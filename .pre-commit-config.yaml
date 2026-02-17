@@ -1,0 +1,88 @@
+# Pre-commit hooks configuration
+# Installation: pip install pre-commit && pre-commit install
+# Manual run: pre-commit run --all-files
+
+repos:
+  # General file checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+        name: Trim trailing whitespace
+      - id: end-of-file-fixer
+        name: Fix end of file
+      - id: check-yaml
+        name: Check YAML files
+        args: ['--unsafe']
+      - id: check-json
+        name: Check JSON files
+      - id: check-merge-conflict
+        name: Check for merge conflicts
+      - id: check-added-large-files
+        name: Check for large files
+        args: ['--maxkb=1000']
+      - id: mixed-line-ending
+        name: Check mixed line endings
+        args: ['--fix=lf']
+
+  # Ruff: Fast Python linter
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.1
+    hooks:
+      - id: ruff
+        name: Ruff linter
+        args: [check, --fix]
+      - id: ruff-format
+        name: Ruff formatter
+        exclude: ^(xtest)
+
+  # MyPy: Static type checker
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.19.1
+    hooks:
+      - id: mypy
+        name: MyPy type checker
+        additional_dependencies: ['types-PyYAML', 'pandas-stubs', 'types-joblib']
+        args: [--ignore-missing-imports, --exclude=xtest]
+        exclude: ^(xtest|tests/)
+
+  # Black: Code formatter (optional, can conflict with ruff format)
+  # Uncomment if you want Black instead of Ruff formatter
+  # - repo: https://github.com/psf/black
+  #   rev: 24.1.1
+  #   hooks:
+  #     - id: black
+  #       name: Black code formatter
+  #       language_version: python3.10
+
+  # Doctring formatter
+  - repo: https://github.com/PyCQA/docformatter
+    rev: v1.7.5
+    hooks:
+      - id: docformatter
+        name: DocFormatter
+        args: [--in-place, --line-length=120]
+        exclude: ^(xtest)
+
+# Configuration
+default_language_version:
+  python: python3.10
+
+# Exclude files/directories
+exclude: |
+  (?x)^(
+      .venv|
+      venv|
+      __pycache__|
+      .pytest_cache|
+      .mypy_cache|
+      .ruff_cache|
+      \.eggs|
+      build|
+      dist|
+      .*\.egg-info|
+      xtest.*\.py
+  )
+
+# Fail fast (stop at first hook failure)
+fail_fast: false

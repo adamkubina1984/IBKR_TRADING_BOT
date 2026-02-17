@@ -1,0 +1,163 @@
+├── .pytest_cache/
+│   ├── .gitignore
+│   ├── CACHEDIR.TAG
+│   ├── README.md
+│   ├── v/
+│   │   ├── cache/
+│   │   │   ├── lastfailed
+│   │   │   ├── nodeids
+├── Projekt pro automatizované obchodování na IBKR.docx
+├── README.md
+├── __init__.py
+├── __pycache__/
+│   ├── __init__.cpython-313.pyc
+│   ├── test_features.cpython-313-pytest-8.4.1.pyc
+├── config/
+│   ├── default_config.yaml
+│   ├── features_config.yaml
+├── data/
+│   ├── control/
+│   │   ├── .gitkeep
+│   │   ├── fold_0_test.csv
+│   │   ├── fold_0_train.csv
+│   │   ├── fold_1_test.csv
+│   │   ├── fold_1_train.csv
+│   │   ├── fold_2_test.csv
+│   │   ├── fold_2_train.csv
+│   │   ├── fold_3_test.csv
+│   │   ├── fold_3_train.csv
+│   │   ├── fold_4_test.csv
+│   │   ├── fold_4_train.csv
+│   │   ├── fold_5_test.csv
+│   │   ├── fold_5_train.csv
+│   │   ├── fold_6_test.csv
+│   │   ├── fold_6_train.csv
+│   │   ├── fold_7_test.csv
+│   │   ├── fold_7_train.csv
+│   │   ├── fold_8_test.csv
+│   │   ├── fold_8_train.csv
+│   │   ├── val_set_01.csv
+│   ├── processed/
+│   │   ├── .gitkeep
+│   │   ├── featurized_data.parquet
+│   │   ├── processed_data.csv
+│   │   ├── validation.csv
+│   ├── raw/
+│   │   ├── .gitkeep
+│   │   ├── GC_202509_5mins_30d_20250731_1642.csv
+│   │   ├── GC_202509_5mins_5d_20250731_1713.csv
+│   │   ├── GC_202509_5mins_5d_20250731_1722.csv
+│   │   ├── GC_202509_5mins_5d_20250731_1727.csv
+│   │   ├── ohlc_data.csv
+│   ├── synthetic/
+│   │   ├── .gitkeep
+├── features/
+│   ├── __init__.py
+│   ├── __pycache__/
+│   │   ├── __init__.cpython-313.pyc
+│   │   ├── augmentations.cpython-313.pyc
+│   │   ├── candlestick_patterns.cpython-313.pyc
+│   │   ├── feature_engineering.cpython-313.pyc
+│   │   ├── indicators.cpython-313.pyc
+│   │   ├── rolling_stats.cpython-313.pyc
+│   ├── augmentations.py
+│   ├── candlestick_patterns.py
+│   ├── feature_engineering.py
+│   ├── indicators.py
+│   ├── rolling_stats.py
+├── generate_test_data.py
+├── generate_validation_csv.py
+├── gui/
+│   ├── __pycache__/
+│   │   ├── __init__.cpython-313.pyc
+│   │   ├── main_window.cpython-313.pyc
+│   │   ├── tab1_data_download.cpython-313.pyc
+│   │   ├── tab_data_download.cpython-313.pyc
+│   │   ├── tab_live_bot.cpython-313.pyc
+│   │   ├── tab_model_evaluation.cpython-313.pyc
+│   │   ├── tab_model_training.cpython-313.pyc
+│   ├── data/
+│   │   ├── raw/
+│   │   │   ├── GC_202509_5mins_32d_20250804_1725.csv
+│   │   │   ├── ohlc_data.csv
+│   ├── main_window.py
+│   ├── model_outputs/
+│   │   ├── lgbm.pkl
+│   │   ├── rf
+│   │   ├── rf.pkl
+│   │   ├── xgb
+│   │   ├── xgb.pkl
+│   ├── plot_signals.py
+│   ├── report_generator.py
+│   ├── tab_data_download.py
+│   ├── tab_live_bot.py
+│   ├── tab_model_evaluation.py
+│   ├── tab_model_training.py
+├── logs/
+│   ├── eval_xgb.json
+│   ├── rolling_results_lgbm.csv
+│   ├── rolling_results_rf.csv
+│   ├── rolling_results_xgb.csv
+├── main.py
+├── model/
+│   ├── __init__.py
+│   ├── __pycache__/
+│   │   ├── __init__.cpython-313.pyc
+│   │   ├── data_split.cpython-313.pyc
+│   │   ├── load_model.cpython-313.pyc
+│   │   ├── train_models.cpython-313.pyc
+│   ├── data_split.py
+│   ├── evaluate_models.py
+│   ├── load_model.py
+│   ├── selection.py
+│   ├── train_models.py
+├── model_outputs/
+│   ├── lgbm.pkl
+│   ├── lgbm_best_model.pkl
+│   ├── rf.pkl
+│   ├── rf_best_model.pkl
+│   ├── xgb.pkl
+│   ├── xgb_best_model.pkl
+├── notebooks/
+│   ├── exploration.ipynb
+│   ├── generate_validation_set.py
+├── pytest.ini
+├── requirements.txt
+├── results/
+│   ├── results.csv
+│   ├── results.json
+├── rolling_retrain_gui.py
+├── scripts/
+│   ├── generate_synthetic_only.py
+├── simulation/
+│   ├── __pycache__/
+│   │   ├── offline_trader.cpython-313.pyc
+│   ├── offline_trader.py
+│   ├── portfolio_sim.py
+│   ├── signal_engine.py
+├── tests/
+│   ├── __init__.py
+│   ├── __pycache__/
+│   │   ├── __init__.cpython-313.pyc
+│   │   ├── test_data_split.cpython-313-pytest-8.4.1.pyc
+│   │   ├── test_features.cpython-313-pytest-8.4.1.pyc
+│   │   ├── test_signals.cpython-313-pytest-8.4.1.pyc
+│   │   ├── test_trading_loop.cpython-313-pytest-8.4.1.pyc
+│   ├── test_data_split.py
+│   ├── test_features.py
+│   ├── test_signals.py
+│   ├── test_trading_loop.py
+├── utils/
+│   ├── __init__.py
+│   ├── __pycache__/
+│   │   ├── __init__.cpython-313.pyc
+│   │   ├── download_ibkr_data.cpython-313.pyc
+│   │   ├── io_helpers.cpython-313.pyc
+│   │   ├── logger.cpython-313.pyc
+│   │   ├── metrics.cpython-313.pyc
+│   ├── download_ibkr_data.py
+│   ├── io_helpers.py
+│   ├── logger.py
+│   ├── metrics.py
+├── xtest06.py
+├── xtest_features.py

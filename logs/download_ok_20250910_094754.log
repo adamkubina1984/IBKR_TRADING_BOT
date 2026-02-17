@@ -1,0 +1,46 @@
+CMD: python -m ibkr_trading_bot.main download --symbol GC --expiry 202509 --days 31 --barSize 5 mins
+CWD: C:\Users\adamk\Můj disk
+
+STDOUT:
+⬇️  Stahuji data pro GC s expirací 202509…
+Stahuji data pro GC (202509) za posledních 31 dnů...
+  ➤ Den 1: 2025-09-10
+  ➤ Den 2: 2025-09-09
+  ➤ Den 3: 2025-09-08
+  ➤ Den 4: 2025-09-07
+  ➤ Den 5: 2025-09-06
+  ➤ Den 6: 2025-09-05
+  ➤ Den 7: 2025-09-04
+  ➤ Den 8: 2025-09-03
+  ➤ Den 9: 2025-09-02
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 10: 2025-09-01
+  ➤ Den 11: 2025-08-31
+  ➤ Den 12: 2025-08-30
+  ➤ Den 13: 2025-08-29
+  ➤ Den 14: 2025-08-28
+  ➤ Den 15: 2025-08-27
+  ➤ Den 16: 2025-08-26
+  ➤ Den 17: 2025-08-25
+  ➤ Den 18: 2025-08-24
+  ➤ Den 19: 2025-08-23
+  ➤ Den 20: 2025-08-22
+  ➤ Den 21: 2025-08-21
+  ➤ Den 22: 2025-08-20
+  ➤ Den 23: 2025-08-19
+  ➤ Den 24: 2025-08-18
+  ➤ Den 25: 2025-08-17
+  ➤ Den 26: 2025-08-16
+  ➤ Den 27: 2025-08-15
+  ➤ Den 28: 2025-08-14
+  ➤ Den 29: 2025-08-13
+  ➤ Den 30: 2025-08-12
+  ➤ Den 31: 2025-08-11
+📄 Zkopírováno také jako: C:/Users/adamk/Můj disk/ibkr_trading_bot/data/raw/ohlc_data.csv
+
+✅ Staženo 3092 svíček
+Rozsah: 2025-08-10 18:00:00-04:00 až 2025-09-10 03:35:00-04:00
+Uloženo do: C:/Users/adamk/Můj disk/ibkr_trading_bot/data/raw/GC_202509_5mins_31d_20250910_0947.csv
+
+
+STDERR:

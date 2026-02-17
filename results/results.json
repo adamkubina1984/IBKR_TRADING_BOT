@@ -1,0 +1,12 @@
+{
+  "model_path": "model_outputs/xgb.pkl",
+  "f1": 0.0,
+  "precision": 0.0,
+  "recall": 0.0,
+  "profit": 0.0,
+  "sharpe_ratio": 0.0,
+  "drawdown": 0.0,
+  "winrate": 0.0,
+  "profit_factor": Infinity,
+  "signal_stability": 1.0
+}

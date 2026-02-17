@@ -1,0 +1,51 @@
+# Výběr a konfigurace featur pro výpočet
+features:
+
+  indicators:
+    ema:
+      enabled: true
+      spans: [5, 10, 21, 50, 200]
+
+    rsi:
+      enabled: true
+      period: 14
+
+    atr:
+      enabled: true
+      period: 14
+
+    macd:
+      enabled: true
+      fast: 12
+      slow: 26
+      signal: 9
+
+    bollinger_bands:
+      enabled: true
+      period: 20
+      std_dev: 2.0
+
+    williams_r:
+      enabled: true
+      period: 14
+
+    stochastic:
+      enabled: true
+      k_period: 14
+      d_period: 3
+
+  candlestick_patterns:
+    enabled: true
+
+  rolling_stats:
+    mean_std:
+      enabled: true
+      windows: [20, 50, 100]
+
+    price_change:
+      enabled: true
+      periods: [1, 5, 10]
+
+    breakouts:
+      enabled: true
+      window: 20

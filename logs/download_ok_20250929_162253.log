@@ -1,0 +1,200 @@
+CMD: C:\Users\adamk\AppData\Local\Programs\Python\Python313\python.exe -m ibkr_trading_bot.main download --symbol GC --expiry 202509 --days 63 --barSize 1 min
+CWD: C:/Users/adamk/Můj disk
+
+STDOUT:
+⬇️  Stahuji data pro GC s expirací 202509…
+Stahuji data pro GC (202509) za posledních 63 dnů...
+  ➤ Den 1: 2025-09-29
+    ⚠️  Žádná data pro den 2025-09-29
+  ➤ Den 2: 2025-09-28
+    ⚠️  Žádná data pro den 2025-09-28
+  ➤ Den 3: 2025-09-27
+    ⚠️  Žádná data pro den 2025-09-27
+  ➤ Den 4: 2025-09-26
+    ⚠️  Žádná data pro den 2025-09-26
+  ➤ Den 5: 2025-09-25
+    ⚠️  Žádná data pro den 2025-09-25
+  ➤ Den 6: 2025-09-24
+    ⚠️  Žádná data pro den 2025-09-24
+  ➤ Den 7: 2025-09-23
+    ⚠️  Žádná data pro den 2025-09-23
+  ➤ Den 8: 2025-09-22
+    ⚠️  Žádná data pro den 2025-09-22
+  ➤ Den 9: 2025-09-21
+    ⚠️  Žádná data pro den 2025-09-21
+  ➤ Den 10: 2025-09-20
+    ⚠️  Žádná data pro den 2025-09-20
+  ➤ Den 11: 2025-09-19
+    ⚠️  Žádná data pro den 2025-09-19
+  ➤ Den 12: 2025-09-18
+    ⚠️  Žádná data pro den 2025-09-18
+  ➤ Den 13: 2025-09-17
+    ⚠️  Žádná data pro den 2025-09-17
+  ➤ Den 14: 2025-09-16
+    ⚠️  Žádná data pro den 2025-09-16
+  ➤ Den 15: 2025-09-15
+    ⚠️  Žádná data pro den 2025-09-15
+  ➤ Den 16: 2025-09-14
+    ⚠️  Žádná data pro den 2025-09-14
+  ➤ Den 17: 2025-09-13
+    ⚠️  Žádná data pro den 2025-09-13
+  ➤ Den 18: 2025-09-12
+    ⚠️  Žádná data pro den 2025-09-12
+  ➤ Den 19: 2025-09-11
+    ⚠️  Žádná data pro den 2025-09-11
+  ➤ Den 20: 2025-09-10
+    ⚠️  Žádná data pro den 2025-09-10
+  ➤ Den 21: 2025-09-09
+    ⚠️  Žádná data pro den 2025-09-09
+  ➤ Den 22: 2025-09-08
+    ⚠️  Žádná data pro den 2025-09-08
+  ➤ Den 23: 2025-09-07
+    ⚠️  Žádná data pro den 2025-09-07
+  ➤ Den 24: 2025-09-06
+    ⚠️  Žádná data pro den 2025-09-06
+  ➤ Den 25: 2025-09-05
+    ⚠️  Žádná data pro den 2025-09-05
+  ➤ Den 26: 2025-09-04
+    ⚠️  Žádná data pro den 2025-09-04
+  ➤ Den 27: 2025-09-03
+    ⚠️  Žádná data pro den 2025-09-03
+  ➤ Den 28: 2025-09-02
+    ⚠️  Žádná data pro den 2025-09-02
+  ➤ Den 29: 2025-09-01
+    ⚠️  Žádná data pro den 2025-09-01
+  ➤ Den 30: 2025-08-31
+    ⚠️  Žádná data pro den 2025-08-31
+  ➤ Den 31: 2025-08-30
+    ⚠️  Žádná data pro den 2025-08-30
+  ➤ Den 32: 2025-08-29
+    ⚠️  Žádná data pro den 2025-08-29
+  ➤ Den 33: 2025-08-28
+    ⚠️  Žádná data pro den 2025-08-28
+  ➤ Den 34: 2025-08-27
+    ⚠️  Žádná data pro den 2025-08-27
+  ➤ Den 35: 2025-08-26
+    ⚠️  Žádná data pro den 2025-08-26
+  ➤ Den 36: 2025-08-25
+    ⚠️  Žádná data pro den 2025-08-25
+  ➤ Den 37: 2025-08-24
+    ⚠️  Žádná data pro den 2025-08-24
+  ➤ Den 38: 2025-08-23
+    ⚠️  Žádná data pro den 2025-08-23
+  ➤ Den 39: 2025-08-22
+    ⚠️  Žádná data pro den 2025-08-22
+  ➤ Den 40: 2025-08-21
+    ⚠️  Žádná data pro den 2025-08-21
+  ➤ Den 41: 2025-08-20
+    ⚠️  Žádná data pro den 2025-08-20
+  ➤ Den 42: 2025-08-19
+    ⚠️  Žádná data pro den 2025-08-19
+  ➤ Den 43: 2025-08-18
+    ⚠️  Žádná data pro den 2025-08-18
+  ➤ Den 44: 2025-08-17
+    ⚠️  Žádná data pro den 2025-08-17
+  ➤ Den 45: 2025-08-16
+    ⚠️  Žádná data pro den 2025-08-16
+  ➤ Den 46: 2025-08-15
+    ⚠️  Žádná data pro den 2025-08-15
+  ➤ Den 47: 2025-08-14
+    ⚠️  Žádná data pro den 2025-08-14
+  ➤ Den 48: 2025-08-13
+    ⚠️  Žádná data pro den 2025-08-13
+  ➤ Den 49: 2025-08-12
+    ⚠️  Žádná data pro den 2025-08-12
+  ➤ Den 50: 2025-08-11
+    ⚠️  Žádná data pro den 2025-08-11
+  ➤ Den 51: 2025-08-10
+    ⚠️  Žádná data pro den 2025-08-10
+  ➤ Den 52: 2025-08-09
+    ⚠️  Žádná data pro den 2025-08-09
+  ➤ Den 53: 2025-08-08
+    ⚠️  Žádná data pro den 2025-08-08
+  ➤ Den 54: 2025-08-07
+    ⚠️  Žádná data pro den 2025-08-07
+  ➤ Den 55: 2025-08-06
+    ⚠️  Žádná data pro den 2025-08-06
+  ➤ Den 56: 2025-08-05
+    ⚠️  Žádná data pro den 2025-08-05
+  ➤ Den 57: 2025-08-04
+    ⚠️  Žádná data pro den 2025-08-04
+  ➤ Den 58: 2025-08-03
+    ⚠️  Žádná data pro den 2025-08-03
+  ➤ Den 59: 2025-08-02
+    ⚠️  Žádná data pro den 2025-08-02
+  ➤ Den 60: 2025-08-01
+    ⚠️  Žádná data pro den 2025-08-01
+  ➤ Den 61: 2025-07-31
+    ⚠️  Žádná data pro den 2025-07-31
+  ➤ Den 62: 2025-07-30
+    ⚠️  Žádná data pro den 2025-07-30
+  ➤ Den 63: 2025-07-29
+    ⚠️  Žádná data pro den 2025-07-29
+❌ Nepodařilo se stáhnout žádná data.
+✅ Data stažena do složky: C:/Users/adamk/Můj disk/ibkr_trading_bot/data/raw
+
+
+STDERR:
+Error 200, reqId 3: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 4: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 5: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 6: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 7: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 8: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 9: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 10: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 11: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 12: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 13: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 14: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 15: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 16: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 17: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 18: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 19: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 20: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 21: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 22: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 23: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 24: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 25: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 26: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 27: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 28: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 29: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 30: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 31: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 32: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 33: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 34: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 35: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 36: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 37: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 38: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 39: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 40: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 41: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 42: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 43: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 44: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 45: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 46: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 47: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 48: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 49: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 50: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 51: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 52: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 53: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 54: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 55: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 56: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 57: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 58: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 59: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 60: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 61: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 62: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 63: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 64: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 200, reqId 65: No security definition has been found for the request, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')

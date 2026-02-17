@@ -1,0 +1,944 @@
+CMD: python -m ibkr_trading_bot.main download --symbol GC --expiry 202509 --days 366 --barSize 1 hour
+CWD: C:\Users\adamk\Můj disk
+
+STDOUT:
+⬇️  Stahuji data pro GC s expirací 202509…
+Stahuji data pro GC (202509) za posledních 366 dnů...
+  ➤ Den 1: 2025-09-19
+    ⚠️  Žádná data pro den 2025-09-19
+  ➤ Den 2: 2025-09-18
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 3: 2025-09-17
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 4: 2025-09-16
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 5: 2025-09-15
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 6: 2025-09-14
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 7: 2025-09-13
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 8: 2025-09-12
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 9: 2025-09-11
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 10: 2025-09-10
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 11: 2025-09-09
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 12: 2025-09-08
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 13: 2025-09-07
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 14: 2025-09-06
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 15: 2025-09-05
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 16: 2025-09-04
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 17: 2025-09-03
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 18: 2025-09-02
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 19: 2025-09-01
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 20: 2025-08-31
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 21: 2025-08-30
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 22: 2025-08-29
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 23: 2025-08-28
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 24: 2025-08-27
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 25: 2025-08-26
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 26: 2025-08-25
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 27: 2025-08-24
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 28: 2025-08-23
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 29: 2025-08-22
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 30: 2025-08-21
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 31: 2025-08-20
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 32: 2025-08-19
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 33: 2025-08-18
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 34: 2025-08-17
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 35: 2025-08-16
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 36: 2025-08-15
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 37: 2025-08-14
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 38: 2025-08-13
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 39: 2025-08-12
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 40: 2025-08-11
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 41: 2025-08-10
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 42: 2025-08-09
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 43: 2025-08-08
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 44: 2025-08-07
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 45: 2025-08-06
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 46: 2025-08-05
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 47: 2025-08-04
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 48: 2025-08-03
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 49: 2025-08-02
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 50: 2025-08-01
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 51: 2025-07-31
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 52: 2025-07-30
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 53: 2025-07-29
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 54: 2025-07-28
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 55: 2025-07-27
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 56: 2025-07-26
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 57: 2025-07-25
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 58: 2025-07-24
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 59: 2025-07-23
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 60: 2025-07-22
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 61: 2025-07-21
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 62: 2025-07-20
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 63: 2025-07-19
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 64: 2025-07-18
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 65: 2025-07-17
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 66: 2025-07-16
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 67: 2025-07-15
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 68: 2025-07-14
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 69: 2025-07-13
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 70: 2025-07-12
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 71: 2025-07-11
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 72: 2025-07-10
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 73: 2025-07-09
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 74: 2025-07-08
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 75: 2025-07-07
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 76: 2025-07-06
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 77: 2025-07-05
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 78: 2025-07-04
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 79: 2025-07-03
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 80: 2025-07-02
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 81: 2025-07-01
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 82: 2025-06-30
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 83: 2025-06-29
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 84: 2025-06-28
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 85: 2025-06-27
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 86: 2025-06-26
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 87: 2025-06-25
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 88: 2025-06-24
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 89: 2025-06-23
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 90: 2025-06-22
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 91: 2025-06-21
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 92: 2025-06-20
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 93: 2025-06-19
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 94: 2025-06-18
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 95: 2025-06-17
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 96: 2025-06-16
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 97: 2025-06-15
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 98: 2025-06-14
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 99: 2025-06-13
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 100: 2025-06-12
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 101: 2025-06-11
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 102: 2025-06-10
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 103: 2025-06-09
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 104: 2025-06-08
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 105: 2025-06-07
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 106: 2025-06-06
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 107: 2025-06-05
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 108: 2025-06-04
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 109: 2025-06-03
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 110: 2025-06-02
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 111: 2025-06-01
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 112: 2025-05-31
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 113: 2025-05-30
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 114: 2025-05-29
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 115: 2025-05-28
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 116: 2025-05-27
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 117: 2025-05-26
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 118: 2025-05-25
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 119: 2025-05-24
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 120: 2025-05-23
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 121: 2025-05-22
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 122: 2025-05-21
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 123: 2025-05-20
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 124: 2025-05-19
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 125: 2025-05-18
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 126: 2025-05-17
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 127: 2025-05-16
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 128: 2025-05-15
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 129: 2025-05-14
+    ⚠️  Žádná data pro den 2025-05-14
+  ➤ Den 130: 2025-05-13
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 131: 2025-05-12
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 132: 2025-05-11
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 133: 2025-05-10
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 134: 2025-05-09
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 135: 2025-05-08
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 136: 2025-05-07
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 137: 2025-05-06
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 138: 2025-05-05
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 139: 2025-05-04
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 140: 2025-05-03
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 141: 2025-05-02
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 142: 2025-05-01
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 143: 2025-04-30
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 144: 2025-04-29
+    ⚠️  Žádná data pro den 2025-04-29
+  ➤ Den 145: 2025-04-28
+    ⚠️  Žádná data pro den 2025-04-28
+  ➤ Den 146: 2025-04-27
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 147: 2025-04-26
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 148: 2025-04-25
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 149: 2025-04-24
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 150: 2025-04-23
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 151: 2025-04-22
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 152: 2025-04-21
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 153: 2025-04-20
+    ⚠️  Žádná data pro den 2025-04-20
+  ➤ Den 154: 2025-04-19
+    ⚠️  Žádná data pro den 2025-04-19
+  ➤ Den 155: 2025-04-18
+    ⚠️  Žádná data pro den 2025-04-18
+  ➤ Den 156: 2025-04-17
+    ⚠️  Žádná data pro den 2025-04-17
+  ➤ Den 157: 2025-04-16
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 158: 2025-04-15
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 159: 2025-04-14
+    ⚠️  Žádná data pro den 2025-04-14
+  ➤ Den 160: 2025-04-13
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 161: 2025-04-12
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 162: 2025-04-11
+  ➤ Den 163: 2025-04-10
+    ⚠️  Žádná data pro den 2025-04-10
+  ➤ Den 164: 2025-04-09
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 165: 2025-04-08
+    ⚠️  Žádná data pro den 2025-04-08
+  ➤ Den 166: 2025-04-07
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 167: 2025-04-06
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 168: 2025-04-05
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 169: 2025-04-04
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 170: 2025-04-03
+    ⚠️  Žádná data pro den 2025-04-03
+  ➤ Den 171: 2025-04-02
+    ⚠️  Žádná data pro den 2025-04-02
+  ➤ Den 172: 2025-04-01
+    ⚠️  Žádná data pro den 2025-04-01
+  ➤ Den 173: 2025-03-31
+    ⚠️  Žádná data pro den 2025-03-31
+  ➤ Den 174: 2025-03-30
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 175: 2025-03-29
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 176: 2025-03-28
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 177: 2025-03-27
+    ⚠️  Žádná data pro den 2025-03-27
+  ➤ Den 178: 2025-03-26
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 179: 2025-03-25
+    ⚠️  Žádná data pro den 2025-03-25
+  ➤ Den 180: 2025-03-24
+    ⚠️  Žádná data pro den 2025-03-24
+  ➤ Den 181: 2025-03-23
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 182: 2025-03-22
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 183: 2025-03-21
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 184: 2025-03-20
+  ➤ Den 185: 2025-03-19
+    ⚠️  Žádná data pro den 2025-03-19
+  ➤ Den 186: 2025-03-18
+    ⚠️  Žádná data pro den 2025-03-18
+  ➤ Den 187: 2025-03-17
+    ⚠️  Žádná data pro den 2025-03-17
+  ➤ Den 188: 2025-03-16
+    ⚠️  Žádná data pro den 2025-03-16
+  ➤ Den 189: 2025-03-15
+    ⚠️  Žádná data pro den 2025-03-15
+  ➤ Den 190: 2025-03-14
+    ⚠️  Žádná data pro den 2025-03-14
+  ➤ Den 191: 2025-03-13
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 192: 2025-03-12
+    ⚠️  Žádná data pro den 2025-03-12
+  ➤ Den 193: 2025-03-11
+    ⚠️  Žádná data pro den 2025-03-11
+  ➤ Den 194: 2025-03-10
+    ⚠️  Žádná data pro den 2025-03-10
+  ➤ Den 195: 2025-03-09
+    ⚠️  Žádná data pro den 2025-03-09
+  ➤ Den 196: 2025-03-08
+    ⚠️  Žádná data pro den 2025-03-08
+  ➤ Den 197: 2025-03-07
+    ⚠️  Žádná data pro den 2025-03-07
+  ➤ Den 198: 2025-03-06
+    ⚠️  Žádná data pro den 2025-03-06
+  ➤ Den 199: 2025-03-05
+    ⚠️  Žádná data pro den 2025-03-05
+  ➤ Den 200: 2025-03-04
+    ⚠️  Žádná data pro den 2025-03-04
+  ➤ Den 201: 2025-03-03
+    ⚠️  Žádná data pro den 2025-03-03
+  ➤ Den 202: 2025-03-02
+    ⚠️  Žádná data pro den 2025-03-02
+  ➤ Den 203: 2025-03-01
+    ⚠️  Žádná data pro den 2025-03-01
+  ➤ Den 204: 2025-02-28
+    ⚠️  Žádná data pro den 2025-02-28
+  ➤ Den 205: 2025-02-27
+    ⚠️  Žádná data pro den 2025-02-27
+  ➤ Den 206: 2025-02-26
+    ⚠️  Žádná data pro den 2025-02-26
+  ➤ Den 207: 2025-02-25
+    ⚠️  Žádná data pro den 2025-02-25
+  ➤ Den 208: 2025-02-24
+    ⚠️  Žádná data pro den 2025-02-24
+  ➤ Den 209: 2025-02-23
+    ⚠️  Žádná data pro den 2025-02-23
+  ➤ Den 210: 2025-02-22
+    ⚠️  Žádná data pro den 2025-02-22
+  ➤ Den 211: 2025-02-21
+    ⚠️  Žádná data pro den 2025-02-21
+  ➤ Den 212: 2025-02-20
+    ⚠️  Žádná data pro den 2025-02-20
+  ➤ Den 213: 2025-02-19
+    ⚠️  Žádná data pro den 2025-02-19
+  ➤ Den 214: 2025-02-18
+    ⚠️  Žádná data pro den 2025-02-18
+  ➤ Den 215: 2025-02-17
+    ⚠️  Žádná data pro den 2025-02-17
+  ➤ Den 216: 2025-02-16
+    ⚠️  Žádná data pro den 2025-02-16
+  ➤ Den 217: 2025-02-15
+    ⚠️  Žádná data pro den 2025-02-15
+  ➤ Den 218: 2025-02-14
+    ⚠️  Žádná data pro den 2025-02-14
+  ➤ Den 219: 2025-02-13
+    ⚠️  Žádná data pro den 2025-02-13
+  ➤ Den 220: 2025-02-12
+    ⚠️  Žádná data pro den 2025-02-12
+  ➤ Den 221: 2025-02-11
+    ⚠️  Žádná data pro den 2025-02-11
+  ➤ Den 222: 2025-02-10
+    ⚠️  Žádná data pro den 2025-02-10
+  ➤ Den 223: 2025-02-09
+    ⚠️  Žádná data pro den 2025-02-09
+  ➤ Den 224: 2025-02-08
+    ⚠️  Žádná data pro den 2025-02-08
+  ➤ Den 225: 2025-02-07
+    ⚠️  Žádná data pro den 2025-02-07
+  ➤ Den 226: 2025-02-06
+    ⚠️  Žádná data pro den 2025-02-06
+  ➤ Den 227: 2025-02-05
+    ⚠️  Žádná data pro den 2025-02-05
+  ➤ Den 228: 2025-02-04
+    ⚠️  Žádná data pro den 2025-02-04
+  ➤ Den 229: 2025-02-03
+    ⚠️  Žádná data pro den 2025-02-03
+  ➤ Den 230: 2025-02-02
+    ⚠️  Žádná data pro den 2025-02-02
+  ➤ Den 231: 2025-02-01
+    ⚠️  Žádná data pro den 2025-02-01
+  ➤ Den 232: 2025-01-31
+    ⚠️  Žádná data pro den 2025-01-31
+  ➤ Den 233: 2025-01-30
+    ⚠️  Žádná data pro den 2025-01-30
+  ➤ Den 234: 2025-01-29
+    ⚠️  Žádná data pro den 2025-01-29
+  ➤ Den 235: 2025-01-28
+    ⚠️  Žádná data pro den 2025-01-28
+  ➤ Den 236: 2025-01-27
+    ⚠️  Žádná data pro den 2025-01-27
+  ➤ Den 237: 2025-01-26
+    ⚠️  Žádná data pro den 2025-01-26
+  ➤ Den 238: 2025-01-25
+    ⚠️  Žádná data pro den 2025-01-25
+  ➤ Den 239: 2025-01-24
+    ⚠️  Žádná data pro den 2025-01-24
+  ➤ Den 240: 2025-01-23
+    ⚠️  Žádná data pro den 2025-01-23
+  ➤ Den 241: 2025-01-22
+    ⚠️  Žádná data pro den 2025-01-22
+  ➤ Den 242: 2025-01-21
+    ⚠️  Žádná data pro den 2025-01-21
+  ➤ Den 243: 2025-01-20
+    ⚠️  Žádná data pro den 2025-01-20
+  ➤ Den 244: 2025-01-19
+    ⚠️  Žádná data pro den 2025-01-19
+  ➤ Den 245: 2025-01-18
+    ⚠️  Žádná data pro den 2025-01-18
+  ➤ Den 246: 2025-01-17
+    ⚠️  Žádná data pro den 2025-01-17
+  ➤ Den 247: 2025-01-16
+    ⚠️  Žádná data pro den 2025-01-16
+  ➤ Den 248: 2025-01-15
+    ⚠️  Žádná data pro den 2025-01-15
+  ➤ Den 249: 2025-01-14
+    ⚠️  Žádná data pro den 2025-01-14
+  ➤ Den 250: 2025-01-13
+    ⚠️  Žádná data pro den 2025-01-13
+  ➤ Den 251: 2025-01-12
+    ⚠️  Žádná data pro den 2025-01-12
+  ➤ Den 252: 2025-01-11
+    ⚠️  Žádná data pro den 2025-01-11
+  ➤ Den 253: 2025-01-10
+    ⚠️  Žádná data pro den 2025-01-10
+  ➤ Den 254: 2025-01-09
+    ⚠️  Žádná data pro den 2025-01-09
+  ➤ Den 255: 2025-01-08
+    ⚠️  Žádná data pro den 2025-01-08
+  ➤ Den 256: 2025-01-07
+    ⚠️  Žádná data pro den 2025-01-07
+  ➤ Den 257: 2025-01-06
+    ⚠️  Žádná data pro den 2025-01-06
+  ➤ Den 258: 2025-01-05
+    ⚠️  Žádná data pro den 2025-01-05
+  ➤ Den 259: 2025-01-04
+    ⚠️  Žádná data pro den 2025-01-04
+  ➤ Den 260: 2025-01-03
+    ⚠️  Žádná data pro den 2025-01-03
+  ➤ Den 261: 2025-01-02
+    ⚠️  Žádná data pro den 2025-01-02
+  ➤ Den 262: 2025-01-01
+    ⚠️  Žádná data pro den 2025-01-01
+  ➤ Den 263: 2024-12-31
+    ⚠️  Žádná data pro den 2024-12-31
+  ➤ Den 264: 2024-12-30
+    ⚠️  Žádná data pro den 2024-12-30
+  ➤ Den 265: 2024-12-29
+    ⚠️  Žádná data pro den 2024-12-29
+  ➤ Den 266: 2024-12-28
+    ⚠️  Žádná data pro den 2024-12-28
+  ➤ Den 267: 2024-12-27
+    ⚠️  Žádná data pro den 2024-12-27
+  ➤ Den 268: 2024-12-26
+    ⚠️  Žádná data pro den 2024-12-26
+  ➤ Den 269: 2024-12-25
+    ⚠️  Žádná data pro den 2024-12-25
+  ➤ Den 270: 2024-12-24
+    ⚠️  Žádná data pro den 2024-12-24
+  ➤ Den 271: 2024-12-23
+    ⚠️  Žádná data pro den 2024-12-23
+  ➤ Den 272: 2024-12-22
+    ⚠️  Žádná data pro den 2024-12-22
+  ➤ Den 273: 2024-12-21
+    ⚠️  Žádná data pro den 2024-12-21
+  ➤ Den 274: 2024-12-20
+    ⚠️  Žádná data pro den 2024-12-20
+  ➤ Den 275: 2024-12-19
+    ⚠️  Žádná data pro den 2024-12-19
+  ➤ Den 276: 2024-12-18
+    ⚠️  Žádná data pro den 2024-12-18
+  ➤ Den 277: 2024-12-17
+    ⚠️  Žádná data pro den 2024-12-17
+  ➤ Den 278: 2024-12-16
+    ⚠️  Žádná data pro den 2024-12-16
+  ➤ Den 279: 2024-12-15
+    ⚠️  Žádná data pro den 2024-12-15
+  ➤ Den 280: 2024-12-14
+    ⚠️  Žádná data pro den 2024-12-14
+  ➤ Den 281: 2024-12-13
+    ⚠️  Žádná data pro den 2024-12-13
+  ➤ Den 282: 2024-12-12
+    ⚠️  Žádná data pro den 2024-12-12
+  ➤ Den 283: 2024-12-11
+    ⚠️  Žádná data pro den 2024-12-11
+  ➤ Den 284: 2024-12-10
+    ⚠️  Žádná data pro den 2024-12-10
+  ➤ Den 285: 2024-12-09
+    ⚠️  Žádná data pro den 2024-12-09
+  ➤ Den 286: 2024-12-08
+    ⚠️  Žádná data pro den 2024-12-08
+  ➤ Den 287: 2024-12-07
+    ⚠️  Žádná data pro den 2024-12-07
+  ➤ Den 288: 2024-12-06
+    ⚠️  Žádná data pro den 2024-12-06
+  ➤ Den 289: 2024-12-05
+    ⚠️  Žádná data pro den 2024-12-05
+  ➤ Den 290: 2024-12-04
+    ⚠️  Žádná data pro den 2024-12-04
+  ➤ Den 291: 2024-12-03
+    ⚠️  Žádná data pro den 2024-12-03
+  ➤ Den 292: 2024-12-02
+    ⚠️  Žádná data pro den 2024-12-02
+  ➤ Den 293: 2024-12-01
+    ⚠️  Žádná data pro den 2024-12-01
+  ➤ Den 294: 2024-11-30
+    ⚠️  Žádná data pro den 2024-11-30
+  ➤ Den 295: 2024-11-29
+    ⚠️  Žádná data pro den 2024-11-29
+  ➤ Den 296: 2024-11-28
+    ⚠️  Žádná data pro den 2024-11-28
+  ➤ Den 297: 2024-11-27
+    ⚠️  Žádná data pro den 2024-11-27
+  ➤ Den 298: 2024-11-26
+    ⚠️  Žádná data pro den 2024-11-26
+  ➤ Den 299: 2024-11-25
+    ⚠️  Žádná data pro den 2024-11-25
+  ➤ Den 300: 2024-11-24
+    ⚠️  Žádná data pro den 2024-11-24
+  ➤ Den 301: 2024-11-23
+    ⚠️  Žádná data pro den 2024-11-23
+  ➤ Den 302: 2024-11-22
+    ⚠️  Žádná data pro den 2024-11-22
+  ➤ Den 303: 2024-11-21
+    ⚠️  Žádná data pro den 2024-11-21
+  ➤ Den 304: 2024-11-20
+    ⚠️  Žádná data pro den 2024-11-20
+  ➤ Den 305: 2024-11-19
+    ⚠️  Žádná data pro den 2024-11-19
+  ➤ Den 306: 2024-11-18
+    ⚠️  Žádná data pro den 2024-11-18
+  ➤ Den 307: 2024-11-17
+    ⚠️  Žádná data pro den 2024-11-17
+  ➤ Den 308: 2024-11-16
+    ⚠️  Žádná data pro den 2024-11-16
+  ➤ Den 309: 2024-11-15
+    ⚠️  Žádná data pro den 2024-11-15
+  ➤ Den 310: 2024-11-14
+    ⚠️  Žádná data pro den 2024-11-14
+  ➤ Den 311: 2024-11-13
+    ⚠️  Žádná data pro den 2024-11-13
+  ➤ Den 312: 2024-11-12
+    ⚠️  Žádná data pro den 2024-11-12
+  ➤ Den 313: 2024-11-11
+    ⚠️  Žádná data pro den 2024-11-11
+  ➤ Den 314: 2024-11-10
+    ⚠️  Žádná data pro den 2024-11-10
+  ➤ Den 315: 2024-11-09
+    ⚠️  Žádná data pro den 2024-11-09
+  ➤ Den 316: 2024-11-08
+    ⚠️  Žádná data pro den 2024-11-08
+  ➤ Den 317: 2024-11-07
+    ⚠️  Žádná data pro den 2024-11-07
+  ➤ Den 318: 2024-11-06
+    ⚠️  Žádná data pro den 2024-11-06
+  ➤ Den 319: 2024-11-05
+    ⚠️  Žádná data pro den 2024-11-05
+  ➤ Den 320: 2024-11-04
+    ⚠️  Žádná data pro den 2024-11-04
+  ➤ Den 321: 2024-11-03
+    ⚠️  Žádná data pro den 2024-11-03
+  ➤ Den 322: 2024-11-02
+    ⚠️  Žádná data pro den 2024-11-02
+  ➤ Den 323: 2024-11-01
+    ⚠️  Žádná data pro den 2024-11-01
+  ➤ Den 324: 2024-10-31
+    ⚠️  Žádná data pro den 2024-10-31
+  ➤ Den 325: 2024-10-30
+    ⚠️  Žádná data pro den 2024-10-30
+  ➤ Den 326: 2024-10-29
+    ⚠️  Žádná data pro den 2024-10-29
+  ➤ Den 327: 2024-10-28
+    ⚠️  Žádná data pro den 2024-10-28
+  ➤ Den 328: 2024-10-27
+    ⚠️  Žádná data pro den 2024-10-27
+  ➤ Den 329: 2024-10-26
+    ⚠️  Žádná data pro den 2024-10-26
+  ➤ Den 330: 2024-10-25
+    ⚠️  Žádná data pro den 2024-10-25
+  ➤ Den 331: 2024-10-24
+    ⚠️  Žádná data pro den 2024-10-24
+  ➤ Den 332: 2024-10-23
+    ⚠️  Žádná data pro den 2024-10-23
+  ➤ Den 333: 2024-10-22
+    ⚠️  Žádná data pro den 2024-10-22
+  ➤ Den 334: 2024-10-21
+    ⚠️  Žádná data pro den 2024-10-21
+  ➤ Den 335: 2024-10-20
+    ⚠️  Žádná data pro den 2024-10-20
+  ➤ Den 336: 2024-10-19
+    ⚠️  Žádná data pro den 2024-10-19
+  ➤ Den 337: 2024-10-18
+    ⚠️  Žádná data pro den 2024-10-18
+  ➤ Den 338: 2024-10-17
+    ⚠️  Žádná data pro den 2024-10-17
+  ➤ Den 339: 2024-10-16
+    ⚠️  Žádná data pro den 2024-10-16
+  ➤ Den 340: 2024-10-15
+    ⚠️  Žádná data pro den 2024-10-15
+  ➤ Den 341: 2024-10-14
+    ⚠️  Žádná data pro den 2024-10-14
+  ➤ Den 342: 2024-10-13
+    ⚠️  Žádná data pro den 2024-10-13
+  ➤ Den 343: 2024-10-12
+    ⚠️  Žádná data pro den 2024-10-12
+  ➤ Den 344: 2024-10-11
+    ⚠️  Žádná data pro den 2024-10-11
+  ➤ Den 345: 2024-10-10
+    ⚠️  Žádná data pro den 2024-10-10
+  ➤ Den 346: 2024-10-09
+    ⚠️  Žádná data pro den 2024-10-09
+  ➤ Den 347: 2024-10-08
+    ⚠️  Žádná data pro den 2024-10-08
+  ➤ Den 348: 2024-10-07
+    ⚠️  Žádná data pro den 2024-10-07
+  ➤ Den 349: 2024-10-06
+    ⚠️  Žádná data pro den 2024-10-06
+  ➤ Den 350: 2024-10-05
+    ⚠️  Žádná data pro den 2024-10-05
+  ➤ Den 351: 2024-10-04
+    ⚠️  Žádná data pro den 2024-10-04
+  ➤ Den 352: 2024-10-03
+    ⚠️  Žádná data pro den 2024-10-03
+  ➤ Den 353: 2024-10-02
+    ⚠️  Žádná data pro den 2024-10-02
+  ➤ Den 354: 2024-10-01
+    ⚠️  Žádná data pro den 2024-10-01
+  ➤ Den 355: 2024-09-30
+    ⚠️  Žádná data pro den 2024-09-30
+  ➤ Den 356: 2024-09-29
+    ⚠️  Žádná data pro den 2024-09-29
+  ➤ Den 357: 2024-09-28
+    ⚠️  Žádná data pro den 2024-09-28
+  ➤ Den 358: 2024-09-27
+    ⚠️  Žádná data pro den 2024-09-27
+  ➤ Den 359: 2024-09-26
+    ⚠️  Žádná data pro den 2024-09-26
+  ➤ Den 360: 2024-09-25
+    ⚠️  Žádná data pro den 2024-09-25
+  ➤ Den 361: 2024-09-24
+    ⚠️  Žádná data pro den 2024-09-24
+  ➤ Den 362: 2024-09-23
+    ⚠️  Žádná data pro den 2024-09-23
+  ➤ Den 363: 2024-09-22
+    ⚠️  Žádná data pro den 2024-09-22
+  ➤ Den 364: 2024-09-21
+    ⚠️  Žádná data pro den 2024-09-21
+  ➤ Den 365: 2024-09-20
+    ⚠️  Žádná data pro den 2024-09-20
+  ➤ Den 366: 2024-09-19
+    ⚠️  Žádná data pro den 2024-09-19
+📄 Zkopírováno také jako: C:/Users/adamk/Můj disk/ibkr_trading_bot/data/raw/ohlc_data.csv
+
+✅ Staženo 1507 svíček
+Rozsah: 2025-03-12 22:00:00-04:00 až 2025-09-18 05:00:00-04:00
+Uloženo do: C:/Users/adamk/Můj disk/ibkr_trading_bot/data/raw/GC_202509_1hour_366d_20250919_1154.csv
+✅ Data stažena do složky: C:/Users/adamk/Můj disk/ibkr_trading_bot/data/raw
+
+
+STDERR:
+Error 162, reqId 3: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 131: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 146: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 147: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 155: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 156: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 157: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 158: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 161: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 165: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 167: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 172: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 173: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 174: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 175: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 179: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 181: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 182: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 187: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 188: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 189: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 190: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 191: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 192: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 194: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 195: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 196: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 197: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 198: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 199: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 200: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 201: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 202: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 203: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 204: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 205: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 206: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 207: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 208: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 209: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 210: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 211: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 212: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 213: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 214: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 215: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 216: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 217: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 218: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 219: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 220: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 221: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 222: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 223: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 224: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 225: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 226: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 227: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 228: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 229: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 230: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 231: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 232: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 233: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 234: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 235: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 236: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 237: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 238: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 239: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 240: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 241: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 242: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 243: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 244: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 245: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 246: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 247: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 248: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 249: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 250: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 251: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 252: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 253: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 254: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 255: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 256: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 257: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 258: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 259: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 260: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 261: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 262: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 263: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 264: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 265: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 266: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 267: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 268: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 269: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 270: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 271: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 272: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 273: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 274: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 275: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 276: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 277: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 278: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 279: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 280: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 281: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 282: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 283: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 284: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 285: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 286: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 287: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 288: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 289: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 290: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 291: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 292: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 293: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 294: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 295: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 296: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 297: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 298: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 299: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 300: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 301: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 302: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 303: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 304: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 305: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 306: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 307: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 308: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 309: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 310: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 311: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 312: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 313: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 314: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 315: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 316: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 317: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 318: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 319: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 320: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 321: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 322: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 323: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 324: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 325: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 326: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 327: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 328: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 329: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 330: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 331: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 332: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 333: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 334: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 335: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 336: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 337: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 338: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 339: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 340: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 341: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 342: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 343: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 344: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 345: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 346: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 347: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 348: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 349: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 350: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 351: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 352: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 353: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 354: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 355: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 356: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 357: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 358: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 359: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 360: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 361: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 362: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 363: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 364: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 365: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 366: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 367: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 368: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')

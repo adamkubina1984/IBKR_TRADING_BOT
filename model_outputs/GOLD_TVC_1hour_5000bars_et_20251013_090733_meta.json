@@ -1,0 +1,149 @@
+{
+  "created_at": "20251013_090733",
+  "created_at_iso": "2025-10-13T09:07:33.706462",
+  "estimator_name": "et",
+  "best_params": {
+    "clf__max_depth": 8,
+    "clf__min_samples_leaf": 4,
+    "clf__n_estimators": 400
+  },
+  "decision_threshold": 0.36,
+  "trained_features": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "average"
+  ],
+  "n_features": 6,
+  "n_total_bars": 5000,
+  "n_train_bars": 4500,
+  "n_holdout_bars": 500,
+  "class_to_dir": {
+    "0": "SHORT",
+    "1": "LONG"
+  },
+  "classes": [
+    0,
+    1
+  ],
+  "annualize_sharpe": true,
+  "instrument": "GOLD",
+  "exchange": "TVC",
+  "timeframe": "1hour",
+  "mc_block_len": 150,
+  "metrics": {
+    "accuracy": 0.402,
+    "precision": 1.0,
+    "recall": 0.07142857142857142,
+    "f1": 0.13333333333333333,
+    "tn": 178,
+    "fp": 0,
+    "fn": 299,
+    "tp": 23,
+    "signals": 23,
+    "confusion3": {
+      "labels": [
+        -1,
+        0,
+        1
+      ],
+      "matrix": [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          178,
+          0
+        ],
+        [
+          0,
+          299,
+          23
+        ]
+      ]
+    },
+    "per_class_3": {
+      "-1": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 0
+      },
+      "0": {
+        "precision": 0.3731656184486373,
+        "recall": 1.0,
+        "f1": 0.5435114503816794,
+        "support": 178
+      },
+      "1": {
+        "precision": 1.0,
+        "recall": 0.07142857142857142,
+        "f1": 0.13333333333333333,
+        "support": 322
+      }
+    },
+    "f1_micro_3": 0.402,
+    "f1_macro_3": 0.22561492790500423,
+    "f1_weighted_3": 0.27935674300254454,
+    "profit_gross": 50.430000000000746,
+    "profit_net": 50.430000000000746,
+    "sharpe": 0.10720663093311376,
+    "sharpe_net": 0.10720663093311376,
+    "sharpe_ann": 10.037426572718179,
+    "sharpe_net_ann": 10.037426572718179,
+    "max_drawdown": -5.099999999999909,
+    "max_drawdown_net": -5.099999999999909,
+    "num_trades": 5,
+    "winrate": 1.0,
+    "profit_factor": Infinity,
+    "avg_pnl_trade": 10.08600000000015,
+    "median_pnl_trade": 7.874000000000251,
+    "var_95": 7.284000000000288,
+    "cvar_95": 7.180000000000291,
+    "rolling_pnl_mean": 10.08600000000015,
+    "sharpe_ratio": 0.10720663093311376,
+    "max_dd": -5.099999999999909,
+    "trades": 5,
+    "pf": Infinity,
+    "n_signals_holdout": 23
+  },
+  "mc": {
+    "iters": 200,
+    "block_len": 150,
+    "min_trades": 20,
+    "thr_scan": [
+      0.5,
+      0.48,
+      0.46,
+      0.45,
+      0.42,
+      0.4,
+      0.38,
+      0.36,
+      0.34,
+      0.32,
+      0.3,
+      0.28,
+      0.26,
+      0.25
+    ],
+    "sharpe": {
+      "p10": 0.06172127075241469,
+      "p50": 0.10844698969148649,
+      "p90": 0.14195896281748377
+    },
+    "max_drawdown": {
+      "p90": -2.6840000000001965
+    },
+    "profit_net": {
+      "p10": 21.255899999999794,
+      "p50": 65.48400000000129,
+      "p90": 120.96550000000168
+    }
+  }
+}

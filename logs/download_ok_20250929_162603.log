@@ -1,0 +1,141 @@
+CMD: C:\Users\adamk\AppData\Local\Programs\Python\Python313\python.exe -m ibkr_trading_bot.main download --symbol GC --expiry 202510 --days 63 --barSize 1 hour
+CWD: C:/Users/adamk/Můj disk
+
+STDOUT:
+⬇️  Stahuji data pro GC s expirací 202510…
+Stahuji data pro GC (202510) za posledních 63 dnů...
+  ➤ Den 1: 2025-09-29
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 2: 2025-09-28
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 3: 2025-09-27
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 4: 2025-09-26
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 5: 2025-09-25
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 6: 2025-09-24
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 7: 2025-09-23
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 8: 2025-09-22
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 9: 2025-09-21
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 10: 2025-09-20
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 11: 2025-09-19
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 12: 2025-09-18
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 13: 2025-09-17
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 14: 2025-09-16
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 15: 2025-09-15
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 16: 2025-09-14
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 17: 2025-09-13
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 18: 2025-09-12
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 19: 2025-09-11
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 20: 2025-09-10
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 21: 2025-09-09
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 22: 2025-09-08
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 23: 2025-09-07
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 24: 2025-09-06
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 25: 2025-09-05
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 26: 2025-09-04
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 27: 2025-09-03
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 28: 2025-09-02
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 29: 2025-09-01
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 30: 2025-08-31
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 31: 2025-08-30
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 32: 2025-08-29
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 33: 2025-08-28
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 34: 2025-08-27
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 35: 2025-08-26
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 36: 2025-08-25
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 37: 2025-08-24
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 38: 2025-08-23
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 39: 2025-08-22
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 40: 2025-08-21
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 41: 2025-08-20
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 42: 2025-08-19
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 43: 2025-08-18
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 44: 2025-08-17
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 45: 2025-08-16
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 46: 2025-08-15
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 47: 2025-08-14
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 48: 2025-08-13
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 49: 2025-08-12
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 50: 2025-08-11
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 51: 2025-08-10
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 52: 2025-08-09
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 53: 2025-08-08
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 54: 2025-08-07
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 55: 2025-08-06
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 56: 2025-08-05
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 57: 2025-08-04
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 58: 2025-08-03
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 59: 2025-08-02
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 60: 2025-08-01
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 61: 2025-07-31
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 62: 2025-07-30
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 63: 2025-07-29
+    ⚠️  Mezery mezi svíčkami detekovány
+📄 Zkopírováno také jako: C:/Users/adamk/Můj disk/ibkr_trading_bot/data/raw/ohlc_data.csv
+
+✅ Staženo 823 svíček
+Rozsah: 2025-07-28 18:00:00-04:00 až 2025-09-29 10:00:00-04:00
+Uloženo do: C:/Users/adamk/Můj disk/ibkr_trading_bot/data/raw/GC_202510_1hour_63d_20250929_1626.csv
+✅ Data stažena do složky: C:/Users/adamk/Můj disk/ibkr_trading_bot/data/raw
+
+
+STDERR:

@@ -1,0 +1,14 @@
+CMD: python -m ibkr_trading_bot.main download --symbol GC --expiry 202509 --days 1 --barSize 5 mins
+CWD: C:\Users\adamk\Můj disk
+
+STDOUT:
+⬇️  Stahuji data pro GC s expirací 202509…
+Stahuji data pro GC (202509) za posledních 1 dnů...
+  ➤ Den 1: 2025-09-18
+    ⚠️  Žádná data pro den 2025-09-18
+❌ Nepodařilo se stáhnout žádná data.
+✅ Data stažena do složky: C:/Users/adamk/Můj disk/ibkr_trading_bot/data/raw
+
+
+STDERR:
+Error 162, reqId 3: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')

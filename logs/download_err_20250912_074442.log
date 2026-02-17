@@ -1,0 +1,11 @@
+CMD: python C:\Users\adamk\Můj disk\ibkr_trading_bot\main.py download --symbol GC --expiry 202509 --days 60 --bar-size 1 hour
+CWD: C:\Users\adamk\Můj disk
+
+STDOUT:
+
+
+STDERR:
+Traceback (most recent call last):
+  File "C:\Users\adamk\Můj disk\ibkr_trading_bot\main.py", line 23, in <module>
+    from ibkr_trading_bot.utils.download_ibkr_data import download_data
+ModuleNotFoundError: No module named 'ibkr_trading_bot'

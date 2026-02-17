@@ -1,0 +1,51 @@
+CMD: C:\Users\adamk\AppData\Local\Programs\Python\Python313\python.exe -m ibkr_trading_bot.main download --symbol GC --expiry 202509 --days 31 --barSize 1 min
+CWD: C:\Users\adamk\Můj disk
+
+STDOUT:
+⬇️  Stahuji data pro GC s expirací 202509…
+Stahuji data pro GC (202509) za posledních 31 dnů...
+  ➤ Den 1: 2025-09-26
+    ⚠️  Žádná data pro den 2025-09-26
+  ➤ Den 2: 2025-09-25
+  ➤ Den 3: 2025-09-24
+  ➤ Den 4: 2025-09-23
+  ➤ Den 5: 2025-09-22
+  ➤ Den 6: 2025-09-21
+  ➤ Den 7: 2025-09-20
+  ➤ Den 8: 2025-09-19
+    ⚠️  Žádná data pro den 2025-09-19
+  ➤ Den 9: 2025-09-18
+  ➤ Den 10: 2025-09-17
+  ➤ Den 11: 2025-09-16
+  ➤ Den 12: 2025-09-15
+  ➤ Den 13: 2025-09-14
+  ➤ Den 14: 2025-09-13
+  ➤ Den 15: 2025-09-12
+  ➤ Den 16: 2025-09-11
+  ➤ Den 17: 2025-09-10
+  ➤ Den 18: 2025-09-09
+  ➤ Den 19: 2025-09-08
+  ➤ Den 20: 2025-09-07
+  ➤ Den 21: 2025-09-06
+  ➤ Den 22: 2025-09-05
+  ➤ Den 23: 2025-09-04
+  ➤ Den 24: 2025-09-03
+  ➤ Den 25: 2025-09-02
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 26: 2025-09-01
+  ➤ Den 27: 2025-08-31
+  ➤ Den 28: 2025-08-30
+  ➤ Den 29: 2025-08-29
+  ➤ Den 30: 2025-08-28
+  ➤ Den 31: 2025-08-27
+📄 Zkopírováno také jako: C:/Users/adamk/Můj disk/ibkr_trading_bot/data/raw/ohlc_data.csv
+
+✅ Staženo 14932 svíček
+Rozsah: 2025-08-26 18:16:00-04:00 až 2025-09-25 08:01:00-04:00
+Uloženo do: C:/Users/adamk/Můj disk/ibkr_trading_bot/data/raw/GC_202509_1min_31d_20250926_1403.csv
+✅ Data stažena do složky: C:/Users/adamk/Můj disk/ibkr_trading_bot/data/raw
+
+
+STDERR:
+Error 162, reqId 3: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 10: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')

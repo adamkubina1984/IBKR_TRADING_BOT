@@ -1,0 +1,16 @@
+CMD: python -m ibkr_trading_bot.main download --symbol GC --expiry 202509 --days 2 --barSize 5 mins
+CWD: C:\Users\adamk\Můj disk
+
+STDOUT:
+⬇️  Stahuji data pro GC s expirací 202509…
+Stahuji data pro GC (202509) za posledních 2 dnů...
+  ➤ Den 1: 2025-09-10
+  ➤ Den 2: 2025-09-09
+📄 Zkopírováno také jako: C:/Users/adamk/Můj disk/ibkr_trading_bot/data/raw/ohlc_data.csv
+
+✅ Staženo 333 svíček
+Rozsah: 2025-09-08 21:55:00-04:00 až 2025-09-10 09:40:00-04:00
+Uloženo do: C:/Users/adamk/Můj disk/ibkr_trading_bot/data/raw/GC_202509_5mins_2d_20250910_1553.csv
+
+
+STDERR:

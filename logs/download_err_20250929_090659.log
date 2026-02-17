@@ -1,0 +1,72 @@
+CMD: C:\Users\adamk\AppData\Local\Programs\Python\Python313\python.exe -m ibkr_trading_bot.main download --symbol GC --expiry 202509 --days 31 --barSize 1 hour
+CWD: C:\Users\adamk\Můj disk
+
+STDOUT:
+⬇️  Stahuji data pro GC s expirací 202509…
+
+
+STDERR:
+API connection failed: ConnectionRefusedError(22, 'Vzdálený počítač odmítl síťové připojení', None, 1225, None)
+Make sure API port on TWS/IBG is open
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Users\adamk\Můj disk\ibkr_trading_bot\main.py", line 229, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\adamk\Můj disk\ibkr_trading_bot\main.py", line 160, in main
+    download_data(
+    ~~~~~~~~~~~~~^
+        symbol=args.symbol,
+        ^^^^^^^^^^^^^^^^^^^
+    ...<3 lines>...
+        output_dir=output_dir.as_posix(),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\adamk\Můj disk\ibkr_trading_bot\utils\download_ibkr_data.py", line 17, in download_data
+    ib.connect('127.0.0.1', 7496, clientId=1)
+    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\adamk\AppData\Local\Programs\Python\Python313\Lib\site-packages\ib_insync\ib.py", line 279, in connect
+    return self._run(self.connectAsync(
+           ~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+        host, port, clientId, timeout, readonly, account))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\adamk\AppData\Local\Programs\Python\Python313\Lib\site-packages\ib_insync\ib.py", line 318, in _run
+    return util.run(*awaitables, timeout=self.RequestTimeout)
+           ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\adamk\AppData\Local\Programs\Python\Python313\Lib\site-packages\ib_insync\util.py", line 341, in run
+    result = loop.run_until_complete(task)
+  File "C:\Users\adamk\AppData\Local\Programs\Python\Python313\Lib\asyncio\base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "C:\Users\adamk\AppData\Local\Programs\Python\Python313\Lib\site-packages\ib_insync\ib.py", line 1748, in connectAsync
+    await self.client.connectAsync(host, port, clientId, timeout)
+  File "C:\Users\adamk\AppData\Local\Programs\Python\Python313\Lib\site-packages\ib_insync\client.py", line 211, in connectAsync
+    await asyncio.wait_for(self.conn.connectAsync(host, port), timeout)
+  File "C:\Users\adamk\AppData\Local\Programs\Python\Python313\Lib\asyncio\tasks.py", line 507, in wait_for
+    return await fut
+           ^^^^^^^^^
+  File "C:\Users\adamk\AppData\Local\Programs\Python\Python313\Lib\site-packages\ib_insync\connection.py", line 39, in connectAsync
+    self.transport, _ = await loop.create_connection(
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        lambda: self, host, port)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\adamk\AppData\Local\Programs\Python\Python313\Lib\asyncio\base_events.py", line 1160, in create_connection
+    raise exceptions[0]
+  File "C:\Users\adamk\AppData\Local\Programs\Python\Python313\Lib\asyncio\base_events.py", line 1135, in create_connection
+    sock = await self._connect_sock(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+        exceptions, addrinfo, laddr_infos)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\adamk\AppData\Local\Programs\Python\Python313\Lib\asyncio\base_events.py", line 1038, in _connect_sock
+    await self.sock_connect(sock, address)
+  File "C:\Users\adamk\AppData\Local\Programs\Python\Python313\Lib\asyncio\proactor_events.py", line 726, in sock_connect
+    return await self._proactor.connect(sock, address)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\adamk\AppData\Local\Programs\Python\Python313\Lib\asyncio\windows_events.py", line 804, in _poll
+    value = callback(transferred, key, ov)
+  File "C:\Users\adamk\AppData\Local\Programs\Python\Python313\Lib\asyncio\windows_events.py", line 600, in finish_connect
+    ov.getresult()
+    ~~~~~~~~~~~~^^
+ConnectionRefusedError: [WinError 1225] Vzdálený počítač odmítl síťové připojení

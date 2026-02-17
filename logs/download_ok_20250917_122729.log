@@ -1,0 +1,396 @@
+CMD: python -m ibkr_trading_bot.main download --symbol GC --expiry 202509 --days 182 --barSize 1 hour
+CWD: C:\Users\adamk\Můj disk
+
+STDOUT:
+⬇️  Stahuji data pro GC s expirací 202509…
+Stahuji data pro GC (202509) za posledních 182 dnů...
+  ➤ Den 1: 2025-09-17
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 2: 2025-09-16
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 3: 2025-09-15
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 4: 2025-09-14
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 5: 2025-09-13
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 6: 2025-09-12
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 7: 2025-09-11
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 8: 2025-09-10
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 9: 2025-09-09
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 10: 2025-09-08
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 11: 2025-09-07
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 12: 2025-09-06
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 13: 2025-09-05
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 14: 2025-09-04
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 15: 2025-09-03
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 16: 2025-09-02
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 17: 2025-09-01
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 18: 2025-08-31
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 19: 2025-08-30
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 20: 2025-08-29
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 21: 2025-08-28
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 22: 2025-08-27
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 23: 2025-08-26
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 24: 2025-08-25
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 25: 2025-08-24
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 26: 2025-08-23
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 27: 2025-08-22
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 28: 2025-08-21
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 29: 2025-08-20
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 30: 2025-08-19
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 31: 2025-08-18
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 32: 2025-08-17
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 33: 2025-08-16
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 34: 2025-08-15
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 35: 2025-08-14
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 36: 2025-08-13
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 37: 2025-08-12
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 38: 2025-08-11
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 39: 2025-08-10
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 40: 2025-08-09
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 41: 2025-08-08
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 42: 2025-08-07
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 43: 2025-08-06
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 44: 2025-08-05
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 45: 2025-08-04
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 46: 2025-08-03
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 47: 2025-08-02
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 48: 2025-08-01
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 49: 2025-07-31
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 50: 2025-07-30
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 51: 2025-07-29
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 52: 2025-07-28
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 53: 2025-07-27
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 54: 2025-07-26
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 55: 2025-07-25
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 56: 2025-07-24
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 57: 2025-07-23
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 58: 2025-07-22
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 59: 2025-07-21
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 60: 2025-07-20
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 61: 2025-07-19
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 62: 2025-07-18
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 63: 2025-07-17
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 64: 2025-07-16
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 65: 2025-07-15
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 66: 2025-07-14
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 67: 2025-07-13
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 68: 2025-07-12
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 69: 2025-07-11
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 70: 2025-07-10
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 71: 2025-07-09
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 72: 2025-07-08
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 73: 2025-07-07
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 74: 2025-07-06
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 75: 2025-07-05
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 76: 2025-07-04
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 77: 2025-07-03
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 78: 2025-07-02
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 79: 2025-07-01
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 80: 2025-06-30
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 81: 2025-06-29
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 82: 2025-06-28
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 83: 2025-06-27
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 84: 2025-06-26
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 85: 2025-06-25
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 86: 2025-06-24
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 87: 2025-06-23
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 88: 2025-06-22
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 89: 2025-06-21
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 90: 2025-06-20
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 91: 2025-06-19
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 92: 2025-06-18
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 93: 2025-06-17
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 94: 2025-06-16
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 95: 2025-06-15
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 96: 2025-06-14
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 97: 2025-06-13
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 98: 2025-06-12
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 99: 2025-06-11
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 100: 2025-06-10
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 101: 2025-06-09
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 102: 2025-06-08
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 103: 2025-06-07
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 104: 2025-06-06
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 105: 2025-06-05
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 106: 2025-06-04
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 107: 2025-06-03
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 108: 2025-06-02
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 109: 2025-06-01
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 110: 2025-05-31
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 111: 2025-05-30
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 112: 2025-05-29
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 113: 2025-05-28
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 114: 2025-05-27
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 115: 2025-05-26
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 116: 2025-05-25
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 117: 2025-05-24
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 118: 2025-05-23
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 119: 2025-05-22
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 120: 2025-05-21
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 121: 2025-05-20
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 122: 2025-05-19
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 123: 2025-05-18
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 124: 2025-05-17
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 125: 2025-05-16
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 126: 2025-05-15
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 127: 2025-05-14
+    ⚠️  Žádná data pro den 2025-05-14
+  ➤ Den 128: 2025-05-13
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 129: 2025-05-12
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 130: 2025-05-11
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 131: 2025-05-10
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 132: 2025-05-09
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 133: 2025-05-08
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 134: 2025-05-07
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 135: 2025-05-06
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 136: 2025-05-05
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 137: 2025-05-04
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 138: 2025-05-03
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 139: 2025-05-02
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 140: 2025-05-01
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 141: 2025-04-30
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 142: 2025-04-29
+    ⚠️  Žádná data pro den 2025-04-29
+  ➤ Den 143: 2025-04-28
+    ⚠️  Žádná data pro den 2025-04-28
+  ➤ Den 144: 2025-04-27
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 145: 2025-04-26
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 146: 2025-04-25
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 147: 2025-04-24
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 148: 2025-04-23
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 149: 2025-04-22
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 150: 2025-04-21
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 151: 2025-04-20
+    ⚠️  Žádná data pro den 2025-04-20
+  ➤ Den 152: 2025-04-19
+    ⚠️  Žádná data pro den 2025-04-19
+  ➤ Den 153: 2025-04-18
+    ⚠️  Žádná data pro den 2025-04-18
+  ➤ Den 154: 2025-04-17
+    ⚠️  Žádná data pro den 2025-04-17
+  ➤ Den 155: 2025-04-16
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 156: 2025-04-15
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 157: 2025-04-14
+    ⚠️  Žádná data pro den 2025-04-14
+  ➤ Den 158: 2025-04-13
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 159: 2025-04-12
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 160: 2025-04-11
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 161: 2025-04-10
+    ⚠️  Žádná data pro den 2025-04-10
+  ➤ Den 162: 2025-04-09
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 163: 2025-04-08
+    ⚠️  Žádná data pro den 2025-04-08
+  ➤ Den 164: 2025-04-07
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 165: 2025-04-06
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 166: 2025-04-05
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 167: 2025-04-04
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 168: 2025-04-03
+    ⚠️  Žádná data pro den 2025-04-03
+  ➤ Den 169: 2025-04-02
+    ⚠️  Žádná data pro den 2025-04-02
+  ➤ Den 170: 2025-04-01
+    ⚠️  Žádná data pro den 2025-04-01
+  ➤ Den 171: 2025-03-31
+    ⚠️  Žádná data pro den 2025-03-31
+  ➤ Den 172: 2025-03-30
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 173: 2025-03-29
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 174: 2025-03-28
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 175: 2025-03-27
+    ⚠️  Žádná data pro den 2025-03-27
+  ➤ Den 176: 2025-03-26
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 177: 2025-03-25
+    ⚠️  Žádná data pro den 2025-03-25
+  ➤ Den 178: 2025-03-24
+    ⚠️  Žádná data pro den 2025-03-24
+  ➤ Den 179: 2025-03-23
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 180: 2025-03-22
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 181: 2025-03-21
+    ⚠️  Mezery mezi svíčkami detekovány
+  ➤ Den 182: 2025-03-20
+    ⚠️  Mezery mezi svíčkami detekovány
+📄 Zkopírováno také jako: C:/Users/adamk/Můj disk/ibkr_trading_bot/data/raw/ohlc_data.csv
+
+✅ Staženo 1583 svíček
+Rozsah: 2025-03-20 06:00:00-04:00 až 2025-09-17 06:00:00-04:00
+Uloženo do: C:/Users/adamk/Můj disk/ibkr_trading_bot/data/raw/GC_202509_1hour_182d_20250917_1227.csv
+✅ Data stažena do složky: C:/Users/adamk/Můj disk/ibkr_trading_bot/data/raw
+
+
+STDERR:
+Error 162, reqId 129: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 144: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 145: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 153: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 154: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 155: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 156: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 159: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 163: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 165: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 170: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 171: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 172: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 173: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 177: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 179: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')
+Error 162, reqId 180: Historical Market Data Service error message:HMDS query returned no data: GCU5@COMEX Trades, contract: Future(symbol='GC', lastTradeDateOrContractMonth='202509', exchange='COMEX', currency='USD')

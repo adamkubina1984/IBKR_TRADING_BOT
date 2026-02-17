@@ -1,0 +1,7 @@
+CMD: C:\Users\adamk\AppData\Local\Programs\Python\Python313\python.exe -m ibkr_trading_bot.main download --symbol GC --expiry 202510 --days 63 --bar-size 1 min
+CWD: C:/Users/adamk/Můj disk
+
+STDOUT:
+
+
+STDERR:

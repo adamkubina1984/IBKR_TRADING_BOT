@@ -1,0 +1,8 @@
+# 🟦 Parametry pro walk-forward splitting
+data_split:
+  window_size: 500
+  test_size: 100
+  step_size: 50
+  expanding: false
+  export_format: csv
+  output_dir: "data/control/"
