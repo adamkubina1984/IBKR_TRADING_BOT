@@ -175,10 +175,13 @@ class ModelTrainingTab(QWidget):
         try:
             svc = DatasetService()
             df = svc.prepare_from_csv(path, labeling="triple_barrier")
-            if len(df) > 5000: df = df.iloc[-5000:].reset_index(drop=True)
+            # Use ALL data from CSV, no artificial limit
             self.dataset = df
-            self.log.appendPlainText(f"✅ Načteno: {path} | řádků={len(df)}")
+            n_rows = len(df)
+            self.log.appendPlainText(f"✅ Načteno: {path} | řádků={n_rows}")
             self.btn_train.setEnabled(True)
+            # Update button label dynamically
+            self.btn_train.setText(f"Trénovat ({n_rows} rows, holdout 500)")
             self.tbl.setRowCount(0); self.prog.setRange(0, 1); self.prog.setValue(0)
         except Exception as e:
             self.log.appendPlainText(f"❌ Chyba načtení/přípravy dat: {e}")
@@ -240,12 +243,22 @@ class ModelTrainingTab(QWidget):
 
     def _name_and_meta_from_csv(self, path: str, n_total: int, n_train: int, n_hold: int):
         base = os.path.basename(path)
-        m = re.match(r"tv_([^_]+)_([^_]+)_([^_]+)_.+\.csv$", base)
         instrument, exchange, timeframe = ("UNKNOWN", "UNK", "UNK")
+        
+        # Try format: tv_INSTRUMENT_EXCHANGE_TIMEFRAME_...
+        m = re.match(r"tv_([^_]+)_([^_]+)_([^_]+)_.+\.csv$", base)
         if m:
             instrument = m.group(1)
             exchange = m.group(2)
             timeframe = m.group(3)
+        else:
+            # Try format: INSTRUMENT_TIMEFRAME_BARS_... (e.g., GC_5m_5765bars_...)
+            m = re.match(r"([A-Z0-9]+)_([0-9]+m|[0-9]+h|[0-9]+d)_(.+\.csv)$", base)
+            if m:
+                instrument = m.group(1)
+                timeframe = m.group(2)
+                exchange = "COMEX"  # default für IBKR na COMEX
+        
         name_prefix = f"{instrument}_{exchange}_{timeframe}_{n_total}bars"
         meta_extra = {
             "instrument": instrument,

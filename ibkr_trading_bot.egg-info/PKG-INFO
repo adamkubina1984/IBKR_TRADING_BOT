@@ -1,0 +1,99 @@
+Metadata-Version: 2.4
+Name: ibkr-trading-bot
+Version: 1.0.0
+Summary: Automated trading bot for Interactive Brokers with ML-based signal generation
+Author-email: Adam K <adamk@trader.cz>
+License: MIT
+Keywords: trading,ml,xgboost,ibkr,gui,backtesting
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Financial and Insurance Industry
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Topic :: Office/Business :: Financial :: Investment
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.25.0
+Requires-Dist: pandas>=2.2.0
+Requires-Dist: pyarrow>=14.0.0
+Requires-Dist: PySide6>=6.7.0
+Requires-Dist: matplotlib>=3.8.0
+Requires-Dist: plotly>=5.20.0
+Requires-Dist: seaborn>=0.13.0
+Requires-Dist: scikit-learn>=1.4.0
+Requires-Dist: xgboost>=2.0.0
+Requires-Dist: lightgbm>=4.3.0
+Requires-Dist: shap>=0.44.0
+Requires-Dist: scipy>=1.13.0
+Requires-Dist: joblib>=1.4.0
+Requires-Dist: ib-insync>=0.9.84
+Requires-Dist: pyyaml>=6.0.1
+Requires-Dist: tqdm>=4.66.0
+Requires-Dist: loguru>=0.7.2
+Requires-Dist: tvDatafeed>=1.3.7
+Requires-Dist: python-dotenv>=1.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.1.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.1.0; extra == "dev"
+Requires-Dist: black>=24.0.0; extra == "dev"
+Requires-Dist: ruff>=0.15.0; extra == "dev"
+Requires-Dist: mypy>=1.19.0; extra == "dev"
+Requires-Dist: types-PyYAML; extra == "dev"
+Requires-Dist: pandas-stubs; extra == "dev"
+Requires-Dist: pre-commit>=3.5.0; extra == "dev"
+Provides-Extra: dl
+Requires-Dist: tensorflow>=2.16.0; extra == "dl"
+Requires-Dist: torch>=2.2.0; extra == "dl"
+
+\## Quickstart
+
+
+
+```bash
+
+\# 1) Vytvoření a aktivace virtuálního prostředí
+
+python -m venv .venv
+
+\# Windows:
+
+. .venv/Scripts/activate
+
+\# macOS/Linux:
+
+\# source .venv/bin/activate
+
+
+
+\# 2) Instalace závislostí
+
+pip install -r requirements.txt
+
+
+
+\# 3) Generování featur z historických dat (CSV se sloupci: timestamp, open/high/low/close/volume)
+
+python -m ibkr\_trading\_bot.main generate --input data/raw/ohlc\_data.csv
+
+
+
+\# 4) Rychlý trénink modelu a uložení
+
+python -m ibkr\_trading\_bot.main train --features data/processed/features.csv --model-out model\_outputs/model.pkl
+
+
+
+\# 5) Vyhodnocení uloženého modelu na datech
+
+python -m ibkr\_trading\_bot.main evaluate --model model\_outputs/model.pkl --features data/processed/features.csv
+
+
+
+\# 6) Spuštění desktop GUI
+
+python -m ibkr\_trading\_bot.main gui
+
+
+

@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 from core.data_sources.tradingview_client import TradingViewClient
@@ -79,6 +80,46 @@ class DataDownloadTab(QWidget):
         self._log_timer.timeout.connect(self._flush_log_queue)
 
         root = QVBoxLayout(self); root.setContentsMargins(12, 10, 12, 10); root.setSpacing(10)
+
+        # === IBKR STAHOVÁNÍ ===
+        box_ibkr = QGroupBox("IBKR Stahování - Od data do Teď (5000-bar batchů)")
+        lay_ibkr = QVBoxLayout(); lay_ibkr.setContentsMargins(10, 8, 10, 8); lay_ibkr.setSpacing(8)
+        
+        lay_ibkr_row1 = QHBoxLayout()
+        lay_ibkr_row1.addWidget(QLabel("Start datum:"))
+        self.dt_start = QDateEdit(); self.dt_start.setCalendarPopup(True)
+        self.dt_start.setDisplayFormat("dd.MM.yyyy"); self.dt_start.setDate(QDate.currentDate().addDays(-30))
+        lay_ibkr_row1.addWidget(self.dt_start)
+        
+        lay_ibkr_row1.addWidget(QLabel("Symbol:"))
+        self.ed_ibkr_symbol = QLineEdit("GC"); self.ed_ibkr_symbol.setFixedWidth(80)
+        lay_ibkr_row1.addWidget(self.ed_ibkr_symbol)
+        
+        lay_ibkr_row1.addWidget(QLabel("Mode:"))
+        self.cmb_ibkr_mode = QComboBox()
+        self.cmb_ibkr_mode.addItems(["CONT", "FUT"])
+        lay_ibkr_row1.addWidget(self.cmb_ibkr_mode)
+        
+        lay_ibkr_row1.addWidget(QLabel("Expiry:"))
+        self.ed_ibkr_expiry = QLineEdit("202602"); self.ed_ibkr_expiry.setFixedWidth(80)
+        lay_ibkr_row1.addWidget(self.ed_ibkr_expiry)
+        
+        lay_ibkr.addLayout(lay_ibkr_row1)
+        
+        lay_ibkr_row2 = QHBoxLayout()
+        lay_ibkr_row2.addWidget(QLabel("Bar Size:"))
+        self.cmb_ibkr_bar = QComboBox()
+        self.cmb_ibkr_bar.addItems(["5 mins", "15 mins", "30 mins", "1 hour"])
+        self.cmb_ibkr_bar.setCurrentText("5 mins")
+        lay_ibkr_row2.addWidget(self.cmb_ibkr_bar)
+        
+        self.btn_ibkr_dl = QPushButton("🔽 Stáhnout z IBKR")
+        self.btn_ibkr_dl.clicked.connect(self.on_download_ibkr)
+        lay_ibkr_row2.addStretch(1)
+        lay_ibkr_row2.addWidget(self.btn_ibkr_dl)
+        
+        lay_ibkr.addLayout(lay_ibkr_row2)
+        box_ibkr.setLayout(lay_ibkr); root.addWidget(box_ibkr)
 
         # --- Stažení z TradingView ---
         box_dl = QGroupBox("Stažení dat z TradingView")
@@ -216,6 +257,64 @@ class DataDownloadTab(QWidget):
         if self._proc is not None:
             self._proc.kill(); self._proc = None
             self._set_status("Stahování zrušeno.", ok=False); self._lock_buttons(False)
+
+    def on_download_ibkr(self) -> None:
+        """Stahování z IBKR od zadaného data do teď, po 5000-bar batchích."""
+        try:
+            start_date_q = self.dt_start.date()
+            start_date = datetime.combine(
+                datetime(start_date_q.year(), start_date_q.month(), start_date_q.day()).date(),
+                datetime.min.time()
+            )
+            
+            symbol = (self.ed_ibkr_symbol.text() or "GC").strip()
+            mode = self.cmb_ibkr_mode.currentText()
+            expiry = (self.ed_ibkr_expiry.text() or "").strip() if mode == "FUT" else None
+            bar_size = self.cmb_ibkr_bar.currentText()
+            
+            if mode == "FUT" and not expiry:
+                self._set_status("Chyba: Expiry je povinná pro FUT mód", ok=False)
+                return
+            
+            self._set_status(f"Stahuji {symbol} z IBKR od {start_date.date()}...", ok=None)
+            self.log_msg(f"[IBKR] Start: {start_date.date()} | Symbol: {symbol} | Mode: {mode} | Bar: {bar_size}")
+            self._lock_buttons(True)
+            
+            # Import v callbacku
+            from ibkr_trading_bot.utils.download_ibkr_data import download_ibkr_by_date_range
+            
+            output_path = download_ibkr_by_date_range(
+                symbol=symbol,
+                start_date=start_date,
+                end_date=datetime.now(),
+                bar_size=bar_size,
+                contract_mode=mode,
+                expiry=expiry,
+                output_dir=RAW_DIR,
+                max_bars_per_batch=5000,
+                on_progress=lambda bn, tb, rec: self.log_msg(f"[IBKR] Batch {bn}: {rec} barů")
+            )
+            
+            # Načtení a zobrazení
+            df = pd.read_csv(output_path)
+            df["date"] = pd.to_datetime(df["date"])
+            df_plot = df[["date", "open", "high", "low", "close", "volume"]]
+            df_chart = self._prepare_for_chart(df_plot)
+            self.df = df_chart
+            self._plot_candles(df_chart)
+            
+            self._set_status(f"OK: {len(df)} barů ze souboru {Path(output_path).name}", ok=True)
+            self.log_msg(f"[IBKR] ✅ Hotovo: {output_path}")
+            
+        except Exception as e:
+            self._style_axes_empty()
+            self._set_status(f"Chyba IBKR: {e}", ok=False)
+            self.log_msg(f"[IBKR][ERROR] {e}")
+            import traceback
+            self.log_msg(f"[IBKR] {traceback.format_exc()}")
+        
+        finally:
+            self._lock_buttons(False)
 
     def _flush_log_queue(self, force: bool = False) -> None:
         if not self._log_queue:

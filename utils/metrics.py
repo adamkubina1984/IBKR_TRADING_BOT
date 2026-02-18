@@ -193,20 +193,31 @@ def calculate_metrics(
     **kwargs,
 ) -> dict[str, Any]:
     """
-    Vrací dict s klasifikačními metrikami (binární i 3-třídní) + (pokud jsou ceny) obchodní metriky.
-    Konvence: y_pred > 0 = LONG, < 0 = SHORT, 0 = FLAT. Pro binární 0/1 stačí 1 = LONG.
+    Vrací dict s klasifikačními metrikami (binární, ternární a 3-třídní) + (pokud jsou ceny) obchodní metriky.
+    Konvence: 
+      - Binární: y_pred > 0 = LONG, < 0 = SHORT, 0 = FLAT. Pro 0/1: 1 = LONG.
+      - Ternární (mapovaná): 0=-1 (SHORT), 1=0 (FLAT), 2=1 (LONG); internal conversion to -1/0/1
+      - 3-class: labels -1, 0, 1 (SHORT, FLAT, LONG)
 
     Parametry navíc:
       - annualize_sharpe: pokud True, dopočítá 'sharpe_ann' a 'sharpe_net_ann'
       - bars_per_year: volitelně explicitní počet barů za rok; pokud není, pokusíme se odhadnout z df['timestamp']
-      - **kwargs: ignorováno (kvůli zpětné kompatibilitě volání ze starších částí GUI)
+      - **kwargs: ignorováno (kvůli zpětné kompatibilitě)
     """
     yt_raw = pd.Series(y_true).astype(int)
     yp_raw = pd.Series(y_pred).astype(int)
     yt = np.asarray(yt_raw.to_numpy())
     yp = np.asarray(yp_raw.to_numpy())
 
-    # ---------- BINÁRNÍ pohled (mapujeme >0 -> 1, jinak 0)
+    # Remap ternary (0,1,2) to (-1,0,1) if detected
+    if set(np.unique(yt)).issubset({0, 1, 2}):
+        # Likely mapped ternary: 0->-1, 1->0, 2->1
+        yt_remap = np.array([-1 if c == 0 else (0 if c == 1 else 1) for c in yt])
+        yp_remap = np.array([-1 if c == 0 else (0 if c == 1 else 1) for c in yp])
+        yt = yt_remap
+        yp = yp_remap
+
+    # ---------- BINÁRNÍ pohled (mapujeme >0 -> 1, FLAT/SHORT -> 0)
     yt_bin = (yt > 0).astype(int)
     yp_bin = (yp > 0).astype(int)
     if _HAVE_SK:

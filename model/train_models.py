@@ -121,19 +121,19 @@ def _build_estimator(name: str) -> tuple[object, dict[str, list]]:
         grid = {"max_depth":[4,6,8],"learning_rate":[0.03,0.06,0.1],"max_iter":[200,300,500],"l2_regularization":[0.0,0.1]}
         return est, grid
     if name in ("rf","random_forest","randomforest"):
-        est = RandomForestClassifier(n_estimators=400, max_depth=None, min_samples_leaf=2, random_state=42, n_jobs=-1)
+        est = RandomForestClassifier(n_estimators=400, max_depth=None, min_samples_leaf=2, random_state=42, n_jobs=-1, class_weight="balanced")
         grid = {"n_estimators":[300,500,800],"max_depth":[None,8,16],"min_samples_leaf":[1,2,4]}
         return est, grid
     if name in ("et","extratrees","extra_trees"):
-        est = ExtraTreesClassifier(n_estimators=500, max_depth=None, min_samples_leaf=2, random_state=42, n_jobs=-1)
+        est = ExtraTreesClassifier(n_estimators=500, max_depth=None, min_samples_leaf=2, random_state=42, n_jobs=-1, class_weight="balanced")
         grid = {"n_estimators":[400,600,800],"max_depth":[None,8,16],"min_samples_leaf":[1,2,4]}
         return est, grid
     if name in ("svm","svc"):
-        est = Pipeline(steps=[("imputer", SimpleImputer(strategy="median")), ("scaler", RobustScaler()), ("clf", SVC(kernel="rbf", probability=True, random_state=42))])
+        est = Pipeline(steps=[("imputer", SimpleImputer(strategy="median")), ("scaler", RobustScaler()), ("clf", SVC(kernel="rbf", probability=True, random_state=42, class_weight="balanced"))])
         grid = {"clf__C":[0.5,1.0,2.0], "clf__gamma":["scale",0.1,0.01]}
         return est, grid
     if name in ("xgb","xgboost") and HAS_XGB:
-        est = xgb.XGBClassifier(n_estimators=500, max_depth=6, learning_rate=0.06, subsample=0.9, colsample_bytree=0.9, tree_method="hist", random_state=42, n_jobs=-1)
+        est = xgb.XGBClassifier(n_estimators=500, max_depth=6, learning_rate=0.06, subsample=0.9, colsample_bytree=0.9, tree_method="hist", random_state=42, n_jobs=-1, scale_pos_weight=2.5)
         grid = {"n_estimators":[400,700], "max_depth":[4,6,8], "learning_rate":[0.03,0.06,0.1], "subsample":[0.8,1.0], "colsample_bytree":[0.8,1.0]}
         return est, grid
     return _build_estimator("hgbt")
@@ -151,14 +151,25 @@ def _namespaced_param_grid(estimator, grid: dict | None) -> dict | None:
     step = estimator.steps[-1][0]
     return {(k if "__" in k else f"{step}__{k}"): v for k, v in grid.items()}
 
-def _predict_proba(estimator, X: pd.DataFrame) -> np.ndarray | None:
+def _predict_proba(estimator, X: pd.DataFrame, class_idx: int = 1) -> np.ndarray | None:
+    """
+    Return predicted probability for class at given index (1 for binary class 1, or for multiclass).
+    For ternary, use class_idx=2 for LONG class.
+    """
     try:
         if hasattr(estimator, "predict_proba"):
-            return estimator.predict_proba(X)[:, 1]
+            proba = estimator.predict_proba(X)
+            if isinstance(proba, np.ndarray) and proba.ndim == 2:
+                # if more than 2 classes, return proba for class_idx; else return class 1
+                return proba[:, min(class_idx, proba.shape[1] - 1)]
+            return np.asarray(proba).ravel()
         if isinstance(estimator, Pipeline):
             last = estimator.steps[-1][1]
             if hasattr(last, "predict_proba"):
-                return estimator.predict_proba(X)[:, 1]
+                proba = estimator.predict_proba(X)
+                if isinstance(proba, np.ndarray) and proba.ndim == 2:
+                    return proba[:, min(class_idx, proba.shape[1] - 1)]
+                return np.asarray(proba).ravel()
     except Exception:
         pass
     return None
@@ -341,6 +352,18 @@ def train_and_evaluate_model(
     if "timestamp" not in df.columns:
         raise ValueError("DataFrame musí obsahovat 'timestamp'.")
     df = df.copy().sort_values("timestamp").reset_index(drop=True)
+
+    # Detect ternary vs binary target
+    unique_targets = sorted(df["target"].unique())
+    is_ternary = set(unique_targets) == {-1, 0, 1} or (set(unique_targets).issubset({-1, 0, 1}) and len(unique_targets) == 3)
+    if is_ternary:
+        print(f"[INFO] Ternary target detected: {unique_targets}")
+        # For ternary, convert to 3-class: map -1->0, 0->1, 1->2 for sklearn
+        y_map = {-1: 0, 0: 1, 1: 2}
+        df["target"] = df["target"].map(y_map).astype(int)
+    else:
+        print(f"[INFO] Binary target detected: {sorted(df['target'].unique())}")
+        df["target"] = df["target"].astype(int)
 
     # split
     n_total = len(df)

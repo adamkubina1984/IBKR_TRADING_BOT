@@ -67,3 +67,61 @@ def make_triple_barrier_labels(
             y[i] = 1 if pnl > 0 else 0
 
     return pd.Series(y, index=df.index, name="target")
+
+
+def make_triple_barrier_labels_ternary(
+    df: pd.DataFrame,
+    horizon: int = 12,
+    take_profit_bps: float = 60.0,
+    stop_loss_bps: float = 40.0,
+    price_col: str = "close",
+) -> pd.Series:
+    """
+    Ternární triple‑barrier labels:
+      - 1  => TP hit (long)
+      - -1 => SL hit (short)
+      - 0  => neither within horizon (flat)
+
+    Výstup: Series s indexem shodným s `df.index`.
+    """
+    if price_col not in df.columns:
+        raise ValueError(f"Sloupec '{price_col}' v datech chybí.")
+
+    close = df[price_col].astype(float).to_numpy()
+    n = len(close)
+    y = np.zeros(n, dtype=int)
+
+    for i in range(n):
+        j_end = min(i + horizon, n - 1)
+        if j_end <= i:
+            y[i] = 0
+            continue
+
+        entry = close[i]
+        tp = entry * (1.0 + take_profit_bps / 1e4)
+        sl = entry * (1.0 - stop_loss_bps / 1e4)
+
+        path = close[i + 1 : j_end + 1]
+        if path.size == 0:
+            y[i] = 0
+            continue
+
+        # determine first hit (if any)
+        hit_tp_idx = None
+        hit_sl_idx = None
+        for k, p in enumerate(path, start=1):
+            if hit_tp_idx is None and p >= tp:
+                hit_tp_idx = k
+            if hit_sl_idx is None and p <= sl:
+                hit_sl_idx = k
+            if hit_tp_idx is not None or hit_sl_idx is not None:
+                break
+
+        if hit_tp_idx is not None and (hit_sl_idx is None or hit_tp_idx <= hit_sl_idx):
+            y[i] = 1
+        elif hit_sl_idx is not None and (hit_tp_idx is None or hit_sl_idx < hit_tp_idx):
+            y[i] = -1
+        else:
+            y[i] = 0
+
+    return pd.Series(y, index=df.index, name="target")
