@@ -161,9 +161,10 @@ def discover_models(dir_path: Path) -> list[ModelRecord]:
             )
         )
 
-    # třídění: nejdřív Sharpe (desc), pak čas (desc)
+    # třídění: nejdřív Sharpe (desc), pak čas (desc), pak profit (desc)
     def _sort_key(r: ModelRecord):
         sharpe = r.metrics.get("sharpe", float("-inf"))
+        profit = r.metrics.get("profit_net", float("-inf"))
         try:
             ts = datetime.fromisoformat(r.created).timestamp()
         except Exception:
@@ -171,7 +172,8 @@ def discover_models(dir_path: Path) -> list[ModelRecord]:
                 ts = float(r.created)
             except Exception:
                 ts = r.model_path.stat().st_mtime
-        return (sharpe, ts)
+        # Primary: sharpe (desc), Secondary: profit (desc), Tertiary: timestamp (desc)
+        return (sharpe, profit, ts)
 
     recs.sort(key=_sort_key, reverse=True)
     return recs
@@ -189,8 +191,8 @@ class ModelManagerTab(QWidget):
         self.chk_auto.setChecked(True)
 
         self.tbl = QTableWidget(self)
-        self.tbl.setColumnCount(6)
-        self.tbl.setHorizontalHeaderLabels(["Model", "SHA1", "Vytvořen", "Sharpe", "#Feats", "Třídy"])
+        self.tbl.setColumnCount(8)
+        self.tbl.setHorizontalHeaderLabels(["Model", "SHA1", "Vytvořen", "Sharpe", "Profit", "PF", "#Feats", "Top Feature"])
         self.tbl.horizontalHeader().setStretchLastSection(True)
 
         self.lbl_loaded = QLabel("Načten: –")
@@ -384,12 +386,27 @@ class ModelManagerTab(QWidget):
             self.tbl.setItem(i, 0, QTableWidgetItem(r.model_path.name))
             self.tbl.setItem(i, 1, QTableWidgetItem(r.sha1[:8]))
             self.tbl.setItem(i, 2, QTableWidgetItem(r.created or ""))
-            sharpe_txt = "" if r.metrics.get("sharpe") is None else str(r.metrics.get("sharpe"))
+            sharpe_txt = "" if r.metrics.get("sharpe") is None else f"{r.metrics.get('sharpe'):.3f}"
             self.tbl.setItem(i, 3, QTableWidgetItem(sharpe_txt))
-            self.tbl.setItem(i, 4, QTableWidgetItem(str(r.features_n)))
-            # důležité: třídy mohou být čísla (numpy.int64) → převést na text
-            cls_list = [str(c) for c in (r.classes or [])]
-            self.tbl.setItem(i, 5, QTableWidgetItem(",".join(cls_list)))
+            profit_txt = "" if r.metrics.get("profit_net") is None else f"{r.metrics.get('profit_net'):.0f}"
+            self.tbl.setItem(i, 4, QTableWidgetItem(profit_txt))
+            pf_txt = "" if r.metrics.get("profit_factor") is None else f"{r.metrics.get('profit_factor'):.2f}"
+            self.tbl.setItem(i, 5, QTableWidgetItem(pf_txt))
+            self.tbl.setItem(i, 6, QTableWidgetItem(str(r.features_n)))
+            # Top feature z feature_importance (pokud je dostupný)
+            top_feat = ""
+            if r.model_path.exists():
+                try:
+                    meta_path = r.model_path.with_name(f"{r.model_path.stem}_meta.json")
+                    if meta_path.exists():
+                        meta_txt = meta_path.read_text(encoding="utf-8")
+                        meta = json.loads(meta_txt)
+                        feat_imp = meta.get("feature_importance", {})
+                        if feat_imp:
+                            top_feat = list(feat_imp.keys())[0][:12]  # první feature, zkrácený
+                except Exception:
+                    pass
+            self.tbl.setItem(i, 7, QTableWidgetItem(top_feat))
 
     def _pick_best(self, recs: list[ModelRecord]) -> ModelRecord | None:
         if not recs:

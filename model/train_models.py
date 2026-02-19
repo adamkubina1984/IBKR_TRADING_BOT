@@ -28,6 +28,12 @@ try:
 except Exception:
     HAS_XGB = False
 
+try:
+    import lightgbm as lgb  # type: ignore
+    HAS_LGB = True
+except Exception:
+    HAS_LGB = False
+
 # --- purged walk-forward split
 try:
     from ibkr_trading_bot.model.tscv import PurgedWalkForwardSplit
@@ -135,6 +141,10 @@ def _build_estimator(name: str) -> tuple[object, dict[str, list]]:
     if name in ("xgb","xgboost") and HAS_XGB:
         est = xgb.XGBClassifier(n_estimators=500, max_depth=6, learning_rate=0.06, subsample=0.9, colsample_bytree=0.9, tree_method="hist", random_state=42, n_jobs=-1, scale_pos_weight=2.5)
         grid = {"n_estimators":[400,700], "max_depth":[4,6,8], "learning_rate":[0.03,0.06,0.1], "subsample":[0.8,1.0], "colsample_bytree":[0.8,1.0]}
+        return est, grid
+    if name in ("lgb","lightgbm") and HAS_LGB:
+        est = lgb.LGBMClassifier(n_estimators=500, max_depth=6, learning_rate=0.05, num_leaves=31, subsample=0.9, colsample_bytree=0.9, random_state=42, n_jobs=-1, class_weight="balanced", verbose=-1)
+        grid = {"n_estimators":[400,700], "max_depth":[5,6,8], "learning_rate":[0.03,0.05,0.1], "num_leaves":[25,31,45], "subsample":[0.8,1.0], "colsample_bytree":[0.8,1.0]}
         return est, grid
     return _build_estimator("hgbt")
 
@@ -565,7 +575,31 @@ def train_and_evaluate_model(
         **(meta_extra or {}),
         "metrics": {**holdout_metrics, **({"n_signals_holdout": n_signals_holdout} if n_signals_holdout is not None else {})},
         "mc": mc_summary,
+        "feature_importance": {},  # bude naplněno níže
     }
+    
+    # Feature importance
+    try:
+        est_for_imp = calibrated_estimator
+        if isinstance(calibrated_estimator, Pipeline):
+            est_for_imp = calibrated_estimator.steps[-1][1]
+        if hasattr(est_for_imp, "feature_importances_"):
+            imp = np.asarray(est_for_imp.feature_importances_)
+            imp_sorted_idx = np.argsort(imp)[::-1]
+            meta["feature_importance"] = {
+                str(X_all.columns[i]): float(imp[i])
+                for i in imp_sorted_idx[:min(20, len(imp))]  # top 20 featur
+            }
+        elif hasattr(est_for_imp, "coef_"):
+            coef = np.asarray(est_for_imp.coef_).ravel()
+            coef_abs = np.abs(coef)
+            coef_sorted_idx = np.argsort(coef_abs)[::-1]
+            meta["feature_importance"] = {
+                str(X_all.columns[i]): float(coef[i])
+                for i in coef_sorted_idx[:min(20, len(coef))]
+            }
+    except Exception:
+        meta["feature_importance"] = {}
     try:
         est_for_cls = calibrated_estimator
         if isinstance(calibrated_estimator, Pipeline):
