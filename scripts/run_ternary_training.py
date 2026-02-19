@@ -66,7 +66,7 @@ def main(input_path: str, estimator_name: str = "hgbt", holdout_bars: int = 500)
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
     p.add_argument("--input", default="data/processed/features_with_labels.csv", help="CSV with features+targets")
-    p.add_argument("--model", default="hgbt", help="Estimator: hgbt, rf, et, xgb, svm")
+    p.add_argument("--model", default="hgbt", help="Estimator: hgbt, rf, et, xgb, lgb, svm")
     p.add_argument("--holdout", type=int, default=500, help="Holdout bars for final test")
     args = p.parse_args()
 

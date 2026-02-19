@@ -139,7 +139,7 @@ class ModelTrainingTab(QWidget):
         row = QHBoxLayout()
         row.addWidget(QLabel("Model:"))
         self.cmb_model = QComboBox()
-        self.cmb_model.addItems(["hgbt", "rf", "et", "xgb"])
+        self.cmb_model.addItems(["hgbt", "rf", "et", "xgb", "lgb", "svm"])
         row.addWidget(self.cmb_model); row.addStretch(1)
 
         self.btn_train = QPushButton("Trénovat (5000 bars, holdout 500)")
