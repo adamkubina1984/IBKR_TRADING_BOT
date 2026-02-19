@@ -17,14 +17,17 @@ import pandas as pd
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QComboBox,
+    QCheckBox,
     QDoubleSpinBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSizePolicy,
     QTableWidget,
@@ -190,6 +193,80 @@ class ModelEvaluationTab(QWidget):
         params_layout.addStretch(1)
         params_group.setLayout(params_layout)
 
+        # ====== 2b) SKUPINA: Nastavení modelu (pro uložení do metadat) ======
+        model_settings_group = QGroupBox("Nastavení modelu (uloží se do meta)")
+        model_settings_layout = QHBoxLayout()
+
+        # Decision threshold
+        dt_label = QLabel("Decision Threshold:")
+        self.dt_spin = QDoubleSpinBox()
+        self.dt_spin.setRange(0.0, 1.0)
+        self.dt_spin.setSingleStep(0.01)
+        self.dt_spin.setDecimals(2)
+        self.dt_spin.setValue(0.5)
+        self.dt_spin.setToolTip("Práh pro klasifikaci LONG (≥ threshold) vs SHORT (< threshold)")
+        self.dt_spin.valueChanged.connect(self._on_model_settings_changed)
+
+        # Entry threshold (pro live bot)
+        et_label = QLabel("Entry Threshold:")
+        self.et_spin = QDoubleSpinBox()
+        self.et_spin.setRange(0.0, 1.0)
+        self.et_spin.setSingleStep(0.01)
+        self.et_spin.setDecimals(2)
+        self.et_spin.setValue(0.6)
+        self.et_spin.setToolTip("Minimální confidence pro otevření pozice")
+        self.et_spin.valueChanged.connect(self._on_model_settings_changed)
+
+        # Exit threshold
+        ext_label = QLabel("Exit Threshold:")
+        self.ext_spin = QDoubleSpinBox()
+        self.ext_spin.setRange(0.0, 1.0)
+        self.ext_spin.setSingleStep(0.01)
+        self.ext_spin.setDecimals(2)
+        self.ext_spin.setValue(0.7)
+        self.ext_spin.setToolTip("Minimální confidence pro zavření pozice (0=vypnuto). Pokud confidence klesne pod tuto hodnotu, pozice se zavře.")
+        self.ext_spin.valueChanged.connect(self._on_model_settings_changed)
+
+        # Ensemble mode
+        self.chk_and_ensemble = QCheckBox("AND Ensemble (místo VOTE)")
+        self.chk_and_ensemble.setChecked(True)
+        self.chk_and_ensemble.setToolTip(
+            "AND = Všechny modely musí souhlasit se signálem (ostrý filtr).\n"
+            "VOTE = Převzítí hlasy modelů (měkčí filtr).\n"
+            "V Tab 3 se uplatňuje jen s více modely v ensemble."
+        )
+        self.chk_and_ensemble.stateChanged.connect(self._on_model_settings_changed)
+
+        # MA-only mode
+        self.chk_ma_only = QCheckBox("Pouze MA (bez modelů)")
+        self.chk_ma_only.setChecked(False)
+        self.chk_ma_only.setToolTip(
+            "Pokud zaškrtnuto: Ignoruj model, používej jen Moving Average signál (ma_fast > ma_slow).\n"
+            "MA signál: +1 = LONG, -1 = SHORT, 0 = FLAT (wait)."
+        )
+        self.chk_ma_only.stateChanged.connect(self._on_model_settings_changed)
+
+        # Tlačítko pro uložení
+        self.btn_save_model_settings = QPushButton("💾 Uložit nastavení do modelu")
+        self.btn_save_model_settings.setToolTip("Uloží všechna nastavení (thresholdy, checkboxy) do meta.json modelu pro reload v Tab 4")
+        self.btn_save_model_settings.clicked.connect(self._on_save_model_settings)
+
+        model_settings_layout.addWidget(dt_label)
+        model_settings_layout.addWidget(self.dt_spin)
+        model_settings_layout.addSpacing(12)
+        model_settings_layout.addWidget(et_label)
+        model_settings_layout.addWidget(self.et_spin)
+        model_settings_layout.addSpacing(12)
+        model_settings_layout.addWidget(ext_label)
+        model_settings_layout.addWidget(self.ext_spin)
+        model_settings_layout.addSpacing(12)
+        model_settings_layout.addWidget(self.chk_and_ensemble)
+        model_settings_layout.addWidget(self.chk_ma_only)
+        model_settings_layout.addSpacing(12)
+        model_settings_layout.addWidget(self.btn_save_model_settings)
+        model_settings_layout.addStretch(1)
+        model_settings_group.setLayout(model_settings_layout)
+
         # ====== 3) SKUPINA: Metriky ======
         metrics_group = QGroupBox("Metriky modelu")
         metrics_layout = QVBoxLayout()
@@ -199,6 +276,19 @@ class ModelEvaluationTab(QWidget):
         self.metrics_table.verticalHeader().setVisible(False)
         self.metrics_table.setEditTriggers(QTableWidget.NoEditTriggers)
         metrics_layout.addWidget(self.metrics_table)
+        
+        # Diagnostika overfittingu
+        overfitting_label = QLabel("Diagnostika overfittingu (Train vs Holdout):")
+        overfitting_font = QFont()
+        overfitting_font.setBold(True)
+        overfitting_label.setFont(overfitting_font)
+        metrics_layout.addWidget(overfitting_label)
+        self.overfitting_console = QPlainTextEdit()
+        self.overfitting_console.setMaximumHeight(100)
+        self.overfitting_console.setReadOnly(True)
+        self.overfitting_console.setPlainText("(Žádný model načten)")
+        metrics_layout.addWidget(self.overfitting_console)
+        
         metrics_group.setLayout(metrics_layout)
 
         # ====== 4) SKUPINA: Grafy ======
@@ -219,6 +309,7 @@ class ModelEvaluationTab(QWidget):
         # ====== Sestavení hlavního layoutu ======
         main_layout.addWidget(files_group)
         main_layout.addWidget(params_group)
+        main_layout.addWidget(model_settings_group)
 
         content_row = QHBoxLayout()
         content_row.addWidget(metrics_group, 1)
@@ -259,6 +350,7 @@ class ModelEvaluationTab(QWidget):
             self.model_metadata = metadata if isinstance(metadata, dict) else (metadata or {})
             self.model_path = file_path
             self.model_label.setText(f"Model: {file_path}")
+            self._show_overfitting_diagnostics()
             self._set_status("Model načten.")
         except Exception as e:
             self._error(f"Nepodařilo se získat estimator z načteného souboru:\n{e}")
@@ -303,8 +395,6 @@ class ModelEvaluationTab(QWidget):
         # 1) CSV
         try:
             df = pd.read_csv(self.data_path, encoding="utf-8", engine="python")
-            self.df_current = df
-            self.close_series = self._safe_close_series(df)
         except Exception as e:
             self._error(f"Chyba při načítání CSV:\n{e}")
             return
@@ -316,6 +406,9 @@ class ModelEvaluationTab(QWidget):
             X = self._coerce_features_for_model(X)
             self.X_current = X
             self.y_true_current = y_true
+            df_for_metrics = prepared if isinstance(prepared, pd.DataFrame) else df
+            self.df_current = df_for_metrics
+            self.close_series = self._safe_close_series(df_for_metrics)
         except Exception as e:
             self._error(f"Chyba při přípravě datasetu:\n{e}")
             return
@@ -324,22 +417,88 @@ class ModelEvaluationTab(QWidget):
         try:
             if not hasattr(self.loaded_model, "predict"):
                 raise AttributeError("Načtený objekt nemá metodu `.predict`.")
-            y_pred = self.loaded_model.predict(self.X_current)
-            self.y_pred_raw = np.asarray(y_pred)
+            
+            # MA-Only mód: ignoruj model, vrať jen MA signál
+            if self.chk_ma_only.isChecked():
+                self.y_pred_raw = self._compute_ma_signal(self.df_current).astype(float)
+                self.confidence_arr = np.ones(len(self.y_pred_raw))
+                entry_threshold = float(self.et_spin.value())
+                self.y_pred_used = self._apply_confidence_threshold(
+                    raw_pred=self.y_pred_raw,
+                    confidence=self.confidence_arr,
+                    threshold=entry_threshold
+                )
+                self.y_pred_used = self._normalize_pred(self.y_pred_used)
+                
+                # Aplikuj Exit Threshold
+                exit_threshold = float(self.ext_spin.value())
+                if exit_threshold > 0:
+                    self.y_pred_used = self._apply_exit_threshold(
+                        y_pred=self.y_pred_used,
+                        confidence=self.confidence_arr,
+                        exit_thr=exit_threshold
+                    )
+                    self.y_pred_used = self._normalize_pred(self.y_pred_used)
+                
+                self._set_status(f"MA-Only mód. Entry={entry_threshold:.2f}, Exit={exit_threshold:.2f}.")
+            else:
+                # Normální mód: používaj model s Decision Threshold
+                # Pokus se získat surové probabilty (přesnější)
+                proba = None
+                if hasattr(self.loaded_model, "predict_proba"):
+                    try:
+                        proba = self.loaded_model.predict_proba(self.X_current)
+                    except Exception:
+                        proba = None
+                
+                # predict_proba: [[prob_class0, prob_class1], ...] nebo [[prob_short, prob_flat, prob_long], ...]
+                # Aplikuj Decision Threshold
+                decision_threshold = float(self.dt_spin.value())
+                
+                if proba is not None and proba.ndim == 2:
+                    # Máme proba, aplikuj threshold
+                    if proba.shape[1] == 2:
+                        # Binary: [prob_class0, prob_class1]
+                        y_pred_by_threshold = (proba[:, 1] >= decision_threshold).astype(int)
+                        self.confidence_arr = np.max(proba, axis=1)  # max confidence
+                    elif proba.shape[1] == 3:
+                        # Ternary: [prob_short, prob_neutral, prob_long]
+                        prob_long = proba[:, 2]
+                        prob_short = proba[:, 0]
+                        y_pred_by_threshold = np.where(prob_long >= decision_threshold, 1, 
+                                                        np.where(prob_short >= decision_threshold, 0, -1))
+                        self.confidence_arr = np.max(proba, axis=1)
+                    else:
+                        # Fallback: normální predict
+                        y_pred_by_threshold = self.loaded_model.predict(self.X_current)
+                        self.confidence_arr = np.ones(len(y_pred_by_threshold))
+                else:
+                    # Bez proba, použij normální predict
+                    y_pred_by_threshold = self.loaded_model.predict(self.X_current)
+                    self.confidence_arr = np.ones(len(y_pred_by_threshold))
+                
+                self.y_pred_raw = np.asarray(y_pred_by_threshold)
 
-            # confidence (pro threshold)
-            proba, classes, decision = self._get_model_scores(self.X_current)
-            self.confidence_arr = self._confidence_from_scores(proba, decision)
+                # Aplikuj Entry Threshold (min. confidence pro obchod)
+                entry_threshold = float(self.et_spin.value())
+                self.y_pred_used = self._apply_confidence_threshold(
+                    raw_pred=self.y_pred_raw,
+                    confidence=self.confidence_arr,
+                    threshold=entry_threshold
+                )
+                self.y_pred_used = self._normalize_pred(self.y_pred_used)
+                
+                # Aplikuj Exit Threshold (zavírání pozic)
+                exit_threshold = float(self.ext_spin.value())
+                if exit_threshold > 0:
+                    self.y_pred_used = self._apply_exit_threshold(
+                        y_pred=self.y_pred_used,
+                        confidence=self.confidence_arr,
+                        exit_thr=exit_threshold
+                    )
+                    self.y_pred_used = self._normalize_pred(self.y_pred_used)
 
-            # aplikace prahu + NORMALIZACE NA −1/0/+1
-            self.y_pred_used = self._apply_confidence_threshold(
-                raw_pred=self.y_pred_raw,
-                confidence=self.confidence_arr,
-                threshold=self.thr_spin.value()
-            )
-            self.y_pred_used = self._normalize_pred(self.y_pred_used)
-
-            self._set_status(f"Predikce OK. Aplikován confidence filtr ≥ {self.thr_spin.value():.2f}.")
+                self._set_status(f"Predikce OK. Decision={decision_threshold:.2f}, Entry={entry_threshold:.2f}, Exit={exit_threshold:.2f}.")
         except Exception as e:
             self._error(f"Chyba při predikci modelem:\n{e}")
             return
@@ -371,6 +530,7 @@ class ModelEvaluationTab(QWidget):
         isinstance(self.trades_df, pd.DataFrame) and not self.trades_df.empty
         )
         self._populate_metrics_table(results)
+        self._show_overfitting_diagnostics()
         self._draw_equity_chart(results)
         trade_pnls_plot = results.get("trade_pnls_net") or results.get("trade_pnls")
         if not trade_pnls_plot:
@@ -384,16 +544,63 @@ class ModelEvaluationTab(QWidget):
         )
 
     def on_params_changed(self, *_):
-        if self.X_current is None or self.y_pred_raw is None or self.df_current is None:
+        if self.X_current is None or self.confidence_arr is None or self.df_current is None:
             return
 
-        # aplikace nového filtru + NORMALIZACE NA −1/0/+1
+        # Prahy z UI
+        decision_threshold = float(self.dt_spin.value())
+        entry_threshold = float(self.et_spin.value())
+        
+        # MA-Only mód
+        if self.chk_ma_only.isChecked():
+            self.y_pred_raw = self._compute_ma_signal(self.df_current).astype(float)
+            self.confidence_arr = np.ones(len(self.y_pred_raw))
+        else:
+            # Normální mód: znovu vypočítaj raw predikce s novým Decision Threshold
+            proba = None
+            if hasattr(self.loaded_model, "predict_proba"):
+                try:
+                    proba = self.loaded_model.predict_proba(self.X_current)
+                except Exception:
+                    proba = None
+            
+            if proba is not None and proba.ndim == 2:
+                # Máme proba, aplikuj decision threshold
+                if proba.shape[1] == 2:
+                    # Binary: [prob_class0, prob_class1]
+                    y_pred_by_threshold = (proba[:, 1] >= decision_threshold).astype(int)
+                elif proba.shape[1] == 3:
+                    # Ternary: [prob_short, prob_neutral, prob_long]
+                    prob_long = proba[:, 2]
+                    prob_short = proba[:, 0]
+                    y_pred_by_threshold = np.where(prob_long >= decision_threshold, 1, 
+                                                    np.where(prob_short >= decision_threshold, 0, -1))
+                else:
+                    # Fallback
+                    y_pred_by_threshold = self.loaded_model.predict(self.X_current)
+            else:
+                # Bez proba, použij normální predict
+                y_pred_by_threshold = self.loaded_model.predict(self.X_current)
+            
+            self.y_pred_raw = np.asarray(y_pred_by_threshold)
+
+        # Aplikuj Entry Threshold (minimální confidence pro obchod)
         self.y_pred_used = self._apply_confidence_threshold(
             raw_pred=self.y_pred_raw,
             confidence=self.confidence_arr,
-            threshold=self.thr_spin.value()
+            threshold=entry_threshold
         )
         self.y_pred_used = self._normalize_pred(self.y_pred_used)
+
+        # Aplikuj Exit Threshold (zavčení pozic když confidence klesne)
+        exit_threshold = float(self.ext_spin.value())
+        if exit_threshold > 0:
+            self.y_pred_used = self._apply_exit_threshold(
+                y_pred=self.y_pred_used,
+                confidence=self.confidence_arr,
+                exit_thr=exit_threshold
+            )
+            self.y_pred_used = self._normalize_pred(self.y_pred_used)
 
         try:
             results = self._eval_service.calculate_metrics(
@@ -419,13 +626,15 @@ class ModelEvaluationTab(QWidget):
             isinstance(self.trades_df, pd.DataFrame) and not self.trades_df.empty
         )
         self._populate_metrics_table(results)
+        self._show_overfitting_diagnostics()
         self._draw_equity_chart(results)
         trade_pnls_plot = results.get("trade_pnls_net") or results.get("trade_pnls")
         self._draw_histogram(trade_pnls_plot)
         self._draw_rolling_chart(trade_pnls_plot)
 
+        exit_threshold = float(self.ext_spin.value())
         self._set_status(
-            f"Přepočteno (confidence ≥ {self.thr_spin.value():.2f}, "
+            f"Přepočteno (Decision={self.dt_spin.value():.2f}, Entry={entry_threshold:.2f}, Exit={exit_threshold:.2f}, "
             f"náklady/obchod {self.cost_spin.value():.3f})"
         )
 
@@ -584,6 +793,25 @@ class ModelEvaluationTab(QWidget):
             arr = tmp
         return arr
 
+    def _apply_exit_threshold(self, y_pred: np.ndarray, confidence: np.ndarray, exit_thr: float) -> np.ndarray:
+        """
+        Aplikuj exit threshold: pokud máme otevřenou pozici (LONG/SHORT) 
+        a confidence klesne pod exit_thr, zavři ji (vrátí FLAT=0).
+        """
+        arr = np.asarray(y_pred).copy()
+        conf = np.asarray(confidence).reshape(-1)
+        eth = float(exit_thr)
+        
+        # Vezmi nízkou confidence
+        mask_low = conf < eth
+        
+        # Nastav na FLAT pouze když máme otevřenou pozici
+        open_pos = np.abs(arr) > 0.5
+        close_mask = mask_low & open_pos
+        
+        arr[close_mask] = 0
+        return arr
+
     # --- NEW: normalizace predikcí po prahování na {-1,0,+1} ---
     def _normalize_pred(self, arr):
         """
@@ -600,6 +828,26 @@ class ModelEvaluationTab(QWidget):
         out[(txt == "long") | (txt == "buy") | (txt == "up") | (txt == "1") | (txt == "+1")] = 1.0
         out[(txt == "short") | (txt == "sell") | (txt == "down") | (txt == "-1")] = -1.0
         return out
+
+    def _compute_ma_signal(self, df: pd.DataFrame) -> np.ndarray:
+        """
+        Vypočítá MA signál: +1 (LONG) pokud ma_fast > ma_slow,
+        -1 (SHORT) pokud ma_fast < ma_slow, 0 (FLAT) jinak.
+        Používá 9-period a 21-period MA na close ceny.
+        """
+        try:
+            if df is None or df.empty or "close" not in df.columns:
+                return np.zeros(len(df) if df is not None else 0)
+            
+            close = df["close"].astype(float).values
+            ma_fast = pd.Series(close).rolling(window=9, min_periods=1).mean().values
+            ma_slow = pd.Series(close).rolling(window=21, min_periods=1).mean().values
+            
+            signal = np.sign(ma_fast - ma_slow)
+            return signal
+        except Exception as e:
+            self._error(f"Chyba při výpočtu MA signálu: {e}")
+            return np.zeros(len(df) if df is not None else 0)
 
     # ---------------- Helpery: PnL a breakdown ----------------
     def _build_positions(self, y_pred):
@@ -1015,4 +1263,142 @@ class ModelEvaluationTab(QWidget):
         except Exception:
             pass
         return None
+
+    def _show_overfitting_diagnostics(self):
+        """Zobrazí diagnostiku overfittingu porovnáním train vs holdout metrik."""
+        if not isinstance(self.model_metadata, dict):
+            self.overfitting_console.setPlainText("(Metadata modelu nejsou dostupná)")
+            return
+
+        train_metrics = self.model_metadata.get("metrics_train", {})
+        holdout_metrics = self.model_metadata.get("metrics_holdout", {})
+        
+        if not train_metrics or not holdout_metrics:
+            text = "(Tréninkové a holdout metriky nejsou k dispozici)\n"
+            if train_metrics:
+                text += f"Train metrics: {train_metrics}\n"
+            if holdout_metrics:
+                text += f"Holdout metrics: {holdout_metrics}"
+            self.overfitting_console.setPlainText(text)
+            return
+
+        # Extrahuj accuracy metriky
+        train_acc = train_metrics.get("accuracy")
+        holdout_acc = holdout_metrics.get("accuracy")
+        
+        if train_acc is None or holdout_acc is None:
+            self.overfitting_console.setPlainText(
+                f"Train: {train_metrics}\nHoldout: {holdout_metrics}"
+            )
+            return
+
+        train_acc = float(train_acc)
+        holdout_acc = float(holdout_acc)
+        diff = train_acc - holdout_acc
+
+        # F1 metriky
+        train_f1 = train_metrics.get("f1")
+        holdout_f1 = holdout_metrics.get("f1")
+        
+        # Počet signálů
+        train_signals = train_metrics.get("n_signals_train", 0)
+        holdout_signals = holdout_metrics.get("n_signals_holdout", 0)
+
+        # Sestav diagnostickou zprávu
+        lines = [
+            "╔═══════════════════════════════════════════════════════╗",
+            "║         DIAGNOSTIKA OVERFITTINGU                      ║",
+            "╠═══════════════════════════════════════════════════════╣",
+            f"║ Train Accuracy:    {train_acc:7.4f}                         ║",
+            f"║ Holdout Accuracy:  {holdout_acc:7.4f}                         ║",
+            f"║ ─────────────────────────────────────────────────────║",
+            f"║ Rozdíl (Train-Out): {diff:+7.4f}                       ║",
+        ]
+        
+        if train_f1 is not None and holdout_f1 is not None:
+            train_f1 = float(train_f1)
+            holdout_f1 = float(holdout_f1)
+            diff_f1 = train_f1 - holdout_f1
+            lines.extend([
+                f"║ Train F1:          {train_f1:7.4f}                         ║",
+                f"║ Holdout F1:        {holdout_f1:7.4f}                         ║",
+                f"║ Rozdíl F1:         {diff_f1:+7.4f}                       ║",
+            ])
+
+        lines.extend([
+            f"║ Train Signals:     {train_signals:7d}                       ║",
+            f"║ Holdout Signals:   {holdout_signals:7d}                       ║",
+            "╠═══════════════════════════════════════════════════════╣",
+        ])
+
+        # Diagnóza
+        if abs(diff) < 0.05:
+            lines.append("║ ✅ DOBRÝ MODEL: Minimální přefitting                 ║")
+        elif abs(diff) < 0.10:
+            lines.append("║ ⚠️  MÍRNÝ OVERFITTING: Rozdíl < 10%                ║")
+        elif abs(diff) < 0.15:
+            lines.append("║ ⚠️  STŘEDOVÝ OVERFITTING: Rozdíl 10-15%            ║")
+        else:
+            lines.append("║ ❌ VÁŽNĚJŠÍ OVERFITTING: Rozdíl > 15%              ║")
+
+        lines.append("╚═══════════════════════════════════════════════════════╝")
+
+        self.overfitting_console.setPlainText("\n".join(lines))
+
+    def _on_save_model_settings(self) -> None:
+        """Uloží aktuální nastavení modelu do metadat."""
+        if not self.model_path:
+            QMessageBox.warning(self, "Chyba", "Nejdřív načti model!")
+            return
+        
+        try:
+            import json as jsonlib
+            from pathlib import Path
+            
+            # Najdi meta.json
+            model_path = Path(self.model_path)
+            meta_path = model_path.with_name(model_path.stem + "_meta.json")
+            
+            # Načti meta (nebo vytvoř nový)
+            if meta_path.exists():
+                with meta_path.open("r", encoding="utf-8") as fh:
+                    metadata = jsonlib.load(fh)
+            else:
+                metadata = {}
+            
+            # Přidej user_settings
+            metadata["user_settings"] = {
+                "decision_threshold": float(self.dt_spin.value()),
+                "entry_threshold": float(self.et_spin.value()),
+                "exit_threshold": float(self.ext_spin.value()),
+                "use_and_ensemble": bool(self.chk_and_ensemble.isChecked()),
+                "use_ma_only": bool(self.chk_ma_only.isChecked()),
+                "updated_at": str(pd.Timestamp.now(tz="UTC")),
+            }
+            
+            # Ulož metadat zpět
+            with meta_path.open("w", encoding="utf-8") as fh:
+                jsonlib.dump(metadata, fh, indent=2, default=str)
+            
+            self._set_status(f"✅ Nastavení uloženo: {meta_path.name}")
+            QMessageBox.information(
+                self, "✅ Hotovo",
+                f"Nastavení modelu úspěšně uloženo!\n\n"
+                f"Decision Threshold: {self.dt_spin.value()}\n"
+                f"Entry Threshold: {self.et_spin.value()}\n"
+                f"Exit Threshold: {self.ext_spin.value()}\n"
+                f"AND Ensemble: {self.chk_and_ensemble.isChecked()}\n"
+                f"MA-Only: {self.chk_ma_only.isChecked()}\n\n"
+                f"Soubor: {meta_path.name}"
+            )
+        except Exception as e:
+            self._error(f"Chyba při uložení nastavení:\n{e}")
+
+    def _on_model_settings_changed(self) -> None:
+        """
+        Zavolá se když se změní nějaký parametr v 'Nastavení modelu'.
+        Zopakuje evaluaci s novými parametry bez překompilování modelu.
+        """
+        # Jednoduše zavolej existující metodu, která aktualizuje metriky
+        self.on_params_changed()
 

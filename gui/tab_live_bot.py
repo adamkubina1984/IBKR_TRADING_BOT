@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
 )
 
 from ibkr_trading_bot.core.config.presets import PRESETS_BY_TF
+from ibkr_trading_bot.features.feature_engineering import compute_all_features
 
 try:
     from PySide6.QtCore import QUrl
@@ -224,7 +225,7 @@ class LiveConfig:
     sensitivity: float = 0.5      # confidence threshold (0..1)
     dry_run: bool = True
     max_fresh_age_min: int = 5
-    max_bars_buffer: int = 100
+    max_bars_buffer: int = 150
     use_ma_only: bool = False
     use_and_ensemble: bool = True  # MA ∧ Model
     alert_on_flip: bool = True
@@ -413,8 +414,9 @@ class _WarmAdapter:
 
     # ---- Predikce pro WarmupService (vrací L2_AND pokud zapnut AND, jinak model/MA podle nastavení) ----
     def predict(self, features: pd.DataFrame):
-        # UI práh pro vstup/výstup (hystereze) – stejný jako v GUI
-        thr_ui = float(self.w.dsb_sensitivity.value())
+        # Praktikovat práh z user_settings (nachází se z Tab 3)
+        user_settings = self.w.user_settings or {}
+        thr_ui = float(user_settings.get("entry_threshold", self.w._curr_entry_thr))
 
         classes = ["LONG", "SHORT"]
 
@@ -422,7 +424,7 @@ class _WarmAdapter:
         l0 = self._ma_sig_from_features(features) or "FLAT"
 
         # MA-only režim -> vrať rovnou MA
-        if getattr(self.w.config, "use_ma_only", False):
+        if user_settings.get("use_ma_only", False):
             probs = [1.0, 0.0] if l0 == "LONG" else [0.0, 1.0] if l0 == "SHORT" else [0.5, 0.5]
             return l0, probs, classes
 
@@ -431,12 +433,15 @@ class _WarmAdapter:
             probs = [1.0, 0.0] if l0 == "LONG" else [0.0, 1.0] if l0 == "SHORT" else [0.5, 0.5]
             return l0, probs, classes
 
-        # L1: čistý AND přes modely (uvnitř bez prahu – jen směr a conf_min)
-        label, conf_min, dirs, confs = self.w._predict_one_label_AND(features, thr=0.0)
+        # L1: AND nebo VOTE podle nastavení (model-only = VOTE)
+        if user_settings.get("use_and_ensemble", True):
+            label, conf_min, dirs, confs = self.w._predict_one_label_AND(features, thr=0.0)
+        else:
+            label, conf_min, dirs, confs = self.w._predict_one_label_VOTE(features)
         l1 = "LONG" if label == +1 else "SHORT" if label == -1 else "FLAT"
 
         # L2: (volitelně) MA ∧ L1 + aplikace prahu z UI (thr_ui) – stejná politika jako v _rescore_all
-        if getattr(self.w.config, "use_and_ensemble", True):
+        if user_settings.get("use_and_ensemble", True):
             # nejdřív jen směrové „proposal“
             if l0 == "FLAT":
                 proposal = l1 if (l1 in ("LONG", "SHORT")) else None
@@ -531,6 +536,9 @@ class LiveBotWidget(QWidget):
         self._curr_exit_thr = self.config.exit_thr
         self._rounds = {"grid": [], "tol_atr": 0.0}
         self.class_to_dir = {0: "SHORT", 1: "LONG"}
+        
+        # Nastavení modelu z Tab 3 (uložená v metadata)
+        self.user_settings = {}  # dict se všemi thresholdy a flagy z Tab 3
 
         # Sledování obchodů
         self._trades: list[dict[str, Any]] = []  # seznam obchodů pro tabulku
@@ -552,10 +560,10 @@ class LiveBotWidget(QWidget):
         tf = self.cmb_interval.currentText()
         p = PRESETS_BY_TF.get(tf, PRESETS_BY_TF["1 hour"])
 
-        # UI práh (hystereze)
-        s = float(self.dsb_sensitivity.value())
-        self._curr_entry_thr = s
-        self._curr_exit_thr  = max(0.0, min(s - 0.05, s))
+        # UI práh (hystereze) - z user_settings (načteno z Tab 3)
+        s = self.user_settings.get("entry_threshold", self.config.sensitivity)
+        self._curr_entry_thr = float(s) if isinstance(s, (int, float)) else self.config.sensitivity
+        self._curr_exit_thr  = max(0.0, min(self._curr_entry_thr - 0.05, self._curr_entry_thr))
 
         # presetované kulatá čísla
         self._rounds = {"grid": [], "tol_atr": 0.0}
@@ -639,20 +647,47 @@ class LiveBotWidget(QWidget):
         g = QGridLayout()
         self.le_model_path = QLineEdit(DEFAULT_MODEL_DIR)
         self.btn_model = QPushButton("…")
-        self.dsb_sensitivity = QDoubleSpinBox()
-        self.dsb_sensitivity.setDecimals(2); self.dsb_sensitivity.setRange(0.00, 1.00); self.dsb_sensitivity.setSingleStep(0.01)
-        self.dsb_sensitivity.setValue(self.config.sensitivity)
-        self.chk_ma_only = QCheckBox("MA-only"); self.chk_ma_only.setChecked(self.config.use_ma_only)
-        self.chk_and = QCheckBox("Ensemble AND (MA ∧ Model)")
+        
+        # Cesta k modelu
+        g.addWidget(QLabel("Cesta:"), 0, 0); g.addWidget(self.le_model_path, 0, 1); g.addWidget(self.btn_model, 0, 2)
+        
+        # Nastavení modelu: READ-ONLY info panel (v samostatném GroupBoxu)
+        settings_box = QGroupBox("⚙️ Nastavení z Tab 3 (read-only)")
+        settings_layout = QVBoxLayout()
+        
+        self.lbl_decision_threshold = QLabel("Decision Threshold: –")
+        self.lbl_entry_threshold = QLabel("Entry Threshold: –")
+        self.lbl_exit_threshold = QLabel("Exit Threshold: –")
+        self.lbl_ma_only = QLabel("MA-Only: –")
+        self.lbl_and_ensemble = QLabel("AND Ensemble: –")
+        
+        # Styl info panelu - viditelný text s bordelem
+        for lbl in [self.lbl_decision_threshold, self.lbl_entry_threshold, self.lbl_exit_threshold, 
+                    self.lbl_ma_only, self.lbl_and_ensemble]:
+            lbl.setStyleSheet(
+                "color: #000; font-size: 9pt; font-weight: 500; "
+                "background-color: #f5f5f5; padding: 6px 10px; "
+                "border: 1px solid #999; border-radius: 4px;"
+            )
+            lbl.setMinimumHeight(26)
+            settings_layout.addWidget(lbl)
+        
+        settings_box.setLayout(settings_layout)
+        
+        # Invert labels (diagnostic - zachová u sebe)
+        invert_layout = QHBoxLayout()
         self.chk_invert_labels = QCheckBox("Invert labels 0↔1")
         self.chk_invert_labels.setToolTip("Ručně prohodí mapu tříd (0↔1). Použij jen pokud DIAG ukazuje opačnou polaritu.")
         self.chk_invert_labels.stateChanged.connect(self._on_toggle_invert_labels)
-        g.addWidget(self.chk_invert_labels, 3, 0, 1, 2)
-        self.chk_and.setChecked(self.config.use_and_ensemble)
-        g.addWidget(QLabel("Cesta:"), 0, 0); g.addWidget(self.le_model_path, 0, 1); g.addWidget(self.btn_model, 0, 2)
-        g.addWidget(QLabel("Citlivost:"), 1, 0); g.addWidget(self.dsb_sensitivity, 1, 1)
-        g.addWidget(self.chk_ma_only, 2, 0); g.addWidget(self.chk_and, 2, 1)
-        model_box.setLayout(g)
+        invert_layout.addWidget(self.chk_invert_labels)
+        invert_layout.addStretch()
+        
+        # Finální layout pro model_box
+        model_layout = QVBoxLayout()
+        model_layout.addLayout(g)
+        model_layout.addWidget(settings_box)
+        model_layout.addLayout(invert_layout)
+        model_box.setLayout(model_layout)
 
         # Log
         log_box = QGroupBox("Log")
@@ -707,9 +742,7 @@ class LiveBotWidget(QWidget):
         self.btn_start.clicked.connect(self._on_start)
         self.btn_stop.clicked.connect(self._on_stop)
         self.btn_reconnect.clicked.connect(self._on_reconnect)
-        self.dsb_sensitivity.valueChanged.connect(self._on_sensitivity_changed)
-        self.chk_ma_only.toggled.connect(lambda v: setattr(self.config, "use_ma_only", bool(v)))
-        self.chk_and.toggled.connect(lambda v: setattr(self.config, "use_and_ensemble", bool(v)))
+        self.chk_invert_labels.stateChanged.connect(self._on_toggle_invert_labels)
 
         self.fresh_timer = QTimer(self); self.fresh_timer.setInterval(1000)
         self.fresh_timer.timeout.connect(self._update_clock)
@@ -793,15 +826,17 @@ class LiveBotWidget(QWidget):
                     exp_list = [str(c) for c in exp]
                     feats_sets.append(set(exp_list))
                     feats_lists.append(exp_list)
+                    sample = ", ".join(exp_list[:10])
+                    more = "" if len(exp_list) <= 10 else f" (+{len(exp_list) - 10} more)"
+                    self._append_log(f"[FEATS] Model expects {len(exp_list)} features: {sample}{more}")
 
                 loaded.append({
                     "predictor": pred,
                     "path": p,
                     "exp_feats": exp_list if exp else None,
                     "label_map": {0: "SHORT", 1: "LONG"},  # per-model default
+                    "metadata": meta,  # uložit metadata pro později
                 })
-
-                loaded.append({"predictor": pred, "path": p})
                 self._append_log(f"[INFO] Načten model: {os.path.basename(p)}")
             except Exception as e:
                 self._append_log(f"[ERROR] Načtení modelu selhalo ({p}): {e}")
@@ -811,27 +846,77 @@ class LiveBotWidget(QWidget):
         self.models = loaded
         self.model = loaded[0]["predictor"] if loaded else None  # jen pro feature_names_in_
 
-        # sjednotit feature-space → průnik, nebo fallback
+        # Cada model usa sus propias features - sin intersección
         base_cols = ['close', 'ma_fast', 'ma_slow', 'atr', 'average']
         if feats_sets:
-            inter = set.intersection(*feats_sets) if len(feats_sets) > 1 else list(feats_sets)[0]
-            if not inter:
-                self._append_log("[WARN] Průnik featur modelů je prázdný – padám na fallback (MA/ATR/average).")
-                self.model_expected_features = base_cols
-            else:
-                if feats_lists:
-                    base_order = feats_lists[0]
-                    self.model_expected_features = [c for c in base_order if c in inter]
-                else:
-                    # kdyby nebyl k dispozici list, nesortovat: ponecháme pořadí tak, jak je v inter přes první nalezený set
-                    self.model_expected_features = list(inter)
-                self._append_log(f"[INFO] Průnik featur v ensemble: {len(self.model_expected_features)}")
+            self._append_log(f"[INFO] Ensemble mód: {len(feats_lists)} modelů, cada uno usa suas próprias features")
+            for i, exp_list in enumerate(feats_lists):
+                sample = ", ".join(exp_list[:5])
+                more = "" if len(exp_list) <= 5 else f" (+{len(exp_list) - 5} mais)"
+                self._append_log(f"  [M{i}] {len(exp_list)} features: {sample}{more}")
+            # Cada modelo usará sus propias features, no la intersección
+            self.model_expected_features = base_cols  # fallback only for MA etc
         else:
             self.model_expected_features = base_cols
 
         # pojmenování vrstev
         self._append_log(f"[LAYERS] L0=MA | L1i=Model_i | L1_AND=AND přes {len(self.models)} modelů | L2_AND=(volitelně) MA ∧ L1_AND")
+        
+        # Načti user_settings z prvního modelu (je-li k dispozici)
+        self._load_user_settings_from_first_model()
+        
         return True
+
+    def _load_user_settings_from_first_model(self) -> None:
+        """Načte user_settings z metadat prvního modelu a zobrazí je jako read-only info panel."""
+        if not self.models or not self.models[0]:
+            self._update_settings_display({})
+            return
+        
+        try:
+            # Vezmi metadata z prvního modelu
+            first_model = self.models[0]
+            metadata = first_model.get("metadata") or {}
+            user_settings = metadata.get("user_settings") or {}
+            
+            if not user_settings:
+                self._append_log("[INFO] Žádná uložená nastavení v modelu - ponechávám defaults")
+                self._update_settings_display({})
+                return
+            
+            # Zobraz nastavení v info panelu
+            self._update_settings_display(user_settings)
+            self._append_log("[SETTINGS] ✅ Nastavení modelu načtena z Tab 3")
+            
+        except Exception as e:
+            self._append_log(f"[WARN] Nelze načít user_settings: {e}")
+            self._update_settings_display({})
+    
+    def _update_settings_display(self, user_settings: dict) -> None:
+        """Aktualizuje display panelu s nastavením modelu (read-only) a uloží do self.user_settings."""
+        self.user_settings = user_settings  # uložit pro použití v predikci
+        
+        decision_threshold = user_settings.get("decision_threshold", "–")
+        entry_threshold = user_settings.get("entry_threshold", "–")
+        exit_threshold = user_settings.get("exit_threshold", "–")
+        use_ma_only = user_settings.get("use_ma_only", False)
+        use_and_ensemble = user_settings.get("use_and_ensemble", True)
+        
+        self.lbl_decision_threshold.setText(f"Decision Threshold: {decision_threshold}")
+        self.lbl_entry_threshold.setText(f"Entry Threshold: {entry_threshold}")
+        self.lbl_exit_threshold.setText(f"Exit Threshold: {exit_threshold}")
+        self.lbl_ma_only.setText(f"MA-Only: {'✓ zapnuto' if use_ma_only else '✗ vypnuto'}")
+        self.lbl_and_ensemble.setText(f"AND Ensemble: {'✓ AND' if use_and_ensemble else '✗ VOTE'}")
+        
+        # Aplikuj entry/exit thresholdy na aktivní konfiguraci
+        if isinstance(entry_threshold, (int, float)):
+            self._curr_entry_thr = float(entry_threshold)
+        if isinstance(exit_threshold, (int, float)):
+            self._curr_exit_thr = float(exit_threshold)
+        
+        # Log po aktualizaci
+        if user_settings:
+            self._append_log(f"[SETTINGS] Decision={decision_threshold}, Entry={entry_threshold}, Exit={exit_threshold}, MA-Only={use_ma_only}, AND={use_and_ensemble}")
 
     # AND hlasování přes všechny modely
     def _predict_one_label_AND(self, Xrow: pd.DataFrame, thr: float) -> tuple[int, float, list[str], list[float]]:
@@ -848,9 +933,7 @@ class LiveBotWidget(QWidget):
             exp = m.get("exp_feats")
             X_use = Xrow
             if exp:
-                cols = [c for c in exp if c in Xrow.columns]
-                if cols:
-                    X_use = Xrow[cols].astype(float)
+                X_use = self._prepare_X_for_model(Xrow, exp)
             try:
                 label_map = m.get("label_map") or self.class_to_dir  # per-model mapa 1st
                 pL, pS, classes_i, _ = _extract_long_short_proba(mdl, X_use, label_map=label_map)
@@ -886,6 +969,70 @@ class LiveBotWidget(QWidget):
             return -1, conf_min, dirs, confs
         return 0, conf_min, dirs, confs
 
+    # Majority-vote přes všechny modely (model-only, bez MA filtru)
+    def _predict_one_label_VOTE(self, Xrow: pd.DataFrame) -> tuple[int, float, list[str], list[float]]:
+        """
+        Vrací (label {-1,0,+1}, conf_vote, directions, confs)
+        label=0 při remíze nebo když není jasná většina.
+        """
+        if not self.models:
+            return 0, 0.0, [], []
+
+        dirs = []
+        confs = []
+        for m in self.models:
+            mdl = m["predictor"]
+            exp = m.get("exp_feats")
+            X_use = Xrow
+            if exp:
+                X_use = self._prepare_X_for_model(Xrow, exp)
+            try:
+                label_map = m.get("label_map") or self.class_to_dir
+                pL, pS, classes_i, _ = _extract_long_short_proba(mdl, X_use, label_map=label_map)
+            except Exception:
+                pL, pS, classes_i = 0.5, 0.5, None
+
+            if pL > pS:
+                direction = "LONG"
+                conf = float(pL)
+            elif pS > pL:
+                direction = "SHORT"
+                conf = float(pS)
+            else:
+                direction = "FLAT"
+                conf = float(pL)
+
+            dirs.append(direction)
+            confs.append(conf)
+
+        n_long = sum(1 for d in dirs if d == "LONG")
+        n_short = sum(1 for d in dirs if d == "SHORT")
+        if n_long == n_short:
+            return 0, float(np.mean(confs)) if confs else 0.0, dirs, confs
+
+        if n_long > n_short:
+            conf_vote = float(np.mean([c for d, c in zip(dirs, confs) if d == "LONG"]))
+            return +1, conf_vote, dirs, confs
+        conf_vote = float(np.mean([c for d, c in zip(dirs, confs) if d == "SHORT"]))
+        return -1, conf_vote, dirs, confs
+
+    def _prepare_X_for_model(self, Xrow: pd.DataFrame, exp: list[str]) -> pd.DataFrame:
+        X_use = Xrow.copy()
+        missing = [c for c in exp if c not in X_use.columns]
+        if missing:
+            key = f"missing_feats_{hash(tuple(exp))}"
+            if not hasattr(self, "_diag_once"):
+                self._diag_once = {}
+            if key not in self._diag_once:
+                sample = ", ".join(missing[:8])
+                more = "" if len(missing) <= 8 else f" (+{len(missing) - 8} more)"
+                self._append_log(f"[FEATS] Missing {len(missing)} features, filled with 0.0: {sample}{more}")
+                self._diag_once[key] = True
+            for c in missing:
+                X_use[c] = 0.0
+        X_use = X_use[exp]
+        return X_use.astype(float)
+
     @Slot()
     def _on_choose_model(self) -> None:
         default_dir = DEFAULT_MODEL_DIR if os.path.isdir(DEFAULT_MODEL_DIR) else os.getcwd()
@@ -905,15 +1052,18 @@ class LiveBotWidget(QWidget):
 
         try:
             adapter = _WarmAdapter(self)
+            # Použij entry_threshold z user_settings (náklad z Tab 3), nebo fallback
+            entry_thr = self.user_settings.get("entry_threshold", self.config.sensitivity)
             self.warm = LiveWarmupService(
                 base_service=adapter,
                 config=WarmupConfig(
-                    threshold=float(self.dsb_sensitivity.value()),
-                    warmup_bars=100,
+                    threshold=float(entry_thr),
+                    warmup_bars=500,
                     min_sim_trades=3,
                     start_sharpe=0.00,
                     max_dd=25.0,
                     diag_first_n=220,
+                    force_live_after_warmup=True,
                 ),
             )
             cfg = getattr(self.warm, "config", None)
@@ -1158,15 +1308,16 @@ class LiveBotWidget(QWidget):
     # ---------- Feature engineering ----------
     def _compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
-        df['ma_fast'] = df['close'].rolling(9, min_periods=1).mean()
-        df['ma_slow'] = df['close'].rolling(21, min_periods=1).mean()
-        h_l  = df['high'] - df['low']
-        h_pc = (df['high'] - df['close'].shift(1)).abs()
-        l_pc = (df['low']  - df['close'].shift(1)).abs()
-        tr   = pd.concat([h_l, h_pc, l_pc], axis=1).max(axis=1)
-        df['atr'] = tr.rolling(14, min_periods=1).mean()
-        df['average'] = (df['open'] + df['high'] + df['low'] + df['close']) / 4.0
-        return df
+        if "timestamp" not in df.columns and "date" in df.columns:
+            df = df.rename(columns={"date": "timestamp"})
+        df_features = compute_all_features(df)
+        df_features["ma_fast"] = df_features["close"].rolling(9, min_periods=1).mean()
+        df_features["ma_slow"] = df_features["close"].rolling(21, min_periods=1).mean()
+        if "average" not in df_features.columns:
+            df_features["average"] = (
+                df_features["open"] + df_features["high"] + df_features["low"] + df_features["close"]
+            ) / 4.0
+        return df_features
 
     def _get_raw_indicators(self) -> pd.DataFrame | None:
         if self.live_df is None or self.live_df.empty:
@@ -1176,8 +1327,9 @@ class LiveBotWidget(QWidget):
         if df.empty:
             return None
         ind = self._compute_indicators(df)
-        ind["date"] = pd.to_datetime(ind["date"], utc=True, errors="coerce")
-        ind = ind.dropna(subset=["date"]).set_index("date").sort_index()
+        if "timestamp" in ind.columns:
+            ind["timestamp"] = pd.to_datetime(ind["timestamp"], utc=True, errors="coerce")
+            ind = ind.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
         return ind
 
     def _align_features_to_model(self, feat: pd.DataFrame) -> pd.DataFrame:
@@ -1288,7 +1440,9 @@ class LiveBotWidget(QWidget):
             return
 
         feats = self._align_features_to_model(raw)
-        thr = float(self.dsb_sensitivity.value())
+        # Praktikovat thresh z user_settings (z Tab 3), nebo fallback
+        thr = self.user_settings.get("entry_threshold", self._curr_entry_thr) if self.user_settings else self._curr_entry_thr
+        thr = float(thr) if isinstance(thr, (int, float)) else self._curr_entry_thr
 
         # L0: MA
         l0_series = np.sign((raw["ma_fast"] - raw["ma_slow"]).astype(float).to_numpy())
@@ -1311,6 +1465,12 @@ class LiveBotWidget(QWidget):
                 elif sig == "SHORT": n_short += 1; n_shown += 1
             self._append_log(f"[RESCORE] (MA-only/model-missing) bars={len(self._bars)} feats={n_total} mapped={n_mapped} shown={n_shown} (LONG={n_long}, SHORT={n_short})")
             self._append_log(f"[RESCORE] ({reason}) bars={len(self._bars)} feats={n_total} mapped={n_mapped} ")
+            
+            # Sleduj obchody i v MA-only režimu
+            try:
+                self._update_position_and_trades(raw)
+            except Exception as e:
+                self._append_log(f"[WARN] Sledování obchodů v MA-only režimu selhalo: {e}")
             return
 
         # Ensemble AND (volitelně MA ∧ L1_AND)
@@ -1323,8 +1483,11 @@ class LiveBotWidget(QWidget):
                 continue
             Xrow = feats.loc[[ts]]
 
-            thr_model = 0.0  # nefiltruj směr uvnitř AND, prahy řeší hysterese
-            label, conf_min, dirs, confs = self._predict_one_label_AND(Xrow, thr_model)
+            if use_ma_and:
+                thr_model = 0.0  # nefiltruj směr uvnitř AND, prahy řeší hysterese
+                label, conf_min, dirs, confs = self._predict_one_label_AND(Xrow, thr_model)
+            else:
+                label, conf_min, dirs, confs = self._predict_one_label_VOTE(Xrow)
             l1 = "LONG" if label == +1 else "SHORT" if label == -1 else "FLAT"
 
             # --- MA∧AND nebo čistý AND: vytvoř "proposal" ---
@@ -1360,88 +1523,15 @@ class LiveBotWidget(QWidget):
             self._bars[idx]["proba"]  = proba
             self._bars[idx]["layers"] = layers
 
-            # --- Aktualizace stavu pozice pouze na posledním baru ---
-            is_last_bar = (ts == feats.index[-1])
-            if is_last_bar:
-                prev_pos = self._live_pos
-                if final == "LONG":
-                    if self._live_pos <= 0:  # vstup/otočka
-                        # Uzavři předchozí obchod, pokud existuje
-                        if self._open_trade is not None:
-                            exit_price = float(raw.loc[ts, "close"])
-                            pnl = exit_price - self._open_trade["entry_price"] if self._open_trade["direction"] == "LONG" else self._open_trade["entry_price"] - exit_price
-                            self._add_trade_to_table(
-                                self._open_trade["entry_time"], self._open_trade["direction"],
-                                self._open_trade["entry_price"], str(ts)[:19], exit_price, pnl
-                            )
-                            self._trades.append({
-                                "entry_time": self._open_trade["entry_time"],
-                                "direction": self._open_trade["direction"],
-                                "entry_price": self._open_trade["entry_price"],
-                                "exit_time": str(ts)[:19],
-                                "exit_price": exit_price,
-                                "pnl": pnl
-                            })
-                        # Otevři nový LONG
-                        self._live_pos = +1
-                        self._live_entry_px = float(raw.loc[ts, "close"])
-                        self._open_trade = {
-                            "direction": "LONG",
-                            "entry_time": str(ts)[:19],
-                            "entry_price": self._live_entry_px
-                        }
-                elif final == "SHORT":
-                    if self._live_pos >= 0:
-                        # Uzavři předchozí obchod, pokud existuje
-                        if self._open_trade is not None:
-                            exit_price = float(raw.loc[ts, "close"])
-                            pnl = exit_price - self._open_trade["entry_price"] if self._open_trade["direction"] == "LONG" else self._open_trade["entry_price"] - exit_price
-                            self._add_trade_to_table(
-                                self._open_trade["entry_time"], self._open_trade["direction"],
-                                self._open_trade["entry_price"], str(ts)[:19], exit_price, pnl
-                            )
-                            self._trades.append({
-                                "entry_time": self._open_trade["entry_time"],
-                                "direction": self._open_trade["direction"],
-                                "entry_price": self._open_trade["entry_price"],
-                                "exit_time": str(ts)[:19],
-                                "exit_price": exit_price,
-                                "pnl": pnl
-                            })
-                        # Otevři nový SHORT
-                        self._live_pos = -1
-                        self._live_entry_px = float(raw.loc[ts, "close"])
-                        self._open_trade = {
-                            "direction": "SHORT",
-                            "entry_time": str(ts)[:19],
-                            "entry_price": self._live_entry_px
-                        }
-                else:
-                    # FLAT – uzavři případnou živou pozici
-                    if self._live_pos != 0:
-                        if self._open_trade is not None:
-                            exit_price = float(raw.loc[ts, "close"])
-                            pnl = exit_price - self._open_trade["entry_price"] if self._open_trade["direction"] == "LONG" else self._open_trade["entry_price"] - exit_price
-                            self._add_trade_to_table(
-                                self._open_trade["entry_time"], self._open_trade["direction"],
-                                self._open_trade["entry_price"], str(ts)[:19], exit_price, pnl
-                            )
-                            self._trades.append({
-                                "entry_time": self._open_trade["entry_time"],
-                                "direction": self._open_trade["direction"],
-                                "entry_price": self._open_trade["entry_price"],
-                                "exit_time": str(ts)[:19],
-                                "exit_price": exit_price,
-                                "pnl": pnl
-                            })
-                        self._live_pos = 0
-                        self._live_entry_px = None
-                        self._open_trade = None
-            # --------------------------------------------------------
-
             n_mapped += 1
             if final == "LONG":  n_long += 1; n_shown += 1
             if final == "SHORT": n_short += 1; n_shown += 1
+
+        # Sleduj obchody po všech signálech
+        try:
+            self._update_position_and_trades(raw)
+        except Exception as e:
+            self._append_log(f"[WARN] Sledování obchodů selhalo: {e}")
 
         self._append_log(
             f"[RESCORE] bars={len(self._bars)} mapped={n_mapped} shown={n_shown} "
@@ -1449,6 +1539,98 @@ class LiveBotWidget(QWidget):
         )
 
     # ----------
+    def _update_position_and_trades(self, raw: pd.DataFrame) -> None:
+        """
+        Aktualizuje pozici a obchody na základě signálů uložených v self._bars.
+        Volá se z obou cest (MA-only i ensemble).
+        Také kontroluje, zda je poslední bar.
+        """
+        if not self._bars:
+            return
+        
+        last_bar = self._bars[-1]
+        ts = pd.to_datetime(last_bar.get("time"), utc=True, errors="coerce")
+        if pd.isna(ts) or ts not in raw.index:
+            return
+        
+        final = last_bar.get("signal")
+        if final is None:
+            return
+        
+        if final == "LONG":
+            if self._live_pos <= 0:  # vstup/otočka
+                # Uzavři předchozí obchod, pokud existuje
+                if self._open_trade is not None:
+                    exit_price = float(raw.loc[ts, "close"])
+                    pnl = exit_price - self._open_trade["entry_price"] if self._open_trade["direction"] == "LONG" else self._open_trade["entry_price"] - exit_price
+                    self._add_trade_to_table(
+                        self._open_trade["entry_time"], self._open_trade["direction"],
+                        self._open_trade["entry_price"], str(ts)[:19], exit_price, pnl
+                    )
+                    self._trades.append({
+                        "entry_time": self._open_trade["entry_time"],
+                        "direction": self._open_trade["direction"],
+                        "entry_price": self._open_trade["entry_price"],
+                        "exit_time": str(ts)[:19],
+                        "exit_price": exit_price,
+                        "pnl": pnl
+                    })
+                # Otevři nový LONG
+                self._live_pos = +1
+                self._live_entry_px = float(raw.loc[ts, "close"])
+                self._open_trade = {
+                    "direction": "LONG",
+                    "entry_time": str(ts)[:19],
+                    "entry_price": self._live_entry_px
+                }
+        elif final == "SHORT":
+            if self._live_pos >= 0:
+                # Uzavři předchozí obchod, pokud existuje
+                if self._open_trade is not None:
+                    exit_price = float(raw.loc[ts, "close"])
+                    pnl = exit_price - self._open_trade["entry_price"] if self._open_trade["direction"] == "LONG" else self._open_trade["entry_price"] - exit_price
+                    self._add_trade_to_table(
+                        self._open_trade["entry_time"], self._open_trade["direction"],
+                        self._open_trade["entry_price"], str(ts)[:19], exit_price, pnl
+                    )
+                    self._trades.append({
+                        "entry_time": self._open_trade["entry_time"],
+                        "direction": self._open_trade["direction"],
+                        "entry_price": self._open_trade["entry_price"],
+                        "exit_time": str(ts)[:19],
+                        "exit_price": exit_price,
+                        "pnl": pnl
+                    })
+                # Otevři nový SHORT
+                self._live_pos = -1
+                self._live_entry_px = float(raw.loc[ts, "close"])
+                self._open_trade = {
+                    "direction": "SHORT",
+                    "entry_time": str(ts)[:19],
+                    "entry_price": self._live_entry_px
+                }
+        else:
+            # FLAT – uzavři případnou živou pozici
+            if self._live_pos != 0:
+                if self._open_trade is not None:
+                    exit_price = float(raw.loc[ts, "close"])
+                    pnl = exit_price - self._open_trade["entry_price"] if self._open_trade["direction"] == "LONG" else self._open_trade["entry_price"] - exit_price
+                    self._add_trade_to_table(
+                        self._open_trade["entry_time"], self._open_trade["direction"],
+                        self._open_trade["entry_price"], str(ts)[:19], exit_price, pnl
+                    )
+                    self._trades.append({
+                        "entry_time": self._open_trade["entry_time"],
+                        "direction": self._open_trade["direction"],
+                        "entry_price": self._open_trade["entry_price"],
+                        "exit_time": str(ts)[:19],
+                        "exit_price": exit_price,
+                        "pnl": pnl
+                    })
+                self._live_pos = 0
+                self._live_entry_px = None
+                self._open_trade = None
+
     def _append_log(self, text: str) -> None:
         self.console.appendPlainText(text)
         cursor = self.console.textCursor()
