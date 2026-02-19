@@ -36,6 +36,8 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -530,6 +532,10 @@ class LiveBotWidget(QWidget):
         self._rounds = {"grid": [], "tol_atr": 0.0}
         self.class_to_dir = {0: "SHORT", 1: "LONG"}
 
+        # Sledování obchodů
+        self._trades: list[dict[str, Any]] = []  # seznam obchodů pro tabulku
+        self._open_trade: dict[str, Any] | None = None  # otevřený obchod
+
         if QSoundEffect is not None and QUrl is not None and self.config.alert_sound:
             try:
                 self._se = QSoundEffect(self)
@@ -655,6 +661,16 @@ class LiveBotWidget(QWidget):
         lv.addWidget(self.console)
         log_box.setLayout(lv)
 
+        # Obchody
+        trades_box = QGroupBox("Obchody")
+        tv = QVBoxLayout()
+        self.tbl_trades = QTableWidget()
+        self.tbl_trades.setColumnCount(5)
+        self.tbl_trades.setHorizontalHeaderLabels(["Čas", "Směr", "Vstup", "Výstup", "PnL"])
+        self.tbl_trades.horizontalHeader().setStretchLastSection(True)
+        tv.addWidget(self.tbl_trades)
+        trades_box.setLayout(tv)
+
         # Grafy
         center = self._create_center_charts()
 
@@ -664,6 +680,7 @@ class LiveBotWidget(QWidget):
         left.addWidget(session_box)
         left.addWidget(model_box)
         left.addWidget(log_box, 1)
+        left.addWidget(trades_box, 1)
 
         main = QHBoxLayout()
         main.addLayout(left, 2)
@@ -1346,19 +1363,80 @@ class LiveBotWidget(QWidget):
             # --- Aktualizace stavu pozice pouze na posledním baru ---
             is_last_bar = (ts == feats.index[-1])
             if is_last_bar:
+                prev_pos = self._live_pos
                 if final == "LONG":
                     if self._live_pos <= 0:  # vstup/otočka
+                        # Uzavři předchozí obchod, pokud existuje
+                        if self._open_trade is not None:
+                            exit_price = float(raw.loc[ts, "close"])
+                            pnl = exit_price - self._open_trade["entry_price"] if self._open_trade["direction"] == "LONG" else self._open_trade["entry_price"] - exit_price
+                            self._add_trade_to_table(
+                                self._open_trade["entry_time"], self._open_trade["direction"],
+                                self._open_trade["entry_price"], str(ts)[:19], exit_price, pnl
+                            )
+                            self._trades.append({
+                                "entry_time": self._open_trade["entry_time"],
+                                "direction": self._open_trade["direction"],
+                                "entry_price": self._open_trade["entry_price"],
+                                "exit_time": str(ts)[:19],
+                                "exit_price": exit_price,
+                                "pnl": pnl
+                            })
+                        # Otevři nový LONG
                         self._live_pos = +1
                         self._live_entry_px = float(raw.loc[ts, "close"])
+                        self._open_trade = {
+                            "direction": "LONG",
+                            "entry_time": str(ts)[:19],
+                            "entry_price": self._live_entry_px
+                        }
                 elif final == "SHORT":
                     if self._live_pos >= 0:
+                        # Uzavři předchozí obchod, pokud existuje
+                        if self._open_trade is not None:
+                            exit_price = float(raw.loc[ts, "close"])
+                            pnl = exit_price - self._open_trade["entry_price"] if self._open_trade["direction"] == "LONG" else self._open_trade["entry_price"] - exit_price
+                            self._add_trade_to_table(
+                                self._open_trade["entry_time"], self._open_trade["direction"],
+                                self._open_trade["entry_price"], str(ts)[:19], exit_price, pnl
+                            )
+                            self._trades.append({
+                                "entry_time": self._open_trade["entry_time"],
+                                "direction": self._open_trade["direction"],
+                                "entry_price": self._open_trade["entry_price"],
+                                "exit_time": str(ts)[:19],
+                                "exit_price": exit_price,
+                                "pnl": pnl
+                            })
+                        # Otevři nový SHORT
                         self._live_pos = -1
                         self._live_entry_px = float(raw.loc[ts, "close"])
+                        self._open_trade = {
+                            "direction": "SHORT",
+                            "entry_time": str(ts)[:19],
+                            "entry_price": self._live_entry_px
+                        }
                 else:
                     # FLAT – uzavři případnou živou pozici
                     if self._live_pos != 0:
+                        if self._open_trade is not None:
+                            exit_price = float(raw.loc[ts, "close"])
+                            pnl = exit_price - self._open_trade["entry_price"] if self._open_trade["direction"] == "LONG" else self._open_trade["entry_price"] - exit_price
+                            self._add_trade_to_table(
+                                self._open_trade["entry_time"], self._open_trade["direction"],
+                                self._open_trade["entry_price"], str(ts)[:19], exit_price, pnl
+                            )
+                            self._trades.append({
+                                "entry_time": self._open_trade["entry_time"],
+                                "direction": self._open_trade["direction"],
+                                "entry_price": self._open_trade["entry_price"],
+                                "exit_time": str(ts)[:19],
+                                "exit_price": exit_price,
+                                "pnl": pnl
+                            })
                         self._live_pos = 0
                         self._live_entry_px = None
+                        self._open_trade = None
             # --------------------------------------------------------
 
             n_mapped += 1
@@ -1376,6 +1454,18 @@ class LiveBotWidget(QWidget):
         cursor = self.console.textCursor()
         cursor.movePosition(QTextCursor.End)
         self.console.setTextCursor(cursor)
+
+    def _add_trade_to_table(self, entry_time: str, direction: str, entry_price: float, exit_time: str, exit_price: float, pnl: float) -> None:
+        """Přidá obchod do tabulky."""
+        row = self.tbl_trades.rowCount()
+        self.tbl_trades.insertRow(row)
+        self.tbl_trades.setItem(row, 0, QTableWidgetItem(f"{entry_time} → {exit_time}"))
+        self.tbl_trades.setItem(row, 1, QTableWidgetItem(direction))
+        self.tbl_trades.setItem(row, 2, QTableWidgetItem(f"{entry_price:.2f}"))
+        self.tbl_trades.setItem(row, 3, QTableWidgetItem(f"{exit_price:.2f}"))
+        self.tbl_trades.setItem(row, 4, QTableWidgetItem(f"{pnl:+.2f}"))
+        # Scroll to bottom
+        self.tbl_trades.scrollToBottom()
 
     def _play_alert(self) -> None:
         try:
