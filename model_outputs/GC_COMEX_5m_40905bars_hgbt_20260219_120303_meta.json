@@ -1,0 +1,178 @@
+{
+  "created_at": "20260219_120303",
+  "created_at_iso": "2026-02-19T12:03:03.067571",
+  "estimator_name": "hgbt",
+  "best_params": {
+    "clf__l2_regularization": 0.1,
+    "clf__learning_rate": 0.06,
+    "clf__max_depth": 8,
+    "clf__max_iter": 200
+  },
+  "decision_threshold": 0.38999999999999996,
+  "trained_features": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "average",
+    "barCount",
+    "rsi",
+    "macd_macd",
+    "macd_hist",
+    "atr",
+    "williams_r",
+    "stoch_k",
+    "stoch_d"
+  ],
+  "n_features": 14,
+  "n_total_bars": 40905,
+  "n_train_bars": 40405,
+  "n_holdout_bars": 500,
+  "class_to_dir": {
+    "0": "SHORT",
+    "1": "LONG"
+  },
+  "classes": [
+    0,
+    1
+  ],
+  "annualize_sharpe": true,
+  "instrument": "GC",
+  "exchange": "COMEX",
+  "timeframe": "5m",
+  "mc_block_len": 40,
+  "metrics": {
+    "accuracy": 1.0,
+    "precision": 0.0,
+    "recall": 0.0,
+    "f1": 0.0,
+    "tn": 500,
+    "fp": 0,
+    "fn": 0,
+    "tp": 0,
+    "signals": 0,
+    "confusion3": {
+      "labels": [
+        -1,
+        0,
+        1
+      ],
+      "matrix": [
+        [
+          2,
+          264,
+          0
+        ],
+        [
+          0,
+          234,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    "per_class_3": {
+      "-1": {
+        "precision": 1.0,
+        "recall": 0.007518796992481203,
+        "f1": 0.014925373134328358,
+        "support": 266
+      },
+      "0": {
+        "precision": 0.46987951807228917,
+        "recall": 1.0,
+        "f1": 0.639344262295082,
+        "support": 234
+      },
+      "1": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 0
+      }
+    },
+    "f1_micro_3": 0.472,
+    "f1_macro_3": 0.21808987847647013,
+    "f1_weighted_3": 0.3071534132615611,
+    "profit_gross": -10.5,
+    "profit_net": -10.5,
+    "trade_pnls_gross": [
+      -10.5
+    ],
+    "trade_pnls_net": [
+      -10.5
+    ],
+    "sharpe": -0.039956967501275746,
+    "sharpe_net": -0.039956967501275746,
+    "sharpe_ann": -12.959369615288201,
+    "sharpe_net_ann": -12.959369615288201,
+    "max_drawdown": -11.699999999999818,
+    "max_drawdown_net": -11.699999999999818,
+    "max_drawdown_trade_gross": 11.699999999999818,
+    "max_drawdown_trade_net": 11.699999999999818,
+    "num_trades": 1,
+    "num_trades_long": 0,
+    "num_trades_short": 1,
+    "winrate": 0.0,
+    "profit_factor": 0.0,
+    "avg_pnl_trade": -10.5,
+    "median_pnl_trade": -10.5,
+    "var_95": -10.5,
+    "cvar_95": -10.5,
+    "rolling_pnl_mean": -10.5,
+    "signal_stability": 1.0,
+    "sharpe_ratio": -0.039956967501275746,
+    "max_dd": -11.699999999999818,
+    "trades": 1,
+    "pf": 0.0,
+    "n_signals_holdout": 498
+  },
+  "mc": {
+    "iters": 200,
+    "block_len": 40,
+    "min_trades": 20,
+    "thr_scan": [
+      0.5,
+      0.48,
+      0.46,
+      0.45,
+      0.42,
+      0.4,
+      0.38,
+      0.36,
+      0.34,
+      0.32,
+      0.3,
+      0.28,
+      0.26,
+      0.25
+    ],
+    "sharpe": {
+      "p10": -0.06931825702066044,
+      "p50": -0.039956967501275746,
+      "p90": -0.03995696750127574
+    },
+    "max_drawdown": {
+      "p90": 0.0
+    },
+    "profit_net": {
+      "p10": -21.869999999999962,
+      "p50": -10.5,
+      "p90": 0.0
+    }
+  },
+  "feature_importance": {},
+  "user_settings": {
+    "decision_threshold": 0.5,
+    "entry_threshold": 0.4999999999999999,
+    "exit_threshold": 0.5699999999999998,
+    "use_and_ensemble": false,
+    "use_ma_only": false,
+    "updated_at": "2026-02-19 15:07:34.244820+00:00"
+  }
+}

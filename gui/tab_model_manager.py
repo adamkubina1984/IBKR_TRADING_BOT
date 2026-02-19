@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import joblib
+import numpy as np
 import pandas as pd
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
@@ -27,6 +28,8 @@ from PySide6.QtWidgets import (
 
 from ibkr_trading_bot.core.services.model_service import load_model_with_meta
 
+# Výchozí (default) složka s modely
+DEFAULT_MODEL_DIR = Path(__file__).parent.parent / "model_outputs"
 
 def _as_float(x: Any, default: float = float("-inf")) -> float:
     """Bezpečně převeď na float (např. '0', '0.0', None, 'nan', '0,1')."""
@@ -121,19 +124,24 @@ def discover_models(dir_path: Path) -> list[ModelRecord]:
         except Exception:
             pass
 
-        # --- robustní parsování metrik na skaláry ---
+        # --- robustní parsování metrik na skaláry, s handlerováním Infinity a NaN ---
         metrics_raw = meta.get("metrics") or {}
         metrics: dict[str, float] = {}
         for k, v in metrics_raw.items():
             try:
                 if isinstance(v, (int, float)):
-                    metrics[k] = float(v)
+                    if np.isfinite(v):
+                        metrics[k] = float(v)
                 elif isinstance(v, str):
-                    metrics[k] = float(v.strip())
+                    v_clean = v.strip()
+                    if v_clean.lower() in ("nan", "infinity", "inf", "-infinity"):
+                        continue  # skip NaN, Infinity
+                    metrics[k] = float(v_clean)
                 elif isinstance(v, (list, tuple)) and len(v) == 1 and isinstance(v[0], (int, float)):
-                    metrics[k] = float(v[0])
-                # jinak ignoruj (např. listy equity, dicty s kvantily apod.)
-            except Exception:
+                    if np.isfinite(v[0]):
+                        metrics[k] = float(v[0])
+                # jinák ignoruj (např. listy equity, dicty s kvantily apod.)
+            except (ValueError, TypeError):
                 pass
 
         # --- čas vytvoření (string pro UI + timestamp pro třídění) ---
@@ -186,6 +194,7 @@ class ModelManagerTab(QWidget):
         self.setObjectName("tab_model_manager")
 
         self.dir_edit = QLineEdit(self)
+        self.dir_edit.setText(str(DEFAULT_MODEL_DIR))  # Nainicializuj na default cestu
         self.btn_browse = QPushButton("Zvolit složku s modely…", self)
         self.chk_auto = QCheckBox("Auto-load nejnovější/best model")
         self.chk_auto.setChecked(True)
@@ -244,9 +253,16 @@ class ModelManagerTab(QWidget):
         self.timer.timeout.connect(self._tick)
         self.timer.start()
 
+        # Načti modely z default cesty a auto-load nejlepší
+        self._refresh_list()
+        if self.chk_auto.isChecked():
+            self._auto_load_best()
+
     # ---------- UI callbacks ----------
     def _on_browse(self):
-        d = QFileDialog.getExistingDirectory(self, "Zvol složku s modely")
+        # Defaultně otevři dialog v DEFAULT_MODEL_DIR
+        start_dir = str(DEFAULT_MODEL_DIR) if DEFAULT_MODEL_DIR.exists() else str(Path.home())
+        d = QFileDialog.getExistingDirectory(self, "Zvol složku s modely", start_dir)
         if d:
             self.dir_edit.setText(d)
             self._refresh_list()
@@ -386,14 +402,24 @@ class ModelManagerTab(QWidget):
             self.tbl.setItem(i, 0, QTableWidgetItem(r.model_path.name))
             self.tbl.setItem(i, 1, QTableWidgetItem(r.sha1[:8]))
             self.tbl.setItem(i, 2, QTableWidgetItem(r.created or ""))
-            sharpe_txt = "" if r.metrics.get("sharpe") is None else f"{r.metrics.get('sharpe'):.3f}"
+            
+            # Sharpe - zobraz N/A pokud chybí
+            sharpe_val = r.metrics.get("sharpe")
+            sharpe_txt = f"{sharpe_val:.3f}" if sharpe_val is not None else "–"
             self.tbl.setItem(i, 3, QTableWidgetItem(sharpe_txt))
-            profit_txt = "" if r.metrics.get("profit_net") is None else f"{r.metrics.get('profit_net'):.0f}"
+            
+            # Profit - zobraz N/A pokud chybí
+            profit_val = r.metrics.get("profit_net")
+            profit_txt = f"{profit_val:.0f}" if profit_val is not None else "–"
             self.tbl.setItem(i, 4, QTableWidgetItem(profit_txt))
-            pf_txt = "" if r.metrics.get("profit_factor") is None else f"{r.metrics.get('profit_factor'):.2f}"
+            
+            # Profit Factor - zobraz N/A pokud chybí
+            pf_val = r.metrics.get("profit_factor") or r.metrics.get("pf")
+            pf_txt = f"{pf_val:.2f}" if pf_val is not None else "–"
             self.tbl.setItem(i, 5, QTableWidgetItem(pf_txt))
+            
             self.tbl.setItem(i, 6, QTableWidgetItem(str(r.features_n)))
-            # Top feature z feature_importance (pokud je dostupný)
+            # Top feature z feature_importance
             top_feat = ""
             if r.model_path.exists():
                 try:
@@ -402,9 +428,10 @@ class ModelManagerTab(QWidget):
                         meta_txt = meta_path.read_text(encoding="utf-8")
                         meta = json.loads(meta_txt)
                         feat_imp = meta.get("feature_importance", {})
-                        if feat_imp:
-                            top_feat = list(feat_imp.keys())[0][:12]  # první feature, zkrácený
-                except Exception:
+                        if feat_imp and isinstance(feat_imp, dict):
+                            # najdi feature s největší importante
+                            top_feat = max(feat_imp.keys(), key=lambda x: feat_imp[x])[:12]  # první feature, zkrácený
+                except Exception as e:
                     pass
             self.tbl.setItem(i, 7, QTableWidgetItem(top_feat))
 

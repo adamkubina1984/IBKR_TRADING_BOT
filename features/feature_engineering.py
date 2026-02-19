@@ -315,15 +315,32 @@ def main(input_path: str, output_path: str | None = None) -> None:
 
 def prepare_dataset_with_targets(df, to_signed: bool = True):
     """
-    Dummy funkce – přidá cílovou proměnnou.
+    Vypočítá všechny technické indikátory pomocí compute_all_features() + přidá cílovou proměnnou.
     to_signed=True → převede na {-1, 1}, jinak ponechá bool.
     """
     df = df.copy()
-    df["target"] = df["close"].shift(-1) > df["close"]  # True/False
-    df = df.dropna()
+    if "timestamp" not in df.columns:
+        for cand in ("date", "datetime", "Date", "Datetime", "time", "Time"):
+            if cand in df.columns:
+                df = df.rename(columns={cand: "timestamp"})
+                break
+    # 1) Počítáme všechny technické indikátory (RSI, MACD, ATR, Williams %R, Stochastic)
+    df_with_features = compute_all_features(df)
+    
+    # 2) Převedeme timestamp z indexu do sloupce (compute_all_features vrací df s indexem=timestamp)
+    if df_with_features.index.name == "timestamp":
+        df_with_features = df_with_features.reset_index()
+    elif "timestamp" not in df_with_features.columns:
+        raise ValueError("compute_all_features() nevrátil DataFrame s timestamp indexem ani sloupcem")
+    
+    # 3) Přidáme target (close.shift(-1) > close)
+    df_with_features["target"] = df_with_features["close"].shift(-1) > df_with_features["close"]
+    df_with_features = df_with_features.dropna()
+    
     if to_signed:
-        df["target"] = df["target"].map({True: 1, False: -1}).astype(int)
-    return df
+        df_with_features["target"] = df_with_features["target"].map({True: 1, False: -1}).astype(int)
+    
+    return df_with_features
 
 
 

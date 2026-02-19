@@ -481,9 +481,31 @@ def train_and_evaluate_model(
                 fee_per_trade=fee_per_trade, slippage_bps=slippage_bps
             )
 
-    holdout_metrics, mc_summary = {}, {}
+    holdout_metrics, train_metrics, mc_summary = {}, {}, {}
     n_signals_holdout: int | None = None
+    n_signals_train: int | None = None
     base_threshold_mc: float = float(decision_threshold)
+
+    # --- TRAIN metriky (z OOF, bez training leakage) ---
+    if best_oof is not None:
+        valid = np.isfinite(best_oof)
+        if valid.any():
+            try:
+                df_train_valid = df_train.iloc[valid.nonzero()[0]]
+                y_train = df_train_valid["target"].astype(int).to_numpy()
+                y_train_pred = (best_oof[valid] >= float(decision_threshold)).astype(int)
+                n_signals_train = int((best_oof[valid] >= float(decision_threshold)).sum())
+                
+                if HAS_CALC_METRICS:
+                    train_metrics = calculate_metrics(
+                        y_true=y_train, y_pred=y_train_pred, df=df_train_valid,
+                        fee_per_trade=fee_per_trade, slippage_bps=slippage_bps,
+                        annualize_sharpe=annualize_sharpe
+                    )
+                else:
+                    train_metrics = {"accuracy": float((y_train_pred == y_train).mean())}
+            except Exception:
+                pass
 
     if df_hold is not None and len(df_hold) >= 10:
         used_feats = list(X_all.columns)
@@ -553,6 +575,8 @@ def train_and_evaluate_model(
         "n_train_bars": len(df_train),
         "n_holdout_bars": int(len(df_hold) if df_hold is not None else 0),
         "annualize_sharpe": bool(annualize_sharpe),
+        "metrics_train": {**train_metrics, **({"n_signals_train": n_signals_train} if n_signals_train is not None else {})},
+        "metrics_holdout": {**holdout_metrics, **({"n_signals_holdout": n_signals_holdout} if n_signals_holdout is not None else {})},
         **(meta_extra or {}),
     }
     import joblib
@@ -573,7 +597,9 @@ def train_and_evaluate_model(
         "classes": None,
         "annualize_sharpe": bool(annualize_sharpe),
         **(meta_extra or {}),
-        "metrics": {**holdout_metrics, **({"n_signals_holdout": n_signals_holdout} if n_signals_holdout is not None else {})},
+        "metrics_train": {**train_metrics, **({"n_signals_train": n_signals_train} if n_signals_train is not None else {})},
+        "metrics_holdout": {**holdout_metrics, **({"n_signals_holdout": n_signals_holdout} if n_signals_holdout is not None else {})},
+        "metrics": {**holdout_metrics, **({"n_signals_holdout": n_signals_holdout} if n_signals_holdout is not None else {})},  # backward compat
         "mc": mc_summary,
         "feature_importance": {},  # bude naplněno níže
     }

@@ -61,13 +61,22 @@ class DatasetService:
 
         # --- 4) zajisti timestamp ve výstupu
         if "timestamp" not in df_prepared.columns:
-            df_prepared["timestamp"] = raw["timestamp"].values
+            # Timestamp může být v indexu po compute_all_features()
+            if hasattr(df_prepared, 'index') and df_prepared.index.name == "timestamp":
+                df_prepared = df_prepared.reset_index()
+            else:
+                raise ValueError(
+                    "Po přípravě datasetu chybí sloupec 'timestamp'. "
+                    "prepare_dataset_with_targets() musí vrátit DataFrame s timestamp sloupcem nebo indexem."
+                )
 
         # --- 5) labeling: buď respektuj target z prepare_* (prepared),
         #         nebo vygeneruj triple-barrier (přepíše existující y/target)
         if labeling == "triple_barrier":
+            # VŽDY počítáme triple barrier nad df_prepared (který má featury a správný počet řádků)
+            # ne nad raw, jinak budou nesedět délky
             tb = make_triple_barrier_labels(
-                df=raw if set(["close"]).issubset(raw.columns) else df_prepared,
+                df=df_prepared,
                 horizon=horizon,
                 take_profit_bps=take_profit_bps,
                 stop_loss_bps=stop_loss_bps,

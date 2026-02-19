@@ -84,6 +84,8 @@ class WarmupConfig:
     start_sharpe: float = 0.0
     max_dd: float = 20.0
     diag_first_n: int = 10
+    # Pokud True, po warm-upu přepni do LIVE bez ohledu na metriky.
+    force_live_after_warmup: bool = False
     # Počet obchodů používaných pro rolling metriky v warm‑upu
     roll_window: int = 20
 
@@ -204,6 +206,10 @@ class LiveWarmupService:
         self.log.info(
             f"[WARMUP-END] bars={self._bars_seen} sim_trades={self._sim_trades} sharpe={sharpe:.2f} maxDD={maxdd:.1f}"
         )
+        if self.cfg.force_live_after_warmup:
+            self.state = "LIVE"
+            self.log.info("[INFO] force_live_after_warmup=True → přepínám do LIVE režimu.")
+            return
         if self._can_go_live(sharpe, maxdd):
             self.state = "LIVE"
 
