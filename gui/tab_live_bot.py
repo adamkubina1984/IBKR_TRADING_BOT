@@ -11,6 +11,7 @@ import json as jsonlib
 import os
 import smtplib
 import threading
+import warnings
 from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Any
@@ -97,6 +98,104 @@ def _make_proxy_target_from_df(df):
     y_proxy = np.where(up, "LONG", "SHORT")
     return y_proxy
 
+
+def _feature_names_for_model(model) -> list[str] | None:
+    try:
+        names = getattr(model, "feature_names_in_", None)
+        if names is not None:
+            return [str(c) for c in list(names)]
+    except Exception:
+        pass
+    try:
+        steps = getattr(model, "steps", None)
+        if steps:
+            last = steps[-1][1]
+            names = getattr(last, "feature_names_in_", None)
+            if names is not None:
+                return [str(c) for c in list(names)]
+    except Exception:
+        pass
+    return None
+
+
+def _align_X_for_model(model, X):
+    if isinstance(X, pd.DataFrame):
+        Xdf = X.copy()
+    else:
+        Xdf = pd.DataFrame(X)
+
+    names = _feature_names_for_model(model)
+    if names:
+        for c in names:
+            if c not in Xdf.columns:
+                Xdf[c] = 0.0
+        Xdf = Xdf.reindex(columns=names, fill_value=0.0)
+
+    med = Xdf.median(numeric_only=True)
+    Xdf = Xdf.fillna(med).fillna(0.0)
+    for c in Xdf.columns:
+        if not pd.api.types.is_bool_dtype(Xdf[c]):
+            Xdf[c] = Xdf[c].astype(float, copy=False)
+    return Xdf
+
+
+def _predict_proba_safely(model, X):
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"X does not have valid feature names, but .* was fitted with feature names",
+            category=UserWarning,
+        )
+        return model.predict_proba(X)
+
+
+def _infer_label_map_from_classes(classes, base_map: dict | None = None) -> dict[int, str]:
+    """
+    Vrátí robustní mapu numerických tříd na směr:
+    - binární: {-1,+1} nebo {0,1}
+    - ternární: {-1,0,+1} nebo {0,1,2}
+    Pokud je base_map dodaná, má prioritu nad inferovanou mapou.
+    """
+    inferred: dict[int, str] = {}
+
+    ints: list[int] = []
+    if classes is not None:
+        for c in list(classes):
+            try:
+                ints.append(int(c))
+            except Exception:
+                pass
+
+    uniq = sorted(set(ints))
+    if uniq:
+        s = set(uniq)
+        if s == {-1, 1}:
+            inferred = {-1: "SHORT", 1: "LONG"}
+        elif s == {0, 1}:
+            inferred = {0: "SHORT", 1: "LONG"}
+        elif s == {-1, 0, 1}:
+            inferred = {-1: "SHORT", 0: "HOLD", 1: "LONG"}
+        elif s == {0, 1, 2}:
+            inferred = {0: "SHORT", 1: "HOLD", 2: "LONG"}
+        else:
+            if len(uniq) >= 2:
+                inferred[uniq[0]] = "SHORT"
+                inferred[uniq[-1]] = "LONG"
+            for u in uniq[1:-1]:
+                inferred[u] = "HOLD"
+
+    if not inferred:
+        inferred = {0: "SHORT", 1: "LONG"}
+
+    if base_map:
+        for k, v in base_map.items():
+            try:
+                inferred[int(k)] = str(v).upper()
+            except Exception:
+                continue
+
+    return inferred
+
 def _auto_detect_label_polarity(model, X_df, raw_df, max_samples=200):
     """
     Zjistí, zda je 0=LONG/1=SHORT nebo 0=SHORT/1=LONG porovnáním s proxy cílem z cen.
@@ -124,7 +223,8 @@ def _auto_detect_label_polarity(model, X_df, raw_df, max_samples=200):
         y_proxy = y_proxy[-nX:]
 
     # Predikce
-    proba = model.predict_proba(X.to_numpy(dtype=float))
+    X_pred = _align_X_for_model(model, X)
+    proba = _predict_proba_safely(model, X_pred)
     classes = getattr(model, "classes_", None)
     if classes is None or len(classes) != proba.shape[1] or len(proba) != len(y_proxy):
         return {0: "SHORT", 1: "LONG"}
@@ -152,17 +252,16 @@ def _extract_long_short_proba(model, df_row, label_map: dict | None = None):
     Default (bez label_map) je bezpečný {0:"SHORT", 1:"LONG"}.
     """
     # 1) Skutečný výpočet proba
+    X_pred = _align_X_for_model(model, df_row)
     try:
-        proba = model.predict_proba(df_row)[0]
+        proba = _predict_proba_safely(model, X_pred)[0]
     except Exception:
-        proba = model.predict_proba(np.asarray(df_row, dtype=float))[0]
+        proba = _predict_proba_safely(model, df_row)[0]
 
     classes = getattr(model, "classes_", None)
 
-    # 2) Výchozí bezpečná mapa pro numerické třídy (pokud label_map není dána)
-    #    - v praxi většina modelů: 0=SHORT, 1=LONG
-    if label_map is None:
-        label_map = {0: "SHORT", 1: "LONG"}
+    # 2) Robustní mapa pro numerické třídy (včetně ternární klasifikace)
+    label_map = _infer_label_map_from_classes(classes, base_map=label_map)
 
     p_long = p_short = None
 
@@ -206,11 +305,55 @@ def _extract_long_short_proba(model, df_row, label_map: dict | None = None):
             p_long, p_short = p_max, 1.0 - p_max
         elif dir_max == "SHORT":
             p_long, p_short = 1.0 - p_max, p_max
+        elif dir_max in ("HOLD", "FLAT", "NONE"):
+            p_long, p_short = 0.5, 0.5
         else:
             # když fakt netuším: udrž symetrii
             p_long, p_short = p_max, 1.0 - p_max
 
     return float(p_long), float(p_short), (list(classes) if classes is not None else None), proba
+
+
+def _pick_direction_from_raw_proba(
+    classes_i,
+    raw_proba,
+    label_map: dict,
+    hold_block_thr: float = 0.78,
+    hold_margin: float = 0.20,
+):
+    """
+    Určí směr z raw pravděpodobností u multi-class modelu.
+    HOLD blokuje směr jen při silné dominanci (thr + margin), jinak vrací LONG/SHORT.
+    """
+    try:
+        if classes_i is None or raw_proba is None or len(raw_proba) != len(classes_i):
+            return None, 0.0
+
+        map_i = _infer_label_map_from_classes(classes_i, base_map=label_map)
+
+        p_long = p_short = p_hold = 0.0
+        for idx, cls in enumerate(classes_i):
+            try:
+                d = str(map_i.get(int(cls), "")).upper()
+            except Exception:
+                d = ""
+            p = float(raw_proba[idx])
+            if d == "LONG":
+                p_long += p
+            elif d == "SHORT":
+                p_short += p
+            elif d in ("HOLD", "FLAT", "NONE", "NEUTRAL"):
+                p_hold += p
+
+        dir_side = "LONG" if p_long >= p_short else "SHORT"
+        p_side = p_long if dir_side == "LONG" else p_short
+
+        if p_hold >= hold_block_thr and (p_hold - p_side) >= hold_margin:
+            return "FLAT", float(p_hold)
+
+        return dir_side, float(p_side)
+    except Exception:
+        return None, 0.0
 
 
 # ==============================================
@@ -225,7 +368,7 @@ class LiveConfig:
     sensitivity: float = 0.5      # confidence threshold (0..1)
     dry_run: bool = True
     max_fresh_age_min: int = 5
-    max_bars_buffer: int = 150
+    max_bars_buffer: int = 300  # Buffer pro live bars (po dropna z rolling bude ~200 validních)
     use_ma_only: bool = False
     use_and_ensemble: bool = True  # MA ∧ Model
     alert_on_flip: bool = True
@@ -382,7 +525,7 @@ class _WarmAdapter:
         self._hist_df = pd.concat([self._hist_df, row], ignore_index=True)
         feat = self.w._compute_indicators(self._hist_df.rename(columns={"date": "date"}))
         last = feat.iloc[[-1]].copy()
-        X = self.w._align_features_to_model(last)
+        X = self.w._sanitize_feature_matrix(last)
 
         if getattr(self.w.config, "use_ma_only", False):
             for col in ("ma_fast", "ma_slow"):
@@ -540,6 +683,16 @@ class LiveBotWidget(QWidget):
         # Nastavení modelu z Tab 3 (uložená v metadata)
         self.user_settings = {}  # dict se všemi thresholdy a flagy z Tab 3
 
+        # Diagnostika degradace modelu (Reference vs Live)
+        self.reference_metrics = {}  # Referenční metriky z metadata (train nebo holdout)
+        self._prediction_buffer = []  # Buffer posledních N predictions (signály)
+        self._price_buffer = []  # Buffer posledních N cen (close)
+        self._y_true_buffer = []  # Buffer posledních N ground truth (pokud dostupné)
+        self._tracked_timestamps = set()  # Set timestampů již trackovaných barů (pro deduplicitu)
+        self.degradation_window_size = 500  # Počet barů pro recent window
+        self._last_degradation_check = 0  # Index posledního checku
+        self.live_metrics_recent = {}  # Aktuální metriky na recent window
+
         # Sledování obchodů
         self._trades: list[dict[str, Any]] = []  # seznam obchodů pro tabulku
         self._open_trade: dict[str, Any] | None = None  # otevřený obchod
@@ -689,6 +842,16 @@ class LiveBotWidget(QWidget):
         model_layout.addLayout(invert_layout)
         model_box.setLayout(model_layout)
 
+        # Diagnostika degradace modelu
+        degradation_box = QGroupBox("📊 Diagnostika degradace modelu")
+        deg_layout = QVBoxLayout()
+        self.degradation_console = QPlainTextEdit()
+        self.degradation_console.setReadOnly(True)
+        self.degradation_console.setMaximumHeight(120)
+        self.degradation_console.setPlainText("(Žádný model načten)")
+        deg_layout.addWidget(self.degradation_console)
+        degradation_box.setLayout(deg_layout)
+
         # Log
         log_box = QGroupBox("Log")
         lv = QVBoxLayout()
@@ -714,6 +877,7 @@ class LiveBotWidget(QWidget):
         left.addWidget(status_box)
         left.addWidget(session_box)
         left.addWidget(model_box)
+        left.addWidget(degradation_box)
         left.addWidget(log_box, 1)
         left.addWidget(trades_box, 1)
 
@@ -778,6 +942,7 @@ class LiveBotWidget(QWidget):
         loaded = []
         feats_sets = []
         feats_lists = []
+        classes_summary = []
         label_map_final = None
 
         def _extract_predictor(obj):
@@ -798,22 +963,53 @@ class LiveBotWidget(QWidget):
             if not os.path.exists(p):
                 self._append_log(f"[ERROR] Soubor neexistuje: {p}")
                 return False
+            
+            self._append_log(f"[MODEL] Načítám: {p}")
+            
             try:
                 obj = joblib.load(p)
                 pred, meta = _extract_predictor(obj)
-                # načti meta z pkl-sidecaru, pokud chybí
-                if not meta:
-                    meta_path = Path(p).with_name(Path(p).stem + "_meta.json")
-                    if meta_path.exists():
-                        try:
-                            with meta_path.open("r", encoding="utf-8") as fh:
-                                meta = jsonlib.load(fh)
-                        except Exception:
-                            meta = {}
+                
+                # načti meta z pkl-sidecaru (VŽDY, i když _extract_predictor něco vrátil)
+                meta_path = Path(p).with_name(Path(p).stem + "_meta.json")
+                self._append_log(f"[META] Hledám metadata: {meta_path}")
+                
+                if meta_path.exists():
+                    try:
+                        with meta_path.open("r", encoding="utf-8") as fh:
+                            loaded_meta = jsonlib.load(fh)
+                        
+                        # Merge metadata (sidecar má prioritu)
+                        if isinstance(loaded_meta, dict):
+                            meta.update(loaded_meta)  # Přepíše prázdné meta z PKL
+                            self._append_log(f"[META] ✅ Načteno {len(loaded_meta)} klíčů z {meta_path.name}")
+                            self._append_log(f"[META] Klíče: {list(loaded_meta.keys())[:10]}")
+                        else:
+                            self._append_log(f"[META] ⚠️ Metadata nejsou dict: {type(loaded_meta)}")
+                    except Exception as ex:
+                        self._append_log(f"[META] ❌ Chyba při čtení {meta_path.name}: {ex}")
+                        import traceback
+                        self._append_log(f"[DEBUG] {traceback.format_exc()[:500]}")
+                else:
+                    self._append_log(f"[META] ⚠️ Soubor neexistuje: {meta_path}")
+                    self._append_log(f"[META] Zkouším absolutní cestu: {meta_path.absolute()}")
+                    if not meta_path.absolute().exists():
+                        self._append_log(f"[META] ❌ Ani absolutní cesta neexistuje")
 
                 # map tříd (poprvé převezmeme)
                 if not label_map_final:
-                    self.class_to_dir = {0: "SHORT", 1: "LONG"}
+                    meta_map = None
+                    if isinstance(meta, dict):
+                        meta_map = meta.get("class_to_dir")
+                    parsed_map = {}
+                    if isinstance(meta_map, dict):
+                        for k, v in meta_map.items():
+                            try:
+                                parsed_map[int(k)] = str(v).upper()
+                            except Exception:
+                                pass
+                    inferred_map = _infer_label_map_from_classes(getattr(pred, "classes_", None), base_map=None)
+                    self.class_to_dir = parsed_map if parsed_map else inferred_map
                     label_map_final = self.class_to_dir
 
                 # featury
@@ -834,10 +1030,30 @@ class LiveBotWidget(QWidget):
                     "predictor": pred,
                     "path": p,
                     "exp_feats": exp_list if exp else None,
-                    "label_map": {0: "SHORT", 1: "LONG"},  # per-model default
+                    "label_map": dict(self.class_to_dir),
                     "metadata": meta,  # uložit metadata pro později
                 })
-                self._append_log(f"[INFO] Načten model: {os.path.basename(p)}")
+
+                try:
+                    classes_dbg = list(getattr(pred, "classes_", []))
+                except Exception:
+                    classes_dbg = []
+                classes_summary.append({
+                    "model": os.path.basename(p),
+                    "classes": classes_dbg,
+                })
+                self._append_log(
+                    f"[TAB4-DIAG] class_map model={os.path.basename(p)} classes={classes_dbg} map={loaded[-1]['label_map']}"
+                )
+                
+                # Debug: Zkontroluj, že metadata obsahují očekávané klíče
+                meta_keys = list(meta.keys()) if isinstance(meta, dict) else []
+                has_train = "metrics_train" in meta
+                has_holdout = "metrics_holdout" in meta
+                self._append_log(f"[META] Model metadata obsahuje {len(meta_keys)} klíčů")
+                self._append_log(f"[META] metrics_train: {has_train}, metrics_holdout: {has_holdout}")
+                
+                self._append_log(f"[INFO] ✅ Načten model: {os.path.basename(p)}")
             except Exception as e:
                 self._append_log(f"[ERROR] Načtení modelu selhalo ({p}): {e}")
                 return False
@@ -845,6 +1061,18 @@ class LiveBotWidget(QWidget):
         # uložit členy ensemble
         self.models = loaded
         self.model = loaded[0]["predictor"] if loaded else None  # jen pro feature_names_in_
+
+        if classes_summary:
+            uniq_counts = {}
+            for it in classes_summary:
+                key = tuple(it.get("classes") or [])
+                uniq_counts[key] = int(uniq_counts.get(key, 0)) + 1
+            combos = " | ".join(
+                [f"classes={list(k)} x{v}" for k, v in sorted(uniq_counts.items(), key=lambda kv: (len(kv[0]), str(kv[0])))]
+            )
+            self._append_log(
+                f"[TAB4-DIAG] startup models={len(classes_summary)} unique={len(uniq_counts)} {combos}"
+            )
 
         # Cada model usa sus propias features - sin intersección
         base_cols = ['close', 'ma_fast', 'ma_slow', 'atr', 'average']
@@ -870,14 +1098,34 @@ class LiveBotWidget(QWidget):
     def _load_user_settings_from_first_model(self) -> None:
         """Načte user_settings z metadat prvního modelu a zobrazí je jako read-only info panel."""
         if not self.models or not self.models[0]:
+            self._append_log("[SETTINGS] ❌ Žádné modely načteny")
             self._update_settings_display({})
+            self._load_reference_metrics({})
             return
         
         try:
             # Vezmi metadata z prvního modelu
             first_model = self.models[0]
             metadata = first_model.get("metadata") or {}
+            
+            self._append_log(f"[SETTINGS] Metadata typ: {type(metadata)}, velikost: {len(metadata) if isinstance(metadata, dict) else 'N/A'}")
+            
+            if not isinstance(metadata, dict):
+                self._append_log(f"[SETTINGS] ❌ Metadata nejsou dict: {type(metadata)}")
+                metadata = {}
+            
+            if not metadata:
+                self._append_log("[SETTINGS] ⚠️ Metadata jsou prázdný dict")
+            else:
+                self._append_log(f"[SETTINGS] Metadata klíče: {list(metadata.keys())[:15]}")
+            
             user_settings = metadata.get("user_settings") or {}
+            
+            # Načti referenční metriky pro degradation diagnostics
+            self._load_reference_metrics(metadata)
+            
+            # Načti historická data pro okamžitou degradation diagnostiku
+            self._preload_historical_data_for_degradation()
             
             if not user_settings:
                 self._append_log("[INFO] Žádná uložená nastavení v modelu - ponechávám defaults")
@@ -891,6 +1139,261 @@ class LiveBotWidget(QWidget):
         except Exception as e:
             self._append_log(f"[WARN] Nelze načít user_settings: {e}")
             self._update_settings_display({})
+            self._load_reference_metrics({})
+    
+    def _load_reference_metrics(self, metadata: dict) -> None:
+        """Extrahuje referenční metriky z metadata modelu (holdout preferovaně, jinak train)."""
+        if not metadata:
+            msg = "❌ PRÁZDNÁ METADATA\n\nModel neobsahuje žádná metadata.\nOvěřte, že existuje soubor *_meta.json vedle .pkl souboru."
+            self.degradation_console.setPlainText(msg)
+            self._append_log("[DEGRADATION] ❌ Metadata jsou prázdná")
+            self.reference_metrics = {}
+            return
+        
+        # Debug: Co je v metadatech?
+        self._append_log(f"[DEGRADATION] Metadata klíče: {list(metadata.keys())[:20]}")
+        
+        # Načti metriky
+        holdout = metadata.get("metrics_holdout")
+        train = metadata.get("metrics_train")
+        
+        # Fallback: hledej jiné klíče s metrikami
+        if not holdout and not train:
+            # Zkus generic "metrics" klíč
+            generic_metrics = metadata.get("metrics")
+            if generic_metrics and isinstance(generic_metrics, dict):
+                # Pokud obsahuje nested strukturu (train/holdout)
+                if "holdout" in generic_metrics:
+                    holdout = generic_metrics["holdout"]
+                elif "train" in generic_metrics:
+                    train = generic_metrics["train"]
+                else:
+                    # Použij přímo jako train metriky
+                    train = generic_metrics
+        
+        self._append_log(f"[DEGRADATION] metrics_train nalezeny: {bool(train)}")
+        self._append_log(f"[DEGRADATION] metrics_holdout nalezeny: {bool(holdout)}")
+        
+        if holdout:
+            self.reference_metrics = holdout
+            ref_source = "holdout"
+            self._append_log(f"[DEGRADATION] ✅ Použity HOLDOUT metriky ({len(holdout)} klíčů)")
+        elif train:
+            self.reference_metrics = train
+            ref_source = "train (OOF)"
+            self._append_log(f"[DEGRADATION] ✅ Použity TRAIN metriky ({len(train)} klíčů)")
+        else:
+            self.reference_metrics = {}
+            available_keys = [k for k in metadata.keys() if "metric" in k.lower()]
+            msg = (
+                f"❌ Žádné referenční metriky v metadata\n\n"
+                f"Hledal jsem: metrics_train, metrics_holdout\n"
+                f"Metadata obsahuje {len(metadata)} klíčů\n"
+                f"Klíče s 'metric': {available_keys if available_keys else 'žádné'}\n\n"
+                f"Všechny klíče:\n" + "\n".join(f"  • {k}" for k in list(metadata.keys())[:20])
+            )
+            self.degradation_console.setPlainText(msg)
+            self._append_log("[DEGRADATION] ❌ Reference metriky nenalezeny")
+            return
+        
+        # Zobraz info o referenčních metrikách
+        ref_f1 = self.reference_metrics.get("f1", "?")
+        ref_acc = self.reference_metrics.get("accuracy", "?")
+        ref_sharpe = self.reference_metrics.get("sharpe", "?")
+        ref_profit = self.reference_metrics.get("profit_net", "?")
+        
+        # Formátuj hodnoty (nelze použít podmínky přímo v format specifieru)
+        acc_str = f"{ref_acc:.4f}" if isinstance(ref_acc, (int, float)) else str(ref_acc)
+        f1_str = f"{ref_f1:.4f}" if isinstance(ref_f1, (int, float)) else str(ref_f1)
+        sharpe_str = f"{ref_sharpe:.4f}" if isinstance(ref_sharpe, (int, float)) else str(ref_sharpe)
+        profit_str = f"{ref_profit:.2f}" if isinstance(ref_profit, (int, float)) else str(ref_profit)
+        
+        info_text = (
+            f"📌 Referenční metriky ({ref_source}):\n"
+            f"   Accuracy: {acc_str}\n"
+            f"   F1: {f1_str}\n"
+            f"   Sharpe: {sharpe_str}\n"
+            f"   Profit Net: {profit_str}\n"
+            f"\n⏳ Čekám na {self.degradation_window_size} barů pro live diagnostiku..."
+        )
+        self.degradation_console.setPlainText(info_text)
+    
+    def _preload_historical_data_for_degradation(self) -> None:
+        """
+        Načte historická data z TradingView a naplní buffery pro degradation diagnostiku.
+        Umožní okamžitou diagnostiku bez čekání na 500+ nových barů.
+        """
+        if not self.models:
+            self._append_log("[DEGRADATION] Přeskakuji preload - žádné modely načteny")
+            self.degradation_console.setPlainText("(Načtěte model pro spuštění diagnostiky)")
+            return
+        
+        if not self.reference_metrics:
+            self._append_log("[DEGRADATION] Přeskakuji preload - žádné referenční metriky")
+            self.degradation_console.setPlainText("(Model neobsahuje referenční metriky)")
+            return
+        
+        try:
+            from pathlib import Path
+            
+            self._append_log("[DEGRADATION] 🔄 Načítám historická data pro okamžitou diagnostiku...")
+            self.degradation_console.setPlainText("⏳ Načítám historická data z TradingView...\nMůže trvat několik sekund...")
+            
+            # Načti potřebný počet barů (+ extra pro výpočet feature s rolling window)
+            bars_needed = self.degradation_window_size + 200  # +200 pro MA/ATR warmup
+            
+            # Použij aktuální symbol/exchange z konfigurace (nebo z modelu)
+            symbol = (self.ed_symbol.text() or "GOLD").strip()
+            exchange = (self.ed_expiry.text() or "TVC").strip()
+            timeframe = self.cmb_interval.currentText().replace("mins", "min")
+            
+            self._append_log(f"[DEGRADATION] Symbol={symbol}, Exchange={exchange}, TF={timeframe}, Bars={bars_needed}")
+            
+            from ibkr_trading_bot.core.datasource.tradingview_client import TradingViewClient
+            tv = TradingViewClient(
+                username=os.getenv("TV_USERNAME"),
+                password=os.getenv("TV_PASSWORD")
+            )
+            
+            self._append_log("[DEGRADATION] TradingView client vytvořen, stahuji data...")
+            df = tv.get_history(symbol, exchange, timeframe, limit=bars_needed)
+            
+            if df is None or df.empty:
+                msg = "❌ Nelze načíst historická data z TradingView"
+                self._append_log(f"[WARN] {msg}")
+                self.degradation_console.setPlainText(f"{msg}\nDiagnostika bude dostupná po načtení {self.degradation_window_size} live barů.")
+                return
+            
+            self._append_log(f"[DEGRADATION] Staženo {len(df)} historických barů, připravuji data...")
+            
+            # Připrav data
+            df = df.copy()
+            df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+            df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+            
+            self._append_log(f"[DEGRADATION] Data připravena ({len(df)} barů po cleanupu), počítám features...")
+            
+            # Připrav index podle očekávání feature_engineering (timestamp v UTC)
+            df = df.copy()
+            df["timestamp"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+            df = df.dropna(subset=["timestamp"]).set_index("timestamp")
+            df.index.name = "timestamp"
+            
+            # Vypočítej features pomocí compute_all_features
+            from ibkr_trading_bot.features.feature_engineering import compute_all_features
+            
+            df_feats = compute_all_features(df)
+            
+            if df_feats.empty:
+                msg = "❌ Feature calculation selhala"
+                self._append_log(f"[WARN] {msg}")
+                self.degradation_console.setPlainText(f"{msg}\nDiagnostika bude dostupná po načtení {self.degradation_window_size} live barů.")
+                return
+            
+            self._append_log(f"[DEGRADATION] Features vypočítány ({len(df_feats)} barů, {len(df_feats.columns)} sloupců)")
+            
+            # Vezmi posledních degradation_window_size barů
+            df_recent = df_feats.tail(self.degradation_window_size).copy().reset_index(drop=True)
+            
+            self._append_log(f"[DEGRADATION] Používám posledních {len(df_recent)} barů, spouštím predikce...")
+            
+            # Vypočítej predikce modelu pro CELÝ DataFrame najednou (efektivnější a bez feature warnings)
+            model = self.models[0]["predictor"]
+            exp_feats = self.models[0].get("exp_feats")
+            
+            # Připrav celý DataFrame pro model
+            X_prepared = df_recent
+            if exp_feats:
+                X_prepared = self._prepare_X_for_model(df_recent, exp_feats)
+            
+            try:
+                # Vypočítej predikce pro všechny řádky najednou
+                label_map = self.models[0].get("label_map") or _infer_label_map_from_classes(getattr(model, "classes_", None))
+                
+                # Batch prediction - rychlejší a bez warningů
+                X_pred = _align_X_for_model(model, X_prepared)
+                proba_all = _predict_proba_safely(model, X_pred)
+                
+                # Určení indexů LONG a SHORT v classes_
+                classes = getattr(model, "classes_", None)
+                if classes is not None:
+                    # Textové classes
+                    if any(isinstance(c, str) for c in classes):
+                        lut = {str(c).upper(): i for i, c in enumerate(classes)}
+                        idx_long = lut.get("LONG")
+                        idx_short = lut.get("SHORT")
+                    # Numerické classes s label_map
+                    else:
+                        idx_long = next((i for i, c in enumerate(classes)
+                                       if str(label_map.get(int(c), "")).upper() == "LONG"), None)
+                        idx_short = next((i for i, c in enumerate(classes)
+                                        if str(label_map.get(int(c), "")).upper() == "SHORT"), None)
+                else:
+                    # Fallback: předpokládej binární klasifikaci
+                    idx_long = 1
+                    idx_short = 0
+                
+                # Konverze proba → predictions (-1/0/+1)
+                predictions = []
+                for proba_row in proba_all:
+                    pL = float(proba_row[idx_long]) if idx_long is not None else 0.5
+                    pS = float(proba_row[idx_short]) if idx_short is not None else 0.5
+                    
+                    if pL > 0.5:
+                        predictions.append(1)  # LONG
+                    elif pS > 0.5:
+                        predictions.append(-1)  # SHORT
+                    else:
+                        predictions.append(0)  # NEUTRAL
+                
+                prices = df_recent["close"].astype(float).tolist()
+                timestamps = df_recent["time"].tolist()
+                
+                self._append_log(f"[DEGRADATION] Predikce dokončeny: {len(predictions)} barů zpracováno")
+                
+            except Exception as e:
+                self._append_log(f"[ERROR] Batch predikce selhala: {e}")
+                import traceback
+                self._append_log(f"[DEBUG] {traceback.format_exc()}")
+                
+                # Fallback: prázdné buffery
+                predictions = [0] * len(df_recent)
+                prices = df_recent["close"].astype(float).tolist()
+                timestamps = df_recent["time"].tolist()
+            
+            # Naplň buffery
+            self._prediction_buffer = predictions
+            self._price_buffer = prices
+            self._y_true_buffer = [None] * len(predictions)
+            
+            # Označ všechny timestampy jako trackované
+            self._tracked_timestamps = {str(ts) for ts in timestamps}
+            
+            self._append_log(f"[DEGRADATION] ✅ Načteno {len(predictions)} historických barů")
+            
+            # Spusť okamžitou diagnostiku
+            if len(self._prediction_buffer) >= self.degradation_window_size:
+                self._update_degradation_diagnostics()
+                self._last_degradation_check = len(self._prediction_buffer)
+                self._append_log("[DEGRADATION] ✅ Okamžitá diagnostika spuštěna")
+            else:
+                msg = f"📊 Načteno {len(self._prediction_buffer)} barů (potřeba {self.degradation_window_size})"
+                self._append_log(f"[DEGRADATION] {msg}")
+                self.degradation_console.setPlainText(msg)
+            
+        except Exception as e:
+            error_msg = f"❌ Preload historických dat selhal: {e}"
+            self._append_log(f"[ERROR] {error_msg}")
+            import traceback
+            traceback_str = traceback.format_exc()
+            self._append_log(f"[DEBUG] {traceback_str}")
+            
+            # Zobraz chybu i v degradation konzoli pro uživatele
+            self.degradation_console.setPlainText(
+                f"{error_msg}\n\n"
+                f"Detail:\n{traceback_str[:500]}\n\n"
+                f"Diagnostika bude dostupná po načtení {self.degradation_window_size} live barů."
+            )
     
     def _update_settings_display(self, user_settings: dict) -> None:
         """Aktualizuje display panelu s nastavením modelu (read-only) a uloží do self.user_settings."""
@@ -907,6 +1410,10 @@ class LiveBotWidget(QWidget):
         self.lbl_exit_threshold.setText(f"Exit Threshold: {exit_threshold}")
         self.lbl_ma_only.setText(f"MA-Only: {'✓ zapnuto' if use_ma_only else '✗ vypnuto'}")
         self.lbl_and_ensemble.setText(f"AND Ensemble: {'✓ AND' if use_and_ensemble else '✗ VOTE'}")
+
+        # Synchronizuj runtime chování Tab 4 s nastavením načteným z Tab 3
+        self.config.use_ma_only = bool(use_ma_only)
+        self.config.use_and_ensemble = bool(use_and_ensemble)
         
         # Aplikuj entry/exit thresholdy na aktivní konfiguraci
         if isinstance(entry_threshold, (int, float)):
@@ -936,9 +1443,9 @@ class LiveBotWidget(QWidget):
                 X_use = self._prepare_X_for_model(Xrow, exp)
             try:
                 label_map = m.get("label_map") or self.class_to_dir  # per-model mapa 1st
-                pL, pS, classes_i, _ = _extract_long_short_proba(mdl, X_use, label_map=label_map)
+                pL, pS, classes_i, raw_proba = _extract_long_short_proba(mdl, X_use, label_map=label_map)
             except Exception:
-                pL, pS, classes_i = 0.5, 0.5, None
+                pL, pS, classes_i, raw_proba = 0.5, 0.5, None, None
 
             # DIAG logging (prvních 10 záznamů)
             if not hasattr(self, "_diag_counter"):
@@ -947,16 +1454,19 @@ class LiveBotWidget(QWidget):
                 self._append_log(f"[DIAG] classes={classes_i} pL={pL:.3f} pS={pS:.3f} from {type(mdl).__name__}")
                 self._diag_counter += 1
 
-        # výběr směru a konfidence
-            if pL > pS:
-                direction = "LONG"
-                conf = float(pL)
-            elif pS > pL:
-                direction = "SHORT"
-                conf = float(pS)
-            else:
-                direction = "FLAT"
-                conf = float(pL)
+        # výběr směru a konfidence (u ternary respektuj i HOLD)
+            direction, conf = _pick_direction_from_raw_proba(classes_i, raw_proba, label_map)
+
+            if direction is None:
+                if pL > pS:
+                    direction = "LONG"
+                    conf = float(pL)
+                elif pS > pL:
+                    direction = "SHORT"
+                    conf = float(pS)
+                else:
+                    direction = "FLAT"
+                    conf = float(pL)
 
             dirs.append(direction)
             confs.append(conf)
@@ -988,19 +1498,22 @@ class LiveBotWidget(QWidget):
                 X_use = self._prepare_X_for_model(Xrow, exp)
             try:
                 label_map = m.get("label_map") or self.class_to_dir
-                pL, pS, classes_i, _ = _extract_long_short_proba(mdl, X_use, label_map=label_map)
+                pL, pS, classes_i, raw_proba = _extract_long_short_proba(mdl, X_use, label_map=label_map)
             except Exception:
-                pL, pS, classes_i = 0.5, 0.5, None
+                pL, pS, classes_i, raw_proba = 0.5, 0.5, None, None
 
-            if pL > pS:
-                direction = "LONG"
-                conf = float(pL)
-            elif pS > pL:
-                direction = "SHORT"
-                conf = float(pS)
-            else:
-                direction = "FLAT"
-                conf = float(pL)
+            direction, conf = _pick_direction_from_raw_proba(classes_i, raw_proba, label_map)
+
+            if direction is None:
+                if pL > pS:
+                    direction = "LONG"
+                    conf = float(pL)
+                elif pS > pL:
+                    direction = "SHORT"
+                    conf = float(pS)
+                else:
+                    direction = "FLAT"
+                    conf = float(pL)
 
             dirs.append(direction)
             confs.append(conf)
@@ -1017,19 +1530,33 @@ class LiveBotWidget(QWidget):
         return -1, conf_vote, dirs, confs
 
     def _prepare_X_for_model(self, Xrow: pd.DataFrame, exp: list[str]) -> pd.DataFrame:
+        """Připrav řádek pro model. Chybné features vyplní mediánem z dostupných dat."""
         X_use = Xrow.copy()
         missing = [c for c in exp if c not in X_use.columns]
+        
         if missing:
             key = f"missing_feats_{hash(tuple(exp))}"
             if not hasattr(self, "_diag_once"):
                 self._diag_once = {}
             if key not in self._diag_once:
-                sample = ", ".join(missing[:8])
-                more = "" if len(missing) <= 8 else f" (+{len(missing) - 8} more)"
-                self._append_log(f"[FEATS] Missing {len(missing)} features, filled with 0.0: {sample}{more}")
+                sample = ", ".join(missing[:5])
+                more = "" if len(missing) <= 5 else f" (+{len(missing)-5} more)"
+                self._append_log(f"[WARN] Chybí features ({len(missing)}/{len(exp)}): {sample}{more}")
                 self._diag_once[key] = True
+            
+            # Doplň chybné features mediánem z existujícíích dat
             for c in missing:
-                X_use[c] = 0.0
+                # Vezmi medián z jiného sloupce (např. 'close' pokud chybí indikátor)
+                if "close" in X_use.columns:
+                    X_use[c] = X_use["close"].median()
+                else:
+                    # Fallback: medián z prvního numerického sloupce
+                    numeric_cols = X_use.select_dtypes(include=[np.number]).columns
+                    if len(numeric_cols) > 0:
+                        X_use[c] = X_use[numeric_cols[0]].median()
+                    else:
+                        X_use[c] = 0.0
+        
         X_use = X_use[exp]
         return X_use.astype(float)
 
@@ -1151,8 +1678,12 @@ class LiveBotWidget(QWidget):
         self.live_df.dropna(subset=["timestamp"], inplace=True)
         self.live_df.drop_duplicates(subset=["timestamp"], keep="last", inplace=True)
         self.live_df.sort_values("timestamp", inplace=True)
-        if len(self.live_df) > self.config.max_bars_buffer:
-            self.live_df = self.live_df.tail(self.config.max_bars_buffer).reset_index(drop=True)
+        
+        # Udržuj VĚTŠÍ buffer (700 barů) pro rolling indicators - neřezat na max_bars_buffer!
+        # Display se ořeže až při rendering
+        max_live_buffer = max(700, self.config.max_bars_buffer + 400)  # +400 pro rolling warmup
+        if len(self.live_df) > max_live_buffer:
+            self.live_df = self.live_df.tail(max_live_buffer).reset_index(drop=True)
 
         try:
             if self.warm is not None:
@@ -1212,11 +1743,14 @@ class LiveBotWidget(QWidget):
         try:
             tv = TradingViewClient(username=os.getenv("TV_USERNAME"), password=os.getenv("TV_PASSWORD"))
             tf_label = (self.config.bar_size or "1 hour").replace("mins", "min")
-            df = tv.get_history(self.config.symbol, self.config.exchange, tf_label, limit=int(self.config.max_bars_buffer))
+            # Stáhnout více barů pro rolling warmup (700), pak ořezat na max_bars_buffer (300)
+            initial_download = max(700, int(self.config.max_bars_buffer) + 200)  # +200 pro rolling warmup
+            df = tv.get_history(self.config.symbol, self.config.exchange, tf_label, limit=initial_download)
             if df is not None and not df.empty:
                 df = df.copy()
                 df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
-                df = df.dropna(subset=["time"]).sort_values("time").tail(self.config.max_bars_buffer)
+                df = df.dropna(subset=["time"]).sort_values("time")
+                # Nevškrtnúť na max_bars_buffer hned - počkáme až po compute_features (kde se dropnou první řádky)
 
                 self._bars = []
                 self._bar_index = {}
@@ -1241,10 +1775,12 @@ class LiveBotWidget(QWidget):
                     "close": df["close"].astype(float).to_numpy(),
                     "volume": df["volume"].astype(float).to_numpy(),
                 })
-                self.live_df = self.live_df.tail(self.config.max_bars_buffer).reset_index(drop=True)
+                # NIKDY NEŘEZAT live_df - potřebujeme plnou historii pro rolling indicators!
+                # Ořezávání se řeší až v _rescore_all() output
                 self._append_log(f"[INFO] Načten počáteční snapshot: {len(self.live_df)} barů.")
                 self._last_arrival_utc = pd.Timestamp.now(tz='UTC')
                 self._rescore_all()
+                
                 X_hist_all = self._build_features_for_all()
                 raw_df = self.live_df.rename(columns={'timestamp': 'date'})[['date','open','high','low','close','volume']].copy()
                 raw_df['date'] = pd.to_datetime(raw_df['date'], utc=True, errors='coerce')
@@ -1254,6 +1790,12 @@ class LiveBotWidget(QWidget):
                 for m in self.models:
                     mdl = m['predictor']
                     exp = m.get('exp_feats')
+                    try:
+                        cls_vals = [int(c) for c in list(getattr(mdl, "classes_", []))]
+                    except Exception:
+                        cls_vals = []
+                    if len(set(cls_vals)) > 2:
+                        continue
                     X_use = X_hist_all
                     if exp:
                         cols = [c for c in exp if c in X_hist_all.columns]
@@ -1285,7 +1827,13 @@ class LiveBotWidget(QWidget):
         # invertuj
         inv = {}
         for k, v in self.class_to_dir.items():
-            inv[k] = "LONG" if str(v).upper() == "SHORT" else "SHORT"
+            vv = str(v).upper()
+            if vv == "SHORT":
+                inv[k] = "LONG"
+            elif vv == "LONG":
+                inv[k] = "SHORT"
+            else:
+                inv[k] = vv
         self.class_to_dir = inv
         self._append_log(f"[MANUAL] Invertuji mapu tříd: {self.class_to_dir}")
         # přepočítej okamžitě posledních N barů, ať vidíš efekt
@@ -1307,10 +1855,12 @@ class LiveBotWidget(QWidget):
 
     # ---------- Feature engineering ----------
     def _compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Vypočítej všechny indikátory a featury pro daný DataFrame."""
         df = df.copy()
         if "timestamp" not in df.columns and "date" in df.columns:
             df = df.rename(columns={"date": "timestamp"})
         df_features = compute_all_features(df)
+        
         df_features["ma_fast"] = df_features["close"].rolling(9, min_periods=1).mean()
         df_features["ma_slow"] = df_features["close"].rolling(21, min_periods=1).mean()
         if "average" not in df_features.columns:
@@ -1326,10 +1876,19 @@ class LiveBotWidget(QWidget):
         df = df[["date","open","high","low","close","volume"]].dropna(subset=["close"]).copy()
         if df.empty:
             return None
+        
+        # compute_all_features() vrátí DataFrame bez prvních ~26 řádků (MACD warmup)
+        # a bez řádků s NaN v klíčových indicatorech
         ind = self._compute_indicators(df)
+        
+        if ind.empty:
+            return None
+        
         if "timestamp" in ind.columns:
             ind["timestamp"] = pd.to_datetime(ind["timestamp"], utc=True, errors="coerce")
             ind = ind.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
+        
+        # ✅ Zbyly jen validní řádky - bez NaN v klíčových featurách
         return ind
 
     def _align_features_to_model(self, feat: pd.DataFrame) -> pd.DataFrame:
@@ -1364,16 +1923,35 @@ class LiveBotWidget(QWidget):
         df = df.fillna(med).fillna(0.0).astype('float32')
         return df
 
+    def _sanitize_feature_matrix(self, feat: pd.DataFrame) -> pd.DataFrame:
+        """Ponechá všechny dostupné featury, jen je převede na numerický tvar + imputuje NaN."""
+        df = feat.copy()
+        if 'average' not in df.columns and all(c in df.columns for c in ['open', 'high', 'low', 'close']):
+            df['average'] = (df['open'] + df['high'] + df['low'] + df['close']) / 4.0
+
+        for c in df.columns:
+            if not pd.api.types.is_bool_dtype(df[c]):
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        med = df.median(numeric_only=True)
+        df = df.fillna(med).fillna(0.0).astype('float32')
+        return df
+
     def _build_features_from_live(self) -> pd.DataFrame | None:
         if self.live_df is None or self.live_df.empty:
             return None
         df = self.live_df.rename(columns={'timestamp': 'date'})
-        df = df[['date', 'open', 'high', 'low', 'close', 'volume']].dropna(subset=['close'])
+        df = df[['date', 'open', 'high', 'low', 'close', 'volume']].dropna(subset=['close']).copy()
         if df.empty:
             return None
-        feat_df = self._compute_indicators(df)
+        
+        # Vezmi posledních 100 barů (ne jen 1!) pro správný výpočet rolling indicators
+        # Rolling windows (RSI, ATR, MACD) potřebují dostatek dat, aby se správně počítaly
+        tail_bars = min(100, len(df))
+        df_tail = df.iloc[-tail_bars:].copy()
+        
+        feat_df = self._compute_indicators(df_tail)
         last = feat_df.iloc[[-1]].copy()
-        return self._align_features_to_model(last)
+        return self._sanitize_feature_matrix(last)
 
     def _build_features_for_all(self) -> pd.DataFrame | None:
         if self.live_df is None or self.live_df.empty:
@@ -1383,9 +1961,15 @@ class LiveBotWidget(QWidget):
         if df.empty:
             return None
         feat = self._compute_indicators(df)
-        feat["date"] = pd.to_datetime(feat["date"], utc=True, errors="coerce")
-        feat = feat.dropna(subset=["date"]).set_index("date").sort_index()
-        return self._align_features_to_model(feat)
+        if "date" in feat.columns:
+            feat["date"] = pd.to_datetime(feat["date"], utc=True, errors="coerce")
+            feat = feat.dropna(subset=["date"]).set_index("date").sort_index()
+        elif "timestamp" in feat.columns:
+            feat["timestamp"] = pd.to_datetime(feat["timestamp"], utc=True, errors="coerce")
+            feat = feat.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
+        elif not isinstance(feat.index, pd.DatetimeIndex):
+            return None
+        return self._sanitize_feature_matrix(feat)
 
     # ---------- Pomocné mapování ----------
     def _label_to_dir(self, cls) -> str | None:
@@ -1402,8 +1986,10 @@ class LiveBotWidget(QWidget):
         s = str(cls).strip().lower()
         if s in ("1", "+1", "long", "buy", "up"):
             return "LONG"
-        if s in ("0", "-1", "short", "sell", "down"):
+        if s in ("-1", "short", "sell", "down"):
             return "SHORT"
+        if s in ("0", "hold", "flat", "neutral", "none"):
+            return "FLAT"
         return None
 
     def _sign_to_dir(self, v) -> str | None:
@@ -1439,7 +2025,7 @@ class LiveBotWidget(QWidget):
         if raw is None or raw.empty:
             return
 
-        feats = self._align_features_to_model(raw)
+        feats = self._sanitize_feature_matrix(raw)
         # Praktikovat thresh z user_settings (z Tab 3), nebo fallback
         thr = self.user_settings.get("entry_threshold", self._curr_entry_thr) if self.user_settings else self._curr_entry_thr
         thr = float(thr) if isinstance(thr, (int, float)) else self._curr_entry_thr
@@ -1477,6 +2063,8 @@ class LiveBotWidget(QWidget):
         use_ma_and = self.config.use_and_ensemble
 
         n_mapped = n_shown = n_long = n_short = 0
+        n_none = 0
+        n_l1_flat = 0
         for ts, d0 in zip(feats.index, l0_dir):
             idx = self._nearest_bar_index(ts)
             if idx is None:
@@ -1489,6 +2077,8 @@ class LiveBotWidget(QWidget):
             else:
                 label, conf_min, dirs, confs = self._predict_one_label_VOTE(Xrow)
             l1 = "LONG" if label == +1 else "SHORT" if label == -1 else "FLAT"
+            if l1 == "FLAT":
+                n_l1_flat += 1
 
             # --- MA∧AND nebo čistý AND: vytvoř "proposal" ---
             if use_ma_and:
@@ -1525,7 +2115,11 @@ class LiveBotWidget(QWidget):
 
             n_mapped += 1
             if final == "LONG":  n_long += 1; n_shown += 1
-            if final == "SHORT": n_short += 1; n_shown += 1
+            elif final == "SHORT":
+                n_short += 1
+                n_shown += 1
+            else:
+                n_none += 1
 
         # Sleduj obchody po všech signálech
         try:
@@ -1537,6 +2131,15 @@ class LiveBotWidget(QWidget):
             f"[RESCORE] bars={len(self._bars)} mapped={n_mapped} shown={n_shown} "
             f"(LONG={n_long}, SHORT={n_short}) thr={thr:.2f} models={len(self.models)} AND_MA={use_ma_and}"
         )
+        self._append_log(
+            f"[TAB4-DIAG] signal_dist mapped={n_mapped} LONG={n_long} SHORT={n_short} ACTIVE={n_shown} NONE={n_none} L1_FLAT={n_l1_flat}"
+        )
+
+        # Track predictions a ceny pro degradation diagnostics
+        try:
+            self._track_predictions_for_degradation(raw)
+        except Exception as e:
+            self._append_log(f"[WARN] Tracking degradace selhal: {e}")
 
     # ----------
     def _update_position_and_trades(self, raw: pd.DataFrame) -> None:
@@ -1631,6 +2234,247 @@ class LiveBotWidget(QWidget):
                 self._live_entry_px = None
                 self._open_trade = None
 
+    # ========== Degradation Diagnostics METHODS ==========
+    
+    def _track_predictions_for_degradation(self, raw: pd.DataFrame) -> None:
+        """
+        Ukládá signály a ceny do bufferů pro sledování degradace modelu.
+        Volá se po každém rescoring v _rescore_all().
+        Trackuje jen NOVÉ bary (deduplicita pomocí timestampů).
+        """
+        if raw is None or raw.empty:
+            return
+        
+        new_bars_tracked = 0
+        
+        # Extrahuj NOVÉ signály a ceny z self._bars (jen ty, které jsme ještě netrackovali)
+        for bar in self._bars:
+            ts = pd.to_datetime(bar.get("time"), utc=True, errors="coerce")
+            if pd.isna(ts):
+                continue
+            
+            # Převeď timestamp na string pro set (hashable)
+            ts_key = str(ts)
+            
+            # Pokud už jsme tento bar trackovali, přeskoč
+            if ts_key in self._tracked_timestamps:
+                continue
+            
+            signal = bar.get("signal")  # "LONG", "SHORT" or None
+            close_price = float(bar.get("close", np.nan))
+            
+            if np.isnan(close_price):
+                continue
+            
+            # Převeď signál na numerickou hodnotu: LONG=+1, SHORT=-1, None/FLAT=0
+            pred_value = 1 if signal == "LONG" else (-1 if signal == "SHORT" else 0)
+            
+            # Přidej do bufferů (jen nové bary)
+            self._prediction_buffer.append(pred_value)
+            self._price_buffer.append(close_price)
+            
+            # V paper/backtest režimu bychom měli y_true
+            # V live režimu ground truth není dostupný → append None
+            self._y_true_buffer.append(None)  # TODO: pokud je dostupné ground truth
+            
+            # Označ tento timestamp jako trackovaný
+            self._tracked_timestamps.add(ts_key)
+            new_bars_tracked += 1
+        
+        # Trim bufferů na max size (2x window pro sliding window analýzu)
+        max_buffer = self.degradation_window_size * 2
+        if len(self._prediction_buffer) > max_buffer:
+            self._prediction_buffer = self._prediction_buffer[-max_buffer:]
+            self._price_buffer = self._price_buffer[-max_buffer:]
+            self._y_true_buffer = self._y_true_buffer[-max_buffer:]
+            
+            # Cleanup tracked timestamps - odstraň staré, které už nejsou v bufferu
+            # (Necháme jen posledních max_buffer timestampů)
+            # Tohle je náročné implementovat správně, tak to zatím necháme
+            # Worst case: set poroste, ale to není kritické
+        
+        if new_bars_tracked > 0:
+            self._append_log(f"[DEGRADATION] Trackováno {new_bars_tracked} nových barů. Buffer: {len(self._prediction_buffer)}/{self.degradation_window_size}")
+        
+        # Spusť degradation check každých N barů
+        check_interval = 100  # Kontroluj každých 100 barů
+        if len(self._prediction_buffer) >= self.degradation_window_size and \
+           len(self._prediction_buffer) - self._last_degradation_check >= check_interval:
+            self._update_degradation_diagnostics()
+            self._last_degradation_check = len(self._prediction_buffer)
+
+    
+    def _update_degradation_diagnostics(self) -> None:
+        """
+        Vypočítá live metriky na recent window a porovná s reference metrikami z metadata.
+        Zobrazí diagnostiku degradace modelu.
+        """
+        # Musíme mít dostatek dat
+        if len(self._prediction_buffer) < self.degradation_window_size:
+            remaining = self.degradation_window_size - len(self._prediction_buffer)
+            self.degradation_console.setPlainText(
+                f"⏳ Sbírám data pro diagnostiku...\n"
+                f"   Aktuálně: {len(self._prediction_buffer)} barů\n"
+                f"   Potřeba: {self.degradation_window_size} barů\n"
+                f"   Zbývá: {remaining} barů"
+            )
+            return
+        
+        if not self.reference_metrics:
+            self.degradation_console.setPlainText("(Žádné referenční metriky k dispozici)")
+            return
+        
+        try:
+            # Vezmi poslední N barů pro recent window
+            recent_preds = np.array(self._prediction_buffer[-self.degradation_window_size:])
+            recent_prices = np.array(self._price_buffer[-self.degradation_window_size:])
+            
+            # Importuj calculate_metrics z utils
+            from ibkr_trading_bot.utils.metrics import calculate_metrics
+            
+            # V live režimu nemáme y_true → počítáme jen trading metriky
+            # Vytvoř dummy y_true (všechny 0) protože calculate_metrics to vyžaduje
+            y_true_dummy = np.zeros(len(recent_preds))
+            
+            # Vytvoř DataFrame s cenami
+            df_recent = pd.DataFrame({"close": recent_prices})
+            
+            # Vypočítej metriky na recent window
+            recent_metrics = calculate_metrics(
+                y_true=y_true_dummy,
+                y_pred=recent_preds,
+                df=df_recent,
+                fee_per_trade=0.0,
+                slippage_bps=0.0,
+                rolling_window=50,
+                annualize_sharpe=False
+            )
+            
+            self.live_metrics_recent = recent_metrics
+            
+            # Porovnej s reference metrikami
+            self._display_degradation_comparison()
+            
+        except Exception as e:
+            self._append_log(f"[WARN] Výpočet live metrik selhal: {e}")
+            self.degradation_console.setPlainText(f"Chyba při výpočtu metrik: {e}")
+    
+    def _display_degradation_comparison(self) -> None:
+        """Zobrazí porovnání Reference vs Live metrik v diagnostické konzoli."""
+        ref = self.reference_metrics
+        live = self.live_metrics_recent
+        
+        if not ref or not live:
+            return
+        
+        # Extrahuj klíčové metriky
+        ref_sharpe = ref.get("sharpe_net") or ref.get("sharpe", 0.0)
+        live_sharpe = live.get("sharpe_net") or live.get("sharpe", 0.0)
+        
+        ref_profit = ref.get("profit_net", 0.0)
+        live_profit = live.get("profit_net", 0.0)
+        
+        ref_acc = ref.get("accuracy", 0.0) if ref.get("accuracy", 0.0) else 0.0
+        live_acc = live.get("accuracy", 0.0) if live.get("accuracy", 0.0) else 0.0
+        
+        ref_f1 = ref.get("f1", 0.0) if ref.get("f1", 0.0) else 0.0
+        live_f1 = live.get("f1", 0.0) if live.get("f1", 0.0) else 0.0
+        
+        # Vypočítej rozdíly
+        diff_sharpe = float(live_sharpe) - float(ref_sharpe) if isinstance(live_sharpe, (int, float)) and isinstance(ref_sharpe, (int, float)) else 0.0
+        diff_profit = float(live_profit) - float(ref_profit) if isinstance(live_profit, (int, float)) and isinstance(ref_profit, (int, float)) else 0.0
+        diff_acc = float(live_acc) - float(ref_acc) if isinstance(live_acc, (int, float)) and isinstance(ref_acc, (int, float)) else 0.0
+        diff_f1 = float(live_f1) - float(ref_f1) if isinstance(live_f1, (int, float)) and isinstance(ref_f1, (int, float)) else 0.0
+        
+        # Formátuj hodnoty pro zobrazení (podmínky nelze dát přímo do f-string specifieru)
+        ref_sharpe_str = f"{ref_sharpe:7.4f}" if isinstance(ref_sharpe, (int, float)) else f"{str(ref_sharpe):>7}"
+        live_sharpe_str = f"{live_sharpe:7.4f}" if isinstance(live_sharpe, (int, float)) else f"{str(live_sharpe):>7}"
+        ref_profit_str = f"{ref_profit:7.2f}" if isinstance(ref_profit, (int, float)) else f"{str(ref_profit):>7}"
+        live_profit_str = f"{live_profit:7.2f}" if isinstance(live_profit, (int, float)) else f"{str(live_profit):>7}"
+        ref_acc_str = f"{ref_acc:7.4f}" if isinstance(ref_acc, (int, float)) else f"{str(ref_acc):>7}"
+        live_acc_str = f"{live_acc:7.4f}" if isinstance(live_acc, (int, float)) else f"{str(live_acc):>7}"
+        ref_f1_str = f"{ref_f1:7.4f}" if isinstance(ref_f1, (int, float)) else f"{str(ref_f1):>7}"
+        live_f1_str = f"{live_f1:7.4f}" if isinstance(live_f1, (int, float)) else f"{str(live_f1):>7}"
+        
+        # Formátuj zobrazení
+        lines = [
+            "╔════════════════════════════════════════════════════════╗",
+            "║      DIAGNOSTIKA DEGRADACE MODELU                      ║",
+            "╠════════════════════════════════════════════════════════╣",
+            f"║ Sharpe (Ref):     {ref_sharpe_str}                        ║",
+            f"║ Sharpe (Live):    {live_sharpe_str}                        ║",
+            f"║ Rozdíl:           {diff_sharpe:+7.4f}                        ║",
+            "║ ─────────────────────────────────────────────────────  ║",
+            f"║ Profit (Ref):     {ref_profit_str}                        ║",
+            f"║ Profit (Live):    {live_profit_str}                        ║",
+            f"║ Rozdíl:           {diff_profit:+7.2f}                        ║",
+            "║ ─────────────────────────────────────────────────────  ║",
+            f"║ Accuracy (Ref):   {ref_acc_str}                        ║",
+            f"║ Accuracy (Live):  {live_acc_str}                        ║",
+            "║ ─────────────────────────────────────────────────────  ║",
+            f"║ F1 (Ref):         {ref_f1_str}                        ║",
+            f"║ F1 (Live):        {live_f1_str}                        ║",
+            "╠════════════════════════════════════════════════════════╣",
+        ]
+        
+        # Diagnóza degradace - OPRAVENÁ LOGIKA
+        # Nejprve zkontroluj, zda reference nejsou podezřelé (špatný training)
+        
+        # Reference jsou "podezřelé" pokud:
+        # - F1 = 0 (žádné signály nebo všechny špatné)
+        # - Accuracy = 1.0 AND F1 = 0 (přetrénování na neutralitě)
+        # - Sharpe < -0.5 (velmi špatná reference)
+        
+        ref_is_suspicious = (
+            (isinstance(ref_f1, (int, float)) and ref_f1 < 0.05) and
+            (isinstance(ref_acc, (int, float)) and ref_acc >= 0.95)
+        ) or (
+            isinstance(ref_sharpe, (int, float)) and ref_sharpe < -0.5
+        )
+        
+        if ref_is_suspicious:
+            # Reference jsou špatné - diagnostika se nedá provádět
+            lines.append("║ ⚠️  UPOZORNĚNÍ: Referenční metriky nejsou spolehlivé   ║")
+            lines.append("║    Model měl špatný výkon v tréninku (F1≈0, Acc=100%)  ║")
+            lines.append("║    Live metriky nelze interpretovat jako degradaci!    ║")
+            lines.append("║    → Přetrénujte model s lepšíma daty                  ║")
+        else:
+            # Reference jsou OK - normální diagnóza
+            # Logika: Porovnávej změny v Sharpe a Profitu
+            
+            # Změny v klíčových metrikách
+            sharpe_improved = diff_sharpe > 0.1  # Zlepšení > 0.1
+            sharpe_degraded = diff_sharpe < -0.1  # Zhoršení > 0.1
+            
+            profit_improved = diff_profit > 10  # Profit vzrostl o 10+
+            profit_degraded = diff_profit < -10  # Profit klesl o 10+
+            
+            f1_improved = diff_f1 > 0.1
+            f1_degraded = diff_f1 < -0.1
+            
+            # Diagnóza na základě trend
+            if sharpe_degraded or profit_degraded or f1_degraded:
+                if sharpe_degraded and profit_degraded and f1_degraded:
+                    lines.append("║ ❌ DEGRADACE: Model zhoršil výkon v TŘECH metrikách  ║")
+                    lines.append("║    → Zvažte přetrénování modelu                        ║")
+                elif sharpe_degraded or profit_degraded:
+                    lines.append("║ ⚠️  MÍRNÉ ZHORŠENÍ: Live výkon pod referenční úrovní   ║")
+                    lines.append("║    → Sledujte další vývoj, zvažte retraining          ║")
+                else:
+                    lines.append("║ ⚠️  F1 POKLES: Model dává méně signálů než v tréninku  ║")
+            elif sharpe_improved or profit_improved or f1_improved:
+                lines.append("║ ✅ ZLEPŠENÍ: Live výkon je lepší než reference!         ║")
+                lines.append("║    Model se chová lépe než v tréninku                   ║")
+            else:
+                lines.append("║ ✅ STABILNÍ: Live výkon je srovnatelný s referencí      ║")
+        
+        lines.append("╚════════════════════════════════════════════════════════╝")
+        lines.append(f"📊 Recent window: {self.degradation_window_size} barů | Last check: {len(self._prediction_buffer)} barů total")
+        
+        self.degradation_console.setPlainText("\n".join(lines))
+    
+    # ========== END Degradation Diagnostics ==========
+
     def _append_log(self, text: str) -> None:
         self.console.appendPlainText(text)
         cursor = self.console.textCursor()
@@ -1659,34 +2503,50 @@ class LiveBotWidget(QWidget):
         except Exception:
             pass
 
+    def _play_exit_alert(self) -> None:
+        """Exit alert: dvojité pípnutí, aby byl výstup odlišitelný od vstupu/směru."""
+        try:
+            self._play_alert()
+            QTimer.singleShot(180, self._play_alert)
+        except Exception:
+            pass
+
     def _maybe_alert_flip_on_last_bar(self) -> None:
-        if not getattr(self.config, "alert_on_flip", True) or not self._bars:
+        if not self._bars:
             return
+
+        # Zvukové alerty chceme vždy v LIVE módu Tab 4 (nikoli ve WARM-UP fázi)
+        warm_state = str(getattr(getattr(self, "warm", None), "state", "")).upper()
+        is_live_runtime = (warm_state == "LIVE") or (self.warm is None and str(getattr(self.config, "mode", "")).lower() == "live")
+        if not is_live_runtime:
+            self._last_signal = None
+            return
+
         last = self._bars[-1]
         sig = last.get("signal")
-        if sig not in ("LONG", "SHORT"): return
+        if sig not in ("LONG", "SHORT"):
+            sig = None
         ts = pd.to_datetime(last.get("time"), utc=True, errors="coerce")
-        if pd.isna(ts): return
+        if pd.isna(ts):
+            return
         ts_ns = int(ts.value)
-        if self._last_alert_bar_ns == ts_ns: return
+        if self._last_alert_bar_ns == ts_ns:
+            return
 
         prev = self._last_signal
-        if prev is not None and prev != sig:
-            now = pd.Timestamp.now(tz="UTC")
-            cd = int(getattr(self.config, "alert_cooldown_s", 5))
-            if self._last_beep_time is None or (now - self._last_beep_time).total_seconds() >= cd:
-                self._append_log(f"[ALERT] Flip {prev} → {sig} @ {ts}")
-                self._play_alert()
-                try:
-                    if getattr(self.config, "alert_email_enabled", False):
-                        subject, body = self._format_flip_email(prev, sig, ts, float(last.get("close", float("nan"))))
-                        to_addrs = [a.strip() for a in (self.config.alert_email_to or "").split(",") if a.strip()]
-                        for addr in to_addrs:
-                            self._send_email_async(addr, subject, body)
-                except Exception as _e:
-                    self._append_log(f"[EMAIL] Výjimka při přípravě zprávy: {_e}")
-                self._last_beep_time = now
-                self._last_alert_bar_ns = ts_ns
+
+        # 1) Každý LONG/SHORT signál na nové svíčce = pípnutí
+        if sig in ("LONG", "SHORT"):
+            self._append_log(f"[ALERT] Signal {sig} @ {ts}")
+            self._play_alert()
+
+        # 2) Výstup z pozice / zrušení směru = odlišné (dvojité) pípnutí
+        if prev in ("LONG", "SHORT") and sig is None:
+            self._append_log(f"[ALERT] Exit {prev} → FLAT @ {ts}")
+            self._play_exit_alert()
+
+        self._last_beep_time = pd.Timestamp.now(tz="UTC")
+        self._last_alert_bar_ns = ts_ns
         self._last_signal = sig
 
     def _format_flip_email(self, prev_sig: str, new_sig: str, ts: pd.Timestamp, px: float) -> tuple[str, str]:
