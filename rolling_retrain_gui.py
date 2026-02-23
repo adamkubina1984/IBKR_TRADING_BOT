@@ -30,7 +30,9 @@ from ibkr_trading_bot.utils.metrics import calculate_metrics
 
 
 def run_online_simulation_with_model(model_path):
-    model = joblib.load(model_path)
+    obj = joblib.load(model_path)
+    model = obj.get("model") if isinstance(obj, dict) and "model" in obj else obj
+    model_feats = obj.get("features") if isinstance(obj, dict) else None
     print(f"✅ Model načten ze souboru: {model_path}")
 
     # Načti poslední CSV soubor z data/raw
@@ -51,6 +53,11 @@ def run_online_simulation_with_model(model_path):
         return
 
     X = prepared.drop(columns=["target"]).select_dtypes(include=["number"])
+    if model_feats:
+        missing = [f for f in model_feats if f not in X.columns]
+        if missing:
+            raise ValueError(f"Model očekává chybějící featury: {missing}")
+        X = X[model_feats]
     y = prepared["target"]
     preds = model.predict(X)
 
@@ -129,15 +136,15 @@ class RollingRetrainGUI(QWidget):
 
         model_map = {
             "Random Forest": "rf",
-            "LightGBM": "lgbm",
+            "LightGBM": "lgb",
             "XGBoost": "xgb"
         }
         selected_option = self.model_select.currentText()
         model_names = list(model_map.values()) if selected_option == "Všechny" else [model_map.get(selected_option, "lgbm")]
 
         all_results = {}
-        best_avg_f1 = -1
-        best_model = None
+        best_avg_f1 = -1.0
+        best_model_path = None
         best_model_name = ""
 
         for model_name in model_names:
@@ -160,16 +167,40 @@ class RollingRetrainGUI(QWidget):
                 if train_prepared.empty or test_prepared.empty:
                     continue
 
-                X_train = train_prepared.drop(columns=["target"]).select_dtypes(include=["number"])
-                y_train = train_prepared["target"]
+                # Sjednocení s hlavním tréninkovým flow: train+holdout v jednom DF
+                full_df = pd.concat([train_prepared, test_prepared], axis=0, ignore_index=True)
+                if "timestamp" not in full_df.columns and "datetime" in full_df.columns:
+                    full_df = full_df.rename(columns={"datetime": "timestamp"})
+                if "timestamp" not in full_df.columns:
+                    continue
 
-                model, _ = train_and_evaluate_model(X_train, y_train, model_name, {})
+                train_result = train_and_evaluate_model(
+                    df=full_df,
+                    estimator_name=model_name,
+                    param_grid=None,
+                    n_splits=3,
+                    embargo=10,
+                    holdout_bars=len(test_prepared),
+                    fee_per_trade=0.0,
+                    slippage_bps=0.0,
+                    mc_enabled=False,
+                    annualize_sharpe=True,
+                )
 
-                X_test = test_prepared.drop(columns=["target"]).select_dtypes(include=["number"])
-                y_test = test_prepared["target"]
-                preds = model.predict(X_test)
+                output_path = train_result.get("output_path")
+                hold_metrics = {}
+                if output_path:
+                    try:
+                        from pathlib import Path
+                        meta_path = Path(output_path).with_name(Path(output_path).stem + "_meta.json")
+                        if meta_path.exists():
+                            import json
+                            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                            hold_metrics = meta.get("metrics_holdout") or meta.get("metrics") or {}
+                    except Exception:
+                        hold_metrics = {}
 
-                metrics = calculate_metrics(y_test, preds)
+                metrics = dict(hold_metrics) if isinstance(hold_metrics, dict) else {}
                 results.append({
                     "Train Start": train_start,
                     "Train End": train_end,
@@ -182,16 +213,14 @@ class RollingRetrainGUI(QWidget):
 
             all_results[model_name] = results
 
-            avg_f1 = sum(r["F1"] for r in results) / len(results) if results else 0
+            avg_f1 = float(sum(float(r.get("f1", 0.0)) for r in results) / len(results)) if results else 0.0
             if avg_f1 > best_avg_f1:
                 best_avg_f1 = avg_f1
-                best_model = model
+                best_model_path = train_result.get("output_path") if 'train_result' in locals() else None
                 best_model_name = model_name
 
-        if best_model:
-            os.makedirs("model_outputs", exist_ok=True)
-            self.best_model_path = f"model_outputs/{best_model_name}_best_model.pkl"
-            joblib.dump(best_model, self.best_model_path)
+        if best_model_path and os.path.exists(best_model_path):
+            self.best_model_path = best_model_path
 
         self.show_results(all_results)
 

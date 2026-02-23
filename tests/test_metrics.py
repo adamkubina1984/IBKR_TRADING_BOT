@@ -86,3 +86,17 @@ def test_var_cvar_available_on_net_trades():
     out = calculate_metrics([0]*len(y_pred), y_pred, df=df, fee_per_trade=0.1, slippage_bps=0.0)
     # var_95 a cvar_95 se plní, pokud vznikly net obchody
     assert "var_95" in out and "cvar_95" in out
+
+
+def test_binary_labels_are_not_ternary_remapped():
+    prices = [100, 101, 102, 103]
+    df = _df_from_prices(prices)
+
+    y_true = [0, 1, 1, 1]
+    y_pred = [1, 1, 1, 1]
+
+    out = calculate_metrics(y_true, y_pred, df=df, fee_per_trade=0.0, slippage_bps=0.0)
+
+    assert out["signals"] == len(y_pred)
+    assert out["num_trades"] >= 1
+    assert out["num_trades_long"] >= 1

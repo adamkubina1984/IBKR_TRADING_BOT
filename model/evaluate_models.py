@@ -13,6 +13,75 @@ from ibkr_trading_bot.utils.io_helpers import load_dataframe
 from ibkr_trading_bot.utils.metrics import calculate_metrics
 
 
+def _unwrap_model_bundle(bundle_or_model):
+    if isinstance(bundle_or_model, dict) and "model" in bundle_or_model:
+        return bundle_or_model["model"], bundle_or_model.get("features")
+    return bundle_or_model, None
+
+
+def _select_feature_matrix(dataset: pd.DataFrame, model, bundle_feats: list[str] | None) -> pd.DataFrame:
+    if bundle_feats:
+        missing = [f for f in bundle_feats if f not in dataset.columns]
+        if missing:
+            _ensure_fallback_features(dataset, missing)
+            missing = [f for f in bundle_feats if f not in dataset.columns]
+            if missing:
+                raise ValueError(f"V datech chybí featury, které model vyžaduje: {missing}")
+        return dataset[bundle_feats].fillna(0.0)
+
+    if hasattr(model, "feature_names_in_") and getattr(model, "feature_names_in_", None) is not None:
+        names = [str(c) for c in list(model.feature_names_in_)]
+        missing = [f for f in names if f not in dataset.columns]
+        if missing:
+            raise ValueError(f"V datech chybí featury požadované modelem: {missing}")
+        return dataset[names].fillna(0.0)
+
+    try:
+        booster = getattr(model, "get_booster", lambda: None)()
+        if booster is not None and hasattr(booster, "feature_names"):
+            names = list(booster.feature_names)
+            missing = [f for f in names if f not in dataset.columns]
+            if missing:
+                raise ValueError(f"V datech chybí featury požadované modelem: {missing}")
+            return dataset[names].fillna(0.0)
+    except Exception:
+        pass
+
+    blacklist = {"timestamp", "open", "high", "low", "close", "volume", "target", "y", "signal"}
+    num_cols = [c for c in dataset.columns if c not in blacklist and pd.api.types.is_numeric_dtype(dataset[c])]
+    return dataset[num_cols].fillna(0.0)
+
+
+def _classification_metrics(y_true: pd.Series, y_pred: np.ndarray) -> tuple[float, float, float, float]:
+    y_true_arr = np.asarray(y_true)
+    y_pred_arr = np.asarray(y_pred)
+    labels = set(np.unique(y_true_arr).tolist()) | set(np.unique(y_pred_arr).tolist())
+    is_multiclass = len(labels) > 2
+    if is_multiclass:
+        f1 = f1_score(y_true_arr, y_pred_arr, average="macro", zero_division=0)
+        precision = precision_score(y_true_arr, y_pred_arr, average="macro", zero_division=0)
+        recall = recall_score(y_true_arr, y_pred_arr, average="macro", zero_division=0)
+    else:
+        f1 = f1_score(y_true_arr, y_pred_arr, zero_division=0)
+        precision = precision_score(y_true_arr, y_pred_arr, zero_division=0)
+        recall = recall_score(y_true_arr, y_pred_arr, zero_division=0)
+    accuracy = float((y_true_arr == y_pred_arr).mean())
+    return float(f1), float(precision), float(recall), accuracy
+
+
+def _prepare_dataset_for_eval(df_raw: pd.DataFrame) -> pd.DataFrame:
+    try:
+        return prepare_dataset_with_targets(df_raw)
+    except Exception:
+        dataset = df_raw.copy()
+        if "target" not in dataset.columns:
+            if "close" not in dataset.columns:
+                raise
+            dataset["target"] = (dataset["close"].shift(-1) > dataset["close"]).astype(int)
+            dataset = dataset.dropna(subset=["target"]).copy()
+        return dataset
+
+
 def profit_factor(signals: list[int], prices: list[float]) -> float:
     profits = []
     for i in range(1, len(signals)):
@@ -55,33 +124,22 @@ def signal_stability(signals: list[int]) -> float:
     return 1 - (reversals / total_changes) if total_changes > 0 else 1.0
 
 def evaluate_model(model_path: str, data_path: str) -> dict:
-    model = joblib.load(model_path)
+    bundle_or_model = joblib.load(model_path)
+    model, bundle_feats = _unwrap_model_bundle(bundle_or_model)
     df = load_dataframe(data_path)
-    dataset = prepare_dataset_with_targets(df)
+    dataset = _prepare_dataset_for_eval(df)
 
-    X = dataset.drop(columns=["target"])
-    non_numerical_cols = X.select_dtypes(include=["object"]).columns
-    if len(non_numerical_cols) > 0:
-        print(f"⚠️ Odstraňuji nenumerické sloupce: {list(non_numerical_cols)}")
-        X = X.drop(columns=non_numerical_cols)
+    X = _select_feature_matrix(dataset, model, bundle_feats)
 
-    model_feature_names = model.get_booster().feature_names
-    missing = [f for f in model_feature_names if f not in X.columns]
-    if missing:
-        raise ValueError(f"⚠️ V datech chybí featury, které model vyžaduje: {missing}")
-    X = X[model_feature_names]
-
-    y_true = dataset["target"]
+    y_true = dataset["target"].astype(int)
     y_pred = model.predict(X)
 
-    f1 = f1_score(y_true, y_pred, zero_division=0)
-    precision = precision_score(y_true, y_pred, zero_division=0)
-    recall = recall_score(y_true, y_pred, zero_division=0)
+    f1, precision, recall, _ = _classification_metrics(y_true, y_pred)
 
     metrics = calculate_metrics(
         y_true=y_true,
         y_pred=y_pred,
-        df=df,                # očekává 'close'/'Close'
+        df=dataset,
         fee_per_trade=0.0,
         slippage_bps=0.0,
         rolling_window=200,
@@ -127,7 +185,7 @@ def evaluate_model_once(features_csv: str, model_path: str, results_out: str) ->
 
     # 1) načteme featury a připravíme dataset s targetem přes tvoji funkci
     df_raw = load_dataframe(features_csv)
-    dataset = prepare_dataset_with_targets(df_raw)
+    dataset = _prepare_dataset_for_eval(df_raw)
 
     # 2) vybereme X/y
     if "target" not in dataset.columns:
@@ -139,37 +197,10 @@ def evaluate_model_once(features_csv: str, model_path: str, results_out: str) ->
 
     # 3) načtení modelu (bundle i čistý estimator)
     bundle_or_model = joblib.load(model_path)
-    if isinstance(bundle_or_model, dict) and "model" in bundle_or_model:
-        model = bundle_or_model["model"]
-        model_feats = bundle_or_model.get("features", None)
-    else:
-        model = bundle_or_model
-        model_feats = None
+    model, model_feats = _unwrap_model_bundle(bundle_or_model)
 
-    # 4) preferuj featury z uloženého bundle; jinak z datasetu
-    if model_feats:
-        missing = [f for f in model_feats if f not in dataset.columns]
-        if missing:
-            # pokusíme se je dopočítat (fallback featury)
-            _ensure_fallback_features(dataset, missing)
-            missing = [f for f in model_feats if f not in dataset.columns]
-            if missing:
-                raise ValueError(f"V datech chybí featury, které model vyžaduje: {missing}")
-        X = dataset[model_feats].fillna(0.0)
-    else:
-        # pro XGB zkus získat names z boosteru
-        try:
-            booster_feats = getattr(model, "get_booster", lambda: None)()
-            if booster_feats is not None and hasattr(booster_feats, "feature_names"):
-                names = booster_feats.feature_names
-                missing = [f for f in names if f not in dataset.columns]
-                if missing:
-                    raise ValueError(f"V datech chybí featury požadované modelem: {missing}")
-                X = dataset[names].fillna(0.0)
-            else:
-                X = dataset[num_cols].fillna(0.0)
-        except Exception:
-            X = dataset[num_cols].fillna(0.0)
+    # 4) robustní výběr featur
+    X = _select_feature_matrix(dataset, model, model_feats)
 
     # 5) predikce (vynecháme poslední řádek kvůli posunu targetu v prepare_dataset_with_targets, pokud je)
     # Pozn.: Pokud prepare_dataset_with_targets NEdělá shift(-1), není třeba ořezávat.
@@ -180,15 +211,13 @@ def evaluate_model_once(features_csv: str, model_path: str, results_out: str) ->
     y_hat = model.predict(X)
 
     # 6) metriky
-    f1 = f1_score(y_true, y_hat, zero_division=0)
-    precision = precision_score(y_true, y_hat, zero_division=0)
-    recall = recall_score(y_true, y_hat, zero_division=0)
+    f1, precision, recall, accuracy = _classification_metrics(y_true, y_hat)
 
     # 7) obchodní metriky – použijeme jednotné calculate_metrics
     metrics = calculate_metrics(
         y_true=y_true,
         y_pred=y_hat,
-        df=df_raw,             # očekává 'close'/'Close' sloupec
+        df=dataset,
         fee_per_trade=0.0,
         slippage_bps=0.0,
         rolling_window=200,
@@ -212,10 +241,10 @@ def evaluate_model_once(features_csv: str, model_path: str, results_out: str) ->
         "model_path": model_path,
         "profit": float(profit),
         "f1": float(f1),
-        "accuracy": float((y_true.values == y_hat).mean()),
+        "accuracy": float(accuracy),
         "precision": float(precision),
         "recall": float(recall),
-        "num_trades": int(num_trades),  # jednoduchá proxy: počet long signálů
+        "num_trades": int(num_trades),
         "sharpe_ratio": float(sharpe),
         "drawdown": float(drawdown),
         "winrate": float(win_rate),

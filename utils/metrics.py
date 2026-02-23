@@ -209,8 +209,13 @@ def calculate_metrics(
     yt = np.asarray(yt_raw.to_numpy())
     yp = np.asarray(yp_raw.to_numpy())
 
-    # Remap ternary (0,1,2) to (-1,0,1) if detected
-    if set(np.unique(yt)).issubset({0, 1, 2}):
+    # Remap ternary (0,1,2) to (-1,0,1) only when class 2 is present.
+    # NOTE:
+    # - Binary 0/1 labels in this project represent SHORT/LONG and must NOT be remapped,
+    #   otherwise class 1 would become FLAT (0) and trading metrics collapse.
+    uniq_yt = set(np.unique(yt).tolist())
+    uniq_yp = set(np.unique(yp).tolist())
+    if (2 in uniq_yt) or (2 in uniq_yp):
         # Likely mapped ternary: 0->-1, 1->0, 2->1
         yt_remap = np.array([-1 if c == 0 else (0 if c == 1 else 1) for c in yt])
         yp_remap = np.array([-1 if c == 0 else (0 if c == 1 else 1) for c in yp])
@@ -394,8 +399,14 @@ def pnl_scorer(
     try:
         if hasattr(estimator, "predict_proba"):
             pr = estimator.predict_proba(X_val)
-            p1 = pr[:, 1] if isinstance(pr, np.ndarray) and pr.ndim == 2 and pr.shape[1] >= 2 else np.asarray(pr).ravel()
-            y_pred = (p1 >= 0.5).astype(int)
+            if isinstance(pr, np.ndarray) and pr.ndim == 2 and pr.shape[1] >= 3:
+                prob_short = pr[:, 0]
+                prob_long = pr[:, 2]
+                # mapped ternary labels: 0=SHORT, 1=HOLD, 2=LONG
+                y_pred = np.where(prob_long >= 0.5, 2, np.where(prob_short >= 0.5, 0, 1)).astype(int)
+            else:
+                p1 = pr[:, 1] if isinstance(pr, np.ndarray) and pr.ndim == 2 and pr.shape[1] >= 2 else np.asarray(pr).ravel()
+                y_pred = (p1 >= 0.5).astype(int)
         elif hasattr(estimator, "decision_function"):
             z = np.asarray(estimator.decision_function(X_val)).ravel()
             y_pred = (1.0 / (1.0 + np.exp(-z)) >= 0.5).astype(int)

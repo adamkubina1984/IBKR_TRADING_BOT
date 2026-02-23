@@ -55,10 +55,20 @@ def load_model_with_meta(model_path: str | Path) -> LoadedModel:
             except Exception as e:
                 log.warning("Cannot read metadata %s: %s", cand, e)
 
-    if not meta.get("model_classes") and hasattr(model, "classes_"):
-        meta["model_classes"] = list(getattr(model, "classes_"))
-    if not meta.get("trained_features") and hasattr(model, "feature_names_in_"):
-        meta["trained_features"] = list(getattr(model, "feature_names_in_"))
+    predictor = model.get("model") if isinstance(model, dict) and "model" in model else model
+
+    # normalize class keys across metadata producers
+    if not meta.get("model_classes"):
+        if isinstance(meta.get("classes"), list):
+            meta["model_classes"] = list(meta.get("classes"))
+        elif hasattr(predictor, "classes_"):
+            meta["model_classes"] = list(getattr(predictor, "classes_"))
+
+    if not meta.get("trained_features"):
+        if isinstance(meta.get("features"), list):
+            meta["trained_features"] = list(meta.get("features"))
+        elif hasattr(predictor, "feature_names_in_"):
+            meta["trained_features"] = list(getattr(predictor, "feature_names_in_"))
 
     log.info(
         "Model loaded | path=%s | size=%.1f kB | sha1=%s | classes=%s | n_features=%s",

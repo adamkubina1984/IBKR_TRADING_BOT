@@ -38,20 +38,24 @@ except Exception:
 try:
     from ibkr_trading_bot.model.tscv import PurgedWalkForwardSplit
 except Exception:
-    class PurgedWalkForwardSplit:  # type: ignore
-        def __init__(self, n_splits=5, embargo=0):
-            self.n_splits = n_splits
-            self.embargo = embargo
-        def split(self, X):
-            n = len(X)
-            fold = n // (self.n_splits + 1)
-            for k in range(self.n_splits):
-                train_end = fold * (k + 1)
-                test_start = min(train_end + self.embargo, n - 1)
-                test_end = min(test_start + fold, n)
-                tr = np.arange(0, train_end)
-                te = np.arange(test_start, test_end)
-                yield tr, te
+    try:
+        from model.tscv import PurgedWalkForwardSplit
+    except Exception:
+        class PurgedWalkForwardSplit:  # type: ignore
+            def __init__(self, n_splits=5, embargo=0):
+                self.n_splits = n_splits
+                self.embargo = embargo
+
+            def split(self, X):
+                n = len(X)
+                fold = n // (self.n_splits + 1)
+                for k in range(self.n_splits):
+                    train_end = fold * (k + 1)
+                    test_start = min(train_end + self.embargo, n - 1)
+                    test_end = min(test_start + fold, n)
+                    tr = np.arange(0, train_end)
+                    te = np.arange(test_start, test_end)
+                    yield tr, te
 
 # --- metriky / scorer
 try:
@@ -59,13 +63,21 @@ try:
     HAS_CALC_METRICS = True
 except Exception:
     try:
-        from ibkr_trading_bot.utils.metrics import pnl_scorer  # type: ignore
-        HAS_CALC_METRICS = False
+        from utils.metrics import calculate_metrics, pnl_scorer  # type: ignore
+        HAS_CALC_METRICS = True
     except Exception:
-        def pnl_scorer(estimator, X_val, y_val, df_val=None, fee=0.0, slippage=0.0):
-            pred = estimator.predict(X_val)
-            return float((pred == y_val).mean())
-        HAS_CALC_METRICS = False
+        try:
+            from ibkr_trading_bot.utils.metrics import pnl_scorer  # type: ignore
+            HAS_CALC_METRICS = False
+        except Exception:
+            try:
+                from utils.metrics import pnl_scorer  # type: ignore
+                HAS_CALC_METRICS = False
+            except Exception:
+                def pnl_scorer(estimator, X_val, y_val, df_val=None, fee=0.0, slippage=0.0):
+                    pred = estimator.predict(X_val)
+                    return float((pred == y_val).mean())
+                HAS_CALC_METRICS = False
 
 # ------------------- Pomocné -------------------
 def _now_str() -> str:
@@ -161,14 +173,51 @@ def _namespaced_param_grid(estimator, grid: dict | None) -> dict | None:
     step = estimator.steps[-1][0]
     return {(k if "__" in k else f"{step}__{k}"): v for k, v in grid.items()}
 
+
+def _feature_names_for_estimator(estimator) -> list[str] | None:
+    try:
+        names = getattr(estimator, "feature_names_in_", None)
+        if names is not None:
+            return [str(c) for c in list(names)]
+    except Exception:
+        pass
+    try:
+        if isinstance(estimator, Pipeline):
+            last = estimator.steps[-1][1]
+            names = getattr(last, "feature_names_in_", None)
+            if names is not None:
+                return [str(c) for c in list(names)]
+    except Exception:
+        pass
+    return None
+
+
+def _align_X_for_estimator(estimator, X):
+    """Ensure prediction input has stable DataFrame columns matching fitted feature names."""
+    try:
+        names = _feature_names_for_estimator(estimator)
+        if names:
+            if isinstance(X, pd.DataFrame):
+                Xdf = X.copy()
+            else:
+                Xdf = pd.DataFrame(X)
+            for col in names:
+                if col not in Xdf.columns:
+                    Xdf[col] = 0.0
+            return Xdf.reindex(columns=names, fill_value=0.0)
+    except Exception:
+        pass
+    return X
+
 def _predict_proba(estimator, X: pd.DataFrame, class_idx: int = 1) -> np.ndarray | None:
     """
     Return predicted probability for class at given index (1 for binary class 1, or for multiclass).
     For ternary, use class_idx=2 for LONG class.
     """
     try:
+        X_use = _align_X_for_estimator(estimator, X)
         if hasattr(estimator, "predict_proba"):
-            proba = estimator.predict_proba(X)
+            proba = estimator.predict_proba(X_use)
             if isinstance(proba, np.ndarray) and proba.ndim == 2:
                 # if more than 2 classes, return proba for class_idx; else return class 1
                 return proba[:, min(class_idx, proba.shape[1] - 1)]
@@ -176,13 +225,68 @@ def _predict_proba(estimator, X: pd.DataFrame, class_idx: int = 1) -> np.ndarray
         if isinstance(estimator, Pipeline):
             last = estimator.steps[-1][1]
             if hasattr(last, "predict_proba"):
-                proba = estimator.predict_proba(X)
+                proba = estimator.predict_proba(X_use)
                 if isinstance(proba, np.ndarray) and proba.ndim == 2:
                     return proba[:, min(class_idx, proba.shape[1] - 1)]
                 return np.asarray(proba).ravel()
     except Exception:
         pass
     return None
+
+
+def _predict_labels_for_metrics(
+    estimator,
+    X: pd.DataFrame,
+    *,
+    decision_threshold: float = 0.5,
+    is_ternary: bool = False,
+) -> tuple[np.ndarray, int, np.ndarray | None]:
+    """
+    Build labels for metrics from estimator outputs.
+
+    Returns:
+      - y_pred labels
+      - n_signals (binary: count(label==1), ternary: count(label!=1/HOLD))
+      - proba matrix/vector if available, else None
+    """
+    proba = None
+    try:
+        X_use = _align_X_for_estimator(estimator, X)
+        if hasattr(estimator, "predict_proba"):
+            proba = estimator.predict_proba(X_use)
+    except Exception:
+        proba = None
+        X_use = X
+
+    thr = float(decision_threshold)
+
+    if isinstance(proba, np.ndarray) and proba.ndim == 2:
+        if is_ternary and proba.shape[1] >= 3:
+            prob_short = proba[:, 0]
+            prob_long = proba[:, 2]
+            # mapped ternary labels expected by sklearn model: 0=SHORT, 1=HOLD, 2=LONG
+            y_pred = np.where(prob_long >= thr, 2, np.where(prob_short >= thr, 0, 1)).astype(int)
+            n_signals = int((y_pred != 1).sum())
+            return y_pred, n_signals, proba
+
+        if proba.shape[1] >= 2:
+            p1 = proba[:, 1]
+            y_pred = (p1 >= thr).astype(int)
+            n_signals = int((y_pred == 1).sum())
+            return y_pred, n_signals, p1
+
+    y_pred = np.asarray(estimator.predict(X_use)).astype(int)
+    if is_ternary:
+        n_signals = int((y_pred != 1).sum())
+    else:
+        n_signals = int((y_pred == 1).sum())
+    return y_pred, n_signals, None
+
+
+def _mapped_ternary_to_signed(arr: np.ndarray) -> np.ndarray:
+    """Convert mapped ternary labels 0/1/2 to signed -1/0/1."""
+    a = np.asarray(arr).astype(int)
+    return np.where(a == 0, -1, np.where(a == 1, 0, 1)).astype(int)
 
 def _fit_with_params(base_estimator, params: dict) -> object:
     est = clone(base_estimator)
@@ -249,12 +353,21 @@ def _mc_eval_holdout_adaptive(
         return {}
 
     proba_all = None
+    proba_short_all = None
+    proba_long_all = None
+    is_ternary_proba = False
     try:
+        Xh_use = _align_X_for_estimator(estimator, Xh)
         if hasattr(estimator, "predict_proba"):
-            pr = estimator.predict_proba(Xh)
-            proba_all = pr[:, 1] if isinstance(pr, np.ndarray) and pr.ndim == 2 and pr.shape[1] >= 2 else np.asarray(pr).ravel()
+            pr = estimator.predict_proba(Xh_use)
+            if isinstance(pr, np.ndarray) and pr.ndim == 2 and pr.shape[1] >= 3:
+                proba_short_all = pr[:, 0]
+                proba_long_all = pr[:, 2]
+                is_ternary_proba = True
+            else:
+                proba_all = pr[:, 1] if isinstance(pr, np.ndarray) and pr.ndim == 2 and pr.shape[1] >= 2 else np.asarray(pr).ravel()
         elif hasattr(estimator, "decision_function"):
-            z = np.asarray(estimator.decision_function(Xh)).ravel()
+            z = np.asarray(estimator.decision_function(Xh_use)).ravel()
             proba_all = 1.0 / (1.0 + np.exp(-z))
     except Exception:
         proba_all = None
@@ -271,7 +384,23 @@ def _mc_eval_holdout_adaptive(
         yt = y_true[idx]
         dfb = df_hold.iloc[idx]
 
-        if proba_all is not None:
+        if is_ternary_proba and proba_short_all is not None and proba_long_all is not None:
+            ps = proba_short_all[idx]
+            pl = proba_long_all[idx]
+            thr_used = float(base_threshold)
+            yp = np.where(pl >= thr_used, 2, np.where(ps >= thr_used, 0, 1)).astype(int)
+            if int((yp != 1).sum()) < min_trades:
+                used = False
+                for thr in trial_thresholds:
+                    thr_used = float(thr)
+                    yp = np.where(pl >= thr_used, 2, np.where(ps >= thr_used, 0, 1)).astype(int)
+                    if int((yp != 1).sum()) >= min_trades:
+                        used = True
+                        break
+                if not used:
+                    thr_used = float(trial_thresholds[-1])
+                    yp = np.where(pl >= thr_used, 2, np.where(ps >= thr_used, 0, 1)).astype(int)
+        elif proba_all is not None:
             pb = proba_all[idx]
             thr_used = float(base_threshold)
             yp = (pb >= thr_used).astype(int)
@@ -287,11 +416,14 @@ def _mc_eval_holdout_adaptive(
                     thr_used = float(trial_thresholds[-1])
                     yp = (pb >= thr_used).astype(int)
         else:
-            yp = estimator.predict(dfb[features])
+            X_pred = _align_X_for_estimator(estimator, dfb[features])
+            yp = estimator.predict(X_pred)
 
         try:
+            yt_eval = _mapped_ternary_to_signed(yt) if is_ternary_proba else yt
+            yp_eval = _mapped_ternary_to_signed(yp) if is_ternary_proba else yp
             m = calculate_metrics(
-                y_true=yt, y_pred=yp, df=dfb,
+                y_true=yt_eval, y_pred=yp_eval, df=dfb,
                 fee_per_trade=fee_per_trade, slippage_bps=slippage_bps,
                 annualize_sharpe=True
             )
@@ -471,7 +603,7 @@ def train_and_evaluate_model(
             calibrated_estimator = best_estimator
 
     decision_threshold = 0.5
-    if best_oof is not None and HAS_CALC_METRICS:
+    if (not is_ternary) and best_oof is not None and HAS_CALC_METRICS:
         valid = np.isfinite(best_oof)
         if valid.any():
             df_oof = df_train.iloc[valid.nonzero()[0]]
@@ -486,8 +618,34 @@ def train_and_evaluate_model(
     n_signals_train: int | None = None
     base_threshold_mc: float = float(decision_threshold)
 
-    # --- TRAIN metriky (z OOF, bez training leakage) ---
-    if best_oof is not None:
+    # --- TRAIN metriky ---
+    if is_ternary:
+        try:
+            X_train_eval = df_train[feats].replace([np.inf, -np.inf], np.nan)
+            y_train = df_train["target"].astype(int).to_numpy()
+            y_train_pred, n_signals_train, _ = _predict_labels_for_metrics(
+                calibrated_estimator,
+                X_train_eval,
+                decision_threshold=decision_threshold,
+                is_ternary=True,
+            )
+
+            if HAS_CALC_METRICS:
+                y_train_eval = _mapped_ternary_to_signed(y_train)
+                y_train_pred_eval = _mapped_ternary_to_signed(y_train_pred)
+                train_metrics = calculate_metrics(
+                    y_true=y_train_eval,
+                    y_pred=y_train_pred_eval,
+                    df=df_train,
+                    fee_per_trade=fee_per_trade,
+                    slippage_bps=slippage_bps,
+                    annualize_sharpe=annualize_sharpe,
+                )
+            else:
+                train_metrics = {"accuracy": float((y_train_pred == y_train).mean())}
+        except Exception:
+            pass
+    elif best_oof is not None:
         valid = np.isfinite(best_oof)
         if valid.any():
             try:
@@ -514,22 +672,23 @@ def train_and_evaluate_model(
         proba = None
         try:
             if HAS_CALC_METRICS:
-                proba = _predict_proba(calibrated_estimator, Xh)
-                if proba is not None:
-                    ypred = (proba >= float(decision_threshold)).astype(int)
-                    n_signals_holdout = int((proba >= float(decision_threshold)).sum())
-                else:
-                    ypred = calibrated_estimator.predict(Xh)
-                    n_signals_holdout = int((ypred == 1).sum())
+                ypred, n_signals_holdout, proba = _predict_labels_for_metrics(
+                    calibrated_estimator,
+                    Xh,
+                    decision_threshold=decision_threshold,
+                    is_ternary=is_ternary,
+                )
 
+                yh_eval = _mapped_ternary_to_signed(yh) if is_ternary else yh
+                ypred_eval = _mapped_ternary_to_signed(ypred) if is_ternary else ypred
                 holdout_metrics = calculate_metrics(
-                    y_true=yh, y_pred=ypred, df=df_hold,
+                    y_true=yh_eval, y_pred=ypred_eval, df=df_hold,
                     fee_per_trade=fee_per_trade, slippage_bps=slippage_bps,
                     annualize_sharpe=annualize_sharpe
                 )
 
                 mc_target_trades = 100
-                if proba is not None and len(proba) > 0 and n_signals_holdout is not None:
+                if (not is_ternary) and proba is not None and len(proba) > 0 and n_signals_holdout is not None:
                     if n_signals_holdout < max(20, 0.2 * mc_target_trades):
                         frac = max(1, mc_target_trades) / max(1, len(proba))
                         q = 1.0 - min(0.95, max(0.01, float(frac)))
@@ -548,7 +707,8 @@ def train_and_evaluate_model(
                         min_trades=20,
                     )
             else:
-                acc = float((calibrated_estimator.predict(Xh) == yh).mean())
+                Xh_pred = _align_X_for_estimator(calibrated_estimator, Xh)
+                acc = float((calibrated_estimator.predict(Xh_pred) == yh).mean())
                 holdout_metrics = {"accuracy": acc}
         except Exception:
             pass
@@ -593,7 +753,7 @@ def train_and_evaluate_model(
         "n_total_bars": int(n_total),
         "n_train_bars": len(df_train),
         "n_holdout_bars": int(len(df_hold) if df_hold is not None else 0),
-        "class_to_dir": {0: "SHORT", 1: "LONG"},
+        "class_to_dir": ({0: "SHORT", 1: "HOLD", 2: "LONG"} if is_ternary else {0: "SHORT", 1: "LONG"}),
         "classes": None,
         "annualize_sharpe": bool(annualize_sharpe),
         **(meta_extra or {}),

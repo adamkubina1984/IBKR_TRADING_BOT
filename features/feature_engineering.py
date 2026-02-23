@@ -158,17 +158,25 @@ def compute_all_features(df: pd.DataFrame) -> pd.DataFrame:
 
     _ensure_ohlc_columns(df)
 
-    cfg = _safe_feature_config()
-
-    rsi_cfg   = cfg.get("rsi", {})
-    macd_cfg  = cfg.get("macd", {})
-    atr_cfg   = cfg.get("atr", {})
-    wr_cfg    = cfg.get("williams_r", {})
-    stoch_cfg = cfg.get("stochastic", {})
-    roll_cfg  = cfg.get("rolling", {})
-    br_cfg    = cfg.get("breakouts", {})
+    cfg_raw = _safe_feature_config()
+    # Naviguj do YAML struktury: features → indicators / rolling_stats / etc
+    cfg = cfg_raw.get("features", {}) if "features" in cfg_raw else cfg_raw
+    
+    # Indikátory (pod "indicators" klíčem)
+    indicators = cfg.get("indicators", {})
+    rsi_cfg       = indicators.get("rsi", {})
+    macd_cfg      = indicators.get("macd", {})
+    atr_cfg       = indicators.get("atr", {})
+    wr_cfg        = indicators.get("williams_r", {})
+    stoch_cfg     = indicators.get("stochastic", {})
+    
+    # Top-level konfigurace
+    roll_cfg  = cfg.get("rolling_stats", {})  # ← OPRAVENO: "rolling_stats" ne "rolling"
 
     out = df.copy()
+
+    # AVERAGE - prosté OHLC průměr
+    out["average"] = (out["open"] + out["high"] + out["low"] + out["close"]) / 4.0
 
     # RSI
     win = int(rsi_cfg.get("window", 14))
@@ -233,16 +241,27 @@ def compute_all_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
     # === Rolling statistiky ===
-    if roll_cfg.get("enabled", False):
-        wins = roll_cfg.get("windows", [5, 10, 20])
+    # rolling_stats má subsekce: mean_std, price_change, breakouts
+    mean_std_cfg = roll_cfg.get("mean_std", {})
+    if mean_std_cfg.get("enabled", False):
+        wins = mean_std_cfg.get("windows", [20, 50, 100])
         for w in wins:
             w = int(w)
             out[f"roll_mean_close_{w}"] = out["close"].rolling(window=w, min_periods=w).mean()
             out[f"roll_std_close_{w}"]  = out["close"].rolling(window=w, min_periods=w).std()
+    
+    # Price changes (diferenční featury)
+    price_chg_cfg = roll_cfg.get("price_change", {})
+    if price_chg_cfg.get("enabled", False):
+        periods = price_chg_cfg.get("periods", [1, 5, 10])
+        for p in periods:
+            p = int(p)
+            out[f"price_change_{p}"] = out["close"].pct_change(periods=p)
 
     # === Breakouts (Donchian) ===
-    if br_cfg.get("enabled", False):
-        w = int(br_cfg.get("window", 20))
+    br_cfg_nested = roll_cfg.get("breakouts", {})
+    if br_cfg_nested.get("enabled", False):
+        w = int(br_cfg_nested.get("window", 20))
         highest = out["high"].rolling(window=w, min_periods=w).max()
         lowest  = out["low"].rolling(window=w, min_periods=w).min()
         out[f"donchian_high_{w}"] = highest

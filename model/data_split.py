@@ -339,7 +339,15 @@ def train_simple_model(features_csv: str, model_out: str) -> str:
         raise FileNotFoundError(f"Soubor s featurami neexistuje: {features_csv}")
 
     raw = pd.read_csv(features_csv)
-    dataset = prepare_dataset_with_targets(raw)
+    try:
+        dataset = prepare_dataset_with_targets(raw)
+    except Exception:
+        dataset = raw.copy()
+        if "target" not in dataset.columns:
+            if "close" not in dataset.columns:
+                raise
+            dataset["target"] = (dataset["close"].shift(-1) > dataset["close"]).astype(int)
+            dataset = dataset.dropna(subset=["target"]).copy()
 
     if "target" not in dataset.columns:
         raise ValueError("Ve vstupním datasetu chybí sloupec 'target' po prepare_dataset_with_targets().")

@@ -97,6 +97,7 @@ class TrainWorker(QThread):
                 mc_iters=200,
                 mc_block_len=int(self.meta_extra.get("mc_block_len", 100)),
                 annualize_sharpe=True,   # ← nově přidáno
+                top_k_features=12,  # Vybere jen top 12 features dle importance
             )
 
             self.phase.emit("save")
@@ -117,6 +118,7 @@ class ModelTrainingTab(QWidget):
         self.csv_path: str | None = None
         self.X_test: pd.DataFrame | None = None
         self.y_test: pd.Series | None = None
+        self._is_ternary_target: bool = False
         self.holdout_bars_default = 500
 
         root = QVBoxLayout(self)
@@ -174,10 +176,12 @@ class ModelTrainingTab(QWidget):
 
         try:
             svc = DatasetService()
-            df = svc.prepare_from_csv(path, labeling="triple_barrier")
+            df = svc.prepare_from_csv(path, labeling="triple_barrier", target_mode="ternary")
             # Use ALL data from CSV, no artificial limit
             self.dataset = df
             n_rows = len(df)
+            uniq = sorted(pd.Series(df["target"]).dropna().astype(int).unique().tolist()) if "target" in df.columns else []
+            self.log.appendPlainText(f"ℹ️ Target classes: {uniq}")
             self.log.appendPlainText(f"✅ Načteno: {path} | řádků={n_rows}")
             self.btn_train.setEnabled(True)
             # Update button label dynamically
@@ -201,9 +205,16 @@ class ModelTrainingTab(QWidget):
 
         feats_all = _select_feature_columns(df_train)
         X_cols = feats_all
+        uniq_target = sorted(pd.Series(df["target"]).dropna().astype(int).unique().tolist())
+        self._is_ternary_target = set(uniq_target).issubset({-1, 0, 1}) and len(uniq_target) == 3
         if df_hold is not None:
             self.X_test = df_hold[X_cols].replace([np.inf, -np.inf], 0.0).fillna(0.0)
-            self.y_test = (df_hold["target"].astype(float) > 0).astype(int)
+            y_hold = df_hold["target"].astype(float)
+            if self._is_ternary_target:
+                # mirror train_models mapping: -1->0, 0->1, 1->2
+                self.y_test = y_hold.map({-1.0: 0, 0.0: 1, 1.0: 2}).astype(int)
+            else:
+                self.y_test = (y_hold > 0).astype(int)
         else:
             self.X_test, self.y_test = None, None
 
@@ -336,8 +347,13 @@ class ModelTrainingTab(QWidget):
                 X_eval = self.X_test.reindex(columns=feats, fill_value=0.0) if feats else self.X_test
                 if hasattr(mdl, "predict_proba"):
                     pr = mdl.predict_proba(X_eval)
-                    p1 = pr[:, 1] if isinstance(pr, np.ndarray) and pr.ndim == 2 and pr.shape[1] >= 2 else np.asarray(pr).ravel()
-                    y_pred = (p1 >= thr).astype(int)
+                    if isinstance(pr, np.ndarray) and pr.ndim == 2 and pr.shape[1] >= 3:
+                        p_short = pr[:, 0]
+                        p_long = pr[:, 2]
+                        y_pred = np.where(p_long >= thr, 2, np.where(p_short >= thr, 0, 1)).astype(int)
+                    else:
+                        p1 = pr[:, 1] if isinstance(pr, np.ndarray) and pr.ndim == 2 and pr.shape[1] >= 2 else np.asarray(pr).ravel()
+                        y_pred = (p1 >= thr).astype(int)
                 elif hasattr(mdl, "decision_function"):
                     z = np.asarray(mdl.decision_function(X_eval)).ravel()
                     p1 = 1.0 / (1.0 + np.exp(-z))
@@ -345,9 +361,14 @@ class ModelTrainingTab(QWidget):
                 else:
                     y_pred = mdl.predict(X_eval)
                 acc = accuracy_score(self.y_test, y_pred)
-                prec = precision_score(self.y_test, y_pred, zero_division=0)
-                rec = recall_score(self.y_test, y_pred, zero_division=0)
-                f1 = f1_score(self.y_test, y_pred, zero_division=0)
+                if len(np.unique(np.asarray(self.y_test))) >= 3:
+                    prec = precision_score(self.y_test, y_pred, average="macro", zero_division=0)
+                    rec = recall_score(self.y_test, y_pred, average="macro", zero_division=0)
+                    f1 = f1_score(self.y_test, y_pred, average="macro", zero_division=0)
+                else:
+                    prec = precision_score(self.y_test, y_pred, zero_division=0)
+                    rec = recall_score(self.y_test, y_pred, zero_division=0)
+                    f1 = f1_score(self.y_test, y_pred, zero_division=0)
                 self.log.appendPlainText(
                     f"📈 HOLDOUT (posledních {len(self.y_test)} barů): Acc={acc:.4f} | Prec={prec:.4f} | Rec={rec:.4f} | F1={f1:.4f}"
                 )

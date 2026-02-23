@@ -117,10 +117,17 @@ def discover_models(dir_path: Path) -> list[ModelRecord]:
         # doplnění z modelu (fallbacky na classes/features)
         try:
             mdl = joblib.load(p)
-            if not meta.get("model_classes") and hasattr(mdl, "classes_"):
-                meta["model_classes"] = list(getattr(mdl, "classes_"))
-            if not meta.get("trained_features") and hasattr(mdl, "feature_names_in_"):
-                meta["trained_features"] = list(getattr(mdl, "feature_names_in_"))
+            predictor = mdl.get("model") if isinstance(mdl, dict) and "model" in mdl else mdl
+            if not meta.get("model_classes"):
+                if isinstance(meta.get("classes"), list):
+                    meta["model_classes"] = list(meta.get("classes"))
+                elif hasattr(predictor, "classes_"):
+                    meta["model_classes"] = list(getattr(predictor, "classes_"))
+            if not meta.get("trained_features"):
+                if isinstance(meta.get("features"), list):
+                    meta["trained_features"] = list(meta.get("features"))
+                elif hasattr(predictor, "feature_names_in_"):
+                    meta["trained_features"] = list(getattr(predictor, "feature_names_in_"))
         except Exception:
             pass
 
@@ -330,7 +337,8 @@ class ModelManagerTab(QWidget):
         if not trained_feats:
             # fallback – zkus načíst model a vzít feature_names_in_
             try:
-                mdl = joblib.load(self.loaded.model_path)
+                mdl_obj = joblib.load(self.loaded.path)
+                mdl = mdl_obj.get("model") if isinstance(mdl_obj, dict) and "model" in mdl_obj else mdl_obj
                 if hasattr(mdl, "feature_names_in_") and mdl.feature_names_in_ is not None:
                     trained_feats = [str(c) for c in list(mdl.feature_names_in_)]
             except Exception:

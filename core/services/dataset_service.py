@@ -1,9 +1,11 @@
 from typing import Literal
 
+import numpy as np
 import pandas as pd
 
 from ibkr_trading_bot.features.feature_engineering import prepare_dataset_with_targets
 from ibkr_trading_bot.labels import make_triple_barrier_labels
+from ibkr_trading_bot.labels.triple_barrier import make_triple_barrier_labels_ternary
 from ibkr_trading_bot.utils.io_helpers import load_dataframe
 
 
@@ -17,7 +19,7 @@ class DatasetService:
       3) zavolá prepare_dataset_with_targets(raw)
       4) doplní timestamp
       5) vytvoří / konsoliduje 'target' podle zvoleného režimu (původní nebo triple-barrier)
-      6) binarizuje target do {0,1}
+    6) normalizuje target podle režimu (binary/ternary)
       7) volitelně vyčistí řádky s NaN ve featurách
 
     Pozn.: Tato služba NEMÁ míchat timestamp do featur (to řeší tréninková část).
@@ -27,6 +29,7 @@ class DatasetService:
         self,
         path: str,
         labeling: Literal["prepared", "triple_barrier"] = "prepared",
+        target_mode: Literal["binary", "ternary"] = "ternary",
         horizon: int = 12,
         take_profit_bps: float = 60.0,
         stop_loss_bps: float = 40.0,
@@ -75,14 +78,22 @@ class DatasetService:
         if labeling == "triple_barrier":
             # VŽDY počítáme triple barrier nad df_prepared (který má featury a správný počet řádků)
             # ne nad raw, jinak budou nesedět délky
-            tb = make_triple_barrier_labels(
-                df=df_prepared,
-                horizon=horizon,
-                take_profit_bps=take_profit_bps,
-                stop_loss_bps=stop_loss_bps,
-                fee_per_trade=fee_per_trade,
-                slippage_bps=slippage_bps,
-            )
+            if target_mode == "ternary":
+                tb = make_triple_barrier_labels_ternary(
+                    df=df_prepared,
+                    horizon=horizon,
+                    take_profit_bps=take_profit_bps,
+                    stop_loss_bps=stop_loss_bps,
+                )
+            else:
+                tb = make_triple_barrier_labels(
+                    df=df_prepared,
+                    horizon=horizon,
+                    take_profit_bps=take_profit_bps,
+                    stop_loss_bps=stop_loss_bps,
+                    fee_per_trade=fee_per_trade,
+                    slippage_bps=slippage_bps,
+                )
             df_prepared["target"] = tb.values
         else:
             # Vezmi target z prepare_* pokud existuje; případně z y_series
@@ -91,10 +102,18 @@ class DatasetService:
                     raise ValueError("Po přípravě chybí sloupec 'target' a nebyl vrácen ani 'y'.")
                 df_prepared["target"] = pd.Series(y_series, index=df_prepared.index)
 
-        # --- 6) final binarizace do {0,1}
-        # Připouští původní {-1,0,1} i spojité hodnoty – kladné -> 1, jinak 0
+        # --- 6) final normalizace targetu dle zvoleného režimu
         df_prepared["target"] = pd.Series(df_prepared["target"]).astype(float)
-        df_prepared["target"] = (df_prepared["target"] > 0).astype(int)
+        if target_mode == "ternary":
+            # mapuj na {-1, 0, 1}
+            df_prepared["target"] = np.where(
+                df_prepared["target"] > 0,
+                1,
+                np.where(df_prepared["target"] < 0, -1, 0),
+            ).astype(int)
+        else:
+            # binární fallback {0,1}
+            df_prepared["target"] = (df_prepared["target"] > 0).astype(int)
 
         if df_prepared["target"].dropna().empty:
             raise ValueError("Po přípravě chybí platné hodnoty pro 'target'.")
@@ -162,11 +181,9 @@ class DatasetService:
     def _sanity_log(df: pd.DataFrame, feature_cols: list[str]) -> None:
         # Tohle si můžeš přepojit na tvůj logger
         n = len(df)
-        n_pos = int(df["target"].sum())
-        n_neg = int(n - n_pos)
+        vc = df["target"].value_counts(dropna=False).to_dict()
         msg = (
-            f"[DatasetService] rows={n}  pos={n_pos}  neg={n_neg}  "
-            f"pos_ratio={n_pos/max(n,1):.3f}  features={len(feature_cols)}"
+            f"[DatasetService] rows={n} classes={vc} features={len(feature_cols)}"
         )
         try:
             print(msg)

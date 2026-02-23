@@ -9,6 +9,7 @@
 import os
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 
 import joblib
@@ -246,6 +247,19 @@ class ModelEvaluationTab(QWidget):
         )
         self.chk_ma_only.stateChanged.connect(self._on_model_settings_changed)
 
+        # MACD Derivative Filter
+        self.chk_macd_filter = QCheckBox("MACD Derivative Filter")
+        self.chk_macd_filter.setChecked(False)
+        self.chk_macd_filter.setToolTip(
+            "Pokud zaškrtnuto:\n"
+            "LONG vstup: Pouze pokud MACD derivace > 0 AND model říká LONG\n"
+            "LONG výstup: Model pokud říká zůstat → ignoruj MACD. Jinak exit pokud MACD derivace < 0\n"
+            "SHORT vstup: Pouze pokud MACD derivace < 0 AND model říká SHORT\n"
+            "SHORT výstup: Model pokud říká zůstat → ignoruj MACD. Jinak exit pokud MACD derivace > 0\n"
+            "Pouze na uzavřených svíčkách."
+        )
+        self.chk_macd_filter.stateChanged.connect(self._on_model_settings_changed)
+
         # Tlačítko pro uložení
         self.btn_save_model_settings = QPushButton("💾 Uložit nastavení do modelu")
         self.btn_save_model_settings.setToolTip("Uloží všechna nastavení (thresholdy, checkboxy) do meta.json modelu pro reload v Tab 4")
@@ -262,6 +276,7 @@ class ModelEvaluationTab(QWidget):
         model_settings_layout.addSpacing(12)
         model_settings_layout.addWidget(self.chk_and_ensemble)
         model_settings_layout.addWidget(self.chk_ma_only)
+        model_settings_layout.addWidget(self.chk_macd_filter)
         model_settings_layout.addSpacing(12)
         model_settings_layout.addWidget(self.btn_save_model_settings)
         model_settings_layout.addStretch(1)
@@ -276,18 +291,6 @@ class ModelEvaluationTab(QWidget):
         self.metrics_table.verticalHeader().setVisible(False)
         self.metrics_table.setEditTriggers(QTableWidget.NoEditTriggers)
         metrics_layout.addWidget(self.metrics_table)
-        
-        # Diagnostika overfittingu
-        overfitting_label = QLabel("Diagnostika overfittingu (Train vs Holdout):")
-        overfitting_font = QFont()
-        overfitting_font.setBold(True)
-        overfitting_label.setFont(overfitting_font)
-        metrics_layout.addWidget(overfitting_label)
-        self.overfitting_console = QPlainTextEdit()
-        self.overfitting_console.setMaximumHeight(100)
-        self.overfitting_console.setReadOnly(True)
-        self.overfitting_console.setPlainText("(Žádný model načten)")
-        metrics_layout.addWidget(self.overfitting_console)
         
         metrics_group.setLayout(metrics_layout)
 
@@ -350,7 +353,6 @@ class ModelEvaluationTab(QWidget):
             self.model_metadata = metadata if isinstance(metadata, dict) else (metadata or {})
             self.model_path = file_path
             self.model_label.setText(f"Model: {file_path}")
-            self._show_overfitting_diagnostics()
             self._set_status("Model načten.")
         except Exception as e:
             self._error(f"Nepodařilo se získat estimator z načteného souboru:\n{e}")
@@ -445,9 +447,10 @@ class ModelEvaluationTab(QWidget):
                 # Normální mód: používaj model s Decision Threshold
                 # Pokus se získat surové probabilty (přesnější)
                 proba = None
+                X_pred = self._align_X_for_loaded_model(self.X_current)
                 if hasattr(self.loaded_model, "predict_proba"):
                     try:
-                        proba = self.loaded_model.predict_proba(self.X_current)
+                        proba = self.loaded_model.predict_proba(X_pred)
                     except Exception:
                         proba = None
                 
@@ -459,22 +462,22 @@ class ModelEvaluationTab(QWidget):
                     # Máme proba, aplikuj threshold
                     if proba.shape[1] == 2:
                         # Binary: [prob_class0, prob_class1]
-                        y_pred_by_threshold = (proba[:, 1] >= decision_threshold).astype(int)
+                        y_pred_by_threshold = np.where(proba[:, 1] >= decision_threshold, 1, -1)
                         self.confidence_arr = np.max(proba, axis=1)  # max confidence
                     elif proba.shape[1] == 3:
                         # Ternary: [prob_short, prob_neutral, prob_long]
                         prob_long = proba[:, 2]
                         prob_short = proba[:, 0]
-                        y_pred_by_threshold = np.where(prob_long >= decision_threshold, 1, 
-                                                        np.where(prob_short >= decision_threshold, 0, -1))
+                        y_pred_by_threshold = np.where(prob_long >= decision_threshold, 1,
+                                                        np.where(prob_short >= decision_threshold, -1, 0))
                         self.confidence_arr = np.max(proba, axis=1)
                     else:
                         # Fallback: normální predict
-                        y_pred_by_threshold = self.loaded_model.predict(self.X_current)
+                        y_pred_by_threshold = self.loaded_model.predict(X_pred)
                         self.confidence_arr = np.ones(len(y_pred_by_threshold))
                 else:
                     # Bez proba, použij normální predict
-                    y_pred_by_threshold = self.loaded_model.predict(self.X_current)
+                    y_pred_by_threshold = self.loaded_model.predict(X_pred)
                     self.confidence_arr = np.ones(len(y_pred_by_threshold))
                 
                 self.y_pred_raw = np.asarray(y_pred_by_threshold)
@@ -495,6 +498,15 @@ class ModelEvaluationTab(QWidget):
                         y_pred=self.y_pred_used,
                         confidence=self.confidence_arr,
                         exit_thr=exit_threshold
+                    )
+                    self.y_pred_used = self._normalize_pred(self.y_pred_used)
+
+                # Aplikuj MACD Derivative Filter (pokud je zapnutý)
+                if self.chk_macd_filter.isChecked():
+                    macd_deriv = self._compute_macd_derivative(self.df_current)
+                    self.y_pred_used = self._apply_macd_derivative_filter(
+                        y_pred=self.y_pred_used,
+                        macd_deriv=macd_deriv
                     )
                     self.y_pred_used = self._normalize_pred(self.y_pred_used)
 
@@ -530,7 +542,6 @@ class ModelEvaluationTab(QWidget):
         isinstance(self.trades_df, pd.DataFrame) and not self.trades_df.empty
         )
         self._populate_metrics_table(results)
-        self._show_overfitting_diagnostics()
         self._draw_equity_chart(results)
         trade_pnls_plot = results.get("trade_pnls_net") or results.get("trade_pnls")
         if not trade_pnls_plot:
@@ -558,9 +569,10 @@ class ModelEvaluationTab(QWidget):
         else:
             # Normální mód: znovu vypočítaj raw predikce s novým Decision Threshold
             proba = None
+            X_pred = self._align_X_for_loaded_model(self.X_current)
             if hasattr(self.loaded_model, "predict_proba"):
                 try:
-                    proba = self.loaded_model.predict_proba(self.X_current)
+                    proba = self.loaded_model.predict_proba(X_pred)
                 except Exception:
                     proba = None
             
@@ -568,19 +580,19 @@ class ModelEvaluationTab(QWidget):
                 # Máme proba, aplikuj decision threshold
                 if proba.shape[1] == 2:
                     # Binary: [prob_class0, prob_class1]
-                    y_pred_by_threshold = (proba[:, 1] >= decision_threshold).astype(int)
+                    y_pred_by_threshold = np.where(proba[:, 1] >= decision_threshold, 1, -1)
                 elif proba.shape[1] == 3:
                     # Ternary: [prob_short, prob_neutral, prob_long]
                     prob_long = proba[:, 2]
                     prob_short = proba[:, 0]
-                    y_pred_by_threshold = np.where(prob_long >= decision_threshold, 1, 
-                                                    np.where(prob_short >= decision_threshold, 0, -1))
+                    y_pred_by_threshold = np.where(prob_long >= decision_threshold, 1,
+                                                    np.where(prob_short >= decision_threshold, -1, 0))
                 else:
                     # Fallback
-                    y_pred_by_threshold = self.loaded_model.predict(self.X_current)
+                    y_pred_by_threshold = self.loaded_model.predict(X_pred)
             else:
                 # Bez proba, použij normální predict
-                y_pred_by_threshold = self.loaded_model.predict(self.X_current)
+                y_pred_by_threshold = self.loaded_model.predict(X_pred)
             
             self.y_pred_raw = np.asarray(y_pred_by_threshold)
 
@@ -599,6 +611,15 @@ class ModelEvaluationTab(QWidget):
                 y_pred=self.y_pred_used,
                 confidence=self.confidence_arr,
                 exit_thr=exit_threshold
+            )
+            self.y_pred_used = self._normalize_pred(self.y_pred_used)
+
+        # Aplikuj MACD Derivative Filter (pokud je zapnutý)
+        if self.chk_macd_filter.isChecked():
+            macd_deriv = self._compute_macd_derivative(self.df_current)
+            self.y_pred_used = self._apply_macd_derivative_filter(
+                y_pred=self.y_pred_used,
+                macd_deriv=macd_deriv
             )
             self.y_pred_used = self._normalize_pred(self.y_pred_used)
 
@@ -626,7 +647,6 @@ class ModelEvaluationTab(QWidget):
             isinstance(self.trades_df, pd.DataFrame) and not self.trades_df.empty
         )
         self._populate_metrics_table(results)
-        self._show_overfitting_diagnostics()
         self._draw_equity_chart(results)
         trade_pnls_plot = results.get("trade_pnls_net") or results.get("trade_pnls")
         self._draw_histogram(trade_pnls_plot)
@@ -744,21 +764,66 @@ class ModelEvaluationTab(QWidget):
                 dfX[c] = dfX[c].astype("float32", copy=False)
         return dfX
 
+    def _feature_names_for_loaded_model(self) -> list[str] | None:
+        try:
+            names = getattr(self.loaded_model, "feature_names_in_", None)
+            if names is not None:
+                return [str(x) for x in list(names)]
+        except Exception:
+            pass
+        try:
+            steps = getattr(self.loaded_model, "steps", None)
+            if steps:
+                last = steps[-1][1]
+                names = getattr(last, "feature_names_in_", None)
+                if names is not None:
+                    return [str(x) for x in list(names)]
+        except Exception:
+            pass
+        return None
+
+    def _align_X_for_loaded_model(self, X):
+        if isinstance(X, pd.DataFrame):
+            Xdf = X.copy()
+        else:
+            Xdf = pd.DataFrame(X)
+
+        names = self._feature_names_for_loaded_model()
+        if names:
+            for c in names:
+                if c not in Xdf.columns:
+                    Xdf[c] = 0.0
+            Xdf = Xdf.reindex(columns=names, fill_value=0.0)
+
+        med = Xdf.median(numeric_only=True)
+        Xdf = Xdf.fillna(med).fillna(0.0)
+        for c in Xdf.columns:
+            if not pd.api.types.is_bool_dtype(Xdf[c]):
+                Xdf[c] = Xdf[c].astype("float32", copy=False)
+        return Xdf
+
     # ---------------- Helpery: confidence / threshold ----------------
     def _get_model_scores(self, X):
         """Vrací (proba, classes, decision) podle možností modelu."""
         proba = None
         classes = None
         decision = None
+        X_pred = self._align_X_for_loaded_model(X)
         try:
             if hasattr(self.loaded_model, "predict_proba"):
-                proba = self.loaded_model.predict_proba(X)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message=r"X does not have valid feature names, but .* was fitted with feature names",
+                        category=UserWarning,
+                    )
+                    proba = self.loaded_model.predict_proba(X_pred)
                 classes = getattr(self.loaded_model, "classes_", None)
         except Exception:
             proba = None
         try:
             if hasattr(self.loaded_model, "decision_function"):
-                decision = self.loaded_model.decision_function(X)
+                decision = self.loaded_model.decision_function(X_pred)
         except Exception:
             decision = None
         return proba, classes, decision
@@ -848,6 +913,95 @@ class ModelEvaluationTab(QWidget):
         except Exception as e:
             self._error(f"Chyba při výpočtu MA signálu: {e}")
             return np.zeros(len(df) if df is not None else 0)
+
+    def _compute_macd_derivative(self, df: pd.DataFrame) -> np.ndarray:
+        """
+        Vypočítá derivaci MACD (změnu MACD mezi svíčkami).
+        MACD = EMA(12) - EMA(26)
+        Derivace = MACD[i] - MACD[i-1]
+        
+        Vrací:
+            np.ndarray: Derivace MACD (>0 rostoucí momentum, <0 klesající momentum)
+        """
+        try:
+            if df is None or df.empty or "close" not in df.columns:
+                return np.zeros(len(df) if df is not None else 0)
+            
+            close = pd.Series(df["close"].astype(float).values)
+            
+            # Vypočítej MACD = EMA(12) - EMA(26)
+            ema_fast = close.ewm(span=12, adjust=False).mean()
+            ema_slow = close.ewm(span=26, adjust=False).mean()
+            macd = ema_fast - ema_slow
+            
+            # Derivace MACD = diff(MACD)
+            macd_deriv = macd.diff().fillna(0).values
+            
+            return macd_deriv
+        except Exception as e:
+            self._error(f"Chyba při výpočtu MACD derivace: {e}")
+            return np.zeros(len(df) if df is not None else 0)
+
+    def _apply_macd_derivative_filter(self, y_pred: np.ndarray, macd_deriv: np.ndarray) -> np.ndarray:
+        """
+        Aplikuje MACD derivative filter na vstup/výstup z pozic.
+        
+        Logika:
+        - LONG vstup (0 -> +1): Povoleno jen pokud MACD_deriv > 0 (rostoucí momentum)
+        - SHORT vstup (0 -> -1): Povoleno jen pokud MACD_deriv < 0 (klesající momentum)
+        - LONG hold (+1 -> +1): Model říká zůstat → IGNORUJ MACD        - SHORT hold (-1 -> -1): Model říká zůstat → IGNORUJ MACD
+        - Exit/Reversal: Model říká změnit → aplikuj MACD filter
+        
+        Pokud model říká zůstat v pozici, MACD se nebere v potaz.
+        """
+        y_pred = np.asarray(y_pred, dtype=float)
+        macd_deriv = np.asarray(macd_deriv, dtype=float)
+        
+        if len(y_pred) != len(macd_deriv):
+            self._error(f"MACD filter: neshodná délka y_pred ({len(y_pred)}) vs macd_deriv ({len(macd_deriv)})")
+            return y_pred
+        
+        result = np.copy(y_pred)
+        prev_pos = 0  # Začínáme FLAT (0)
+        
+        for i in range(len(y_pred)):
+            curr_signal = y_pred[i]
+            curr_macd = macd_deriv[i]
+            
+            # Normalizuj signály na -1/0/+1
+            curr_sign = 0 if abs(curr_signal) < 0.5 else (1 if curr_signal > 0 else -1)
+            prev_sign = 0 if abs(prev_pos) < 0.5 else (1 if prev_pos > 0 else -1)
+            
+            # HOLD: Model říká zůstat (stejný signál jako předtím)
+            if curr_sign == prev_sign and curr_sign != 0:
+                # Model říká "zůstaň v pozici" → ignoruj MACD, ponechej signál
+                pass
+            
+            # ENTRY: Vstup do nové pozice z FLAT
+            elif prev_sign == 0 and curr_sign != 0:
+                if curr_sign > 0:  # Chce LONG entry
+                    if curr_macd <= 0:  # MACD klesá → BLOKUJ LONG entry
+                        result[i] = 0
+                elif curr_sign < 0:  # Chce SHORT entry
+                    if curr_macd >= 0:  # MACD roste → BLOKUJ SHORT entry
+                        result[i] = 0
+            
+            # EXIT nebo REVERSAL: Model říká změnit pozici
+            else:
+                # Model chce změnit → aplikuj MACD filter na nový signál
+                if curr_sign > 0:  # Chce přejít do LONG
+                    if curr_macd <= 0:  # MACD klesá → BLOKUJ
+                        result[i] = prev_pos  # Zůstaň v předchozí pozici
+                elif curr_sign < 0:  # Chce přejít do SHORT
+                    if curr_macd >= 0:  # MACD roste → BLOKUJ
+                        result[i] = prev_pos  # Zůstaň v předchozí pozici
+                elif curr_sign == 0:  # Chce EXIT do FLAT
+                    # Exit je povolen vždy (model rozhodl o exitu)
+                    pass
+            
+            prev_pos = result[i]
+        
+        return result
 
     # ---------------- Helpery: PnL a breakdown ----------------
     def _build_positions(self, y_pred):
@@ -1331,8 +1485,16 @@ class ModelEvaluationTab(QWidget):
             "╠═══════════════════════════════════════════════════════╣",
         ])
 
-        # Diagnóza
-        if abs(diff) < 0.05:
+        # Diagnóza – kontrola F1, accuracy a overfittingu
+        # 1. Nejdřív zkontroluj F1 score (nutné pro použitelný model)
+        if holdout_f1 is not None and holdout_f1 < 0.05:
+            lines.append("║ ❌ NEPOUŽITELNÝ MODEL: F1 score téměř 0             ║")
+            lines.append("║    → Model nepredikuje LONG/SHORT signály!          ║")
+        elif holdout_acc > 0.98 and (holdout_f1 is None or holdout_f1 < 0.1):
+            lines.append("║ ❌ PODEZŘELÝ: Vysoká accuracy ale nízké F1          ║")
+            lines.append("║    → Model predikuje jen majoritní třídu (NEUTRAL)  ║")
+        # 2. Pak zkontroluj overfitting podle rozdílu
+        elif abs(diff) < 0.05:
             lines.append("║ ✅ DOBRÝ MODEL: Minimální přefitting                 ║")
         elif abs(diff) < 0.10:
             lines.append("║ ⚠️  MÍRNÝ OVERFITTING: Rozdíl < 10%                ║")
@@ -1373,6 +1535,7 @@ class ModelEvaluationTab(QWidget):
                 "exit_threshold": float(self.ext_spin.value()),
                 "use_and_ensemble": bool(self.chk_and_ensemble.isChecked()),
                 "use_ma_only": bool(self.chk_ma_only.isChecked()),
+                "use_macd_filter": bool(self.chk_macd_filter.isChecked()),
                 "updated_at": str(pd.Timestamp.now(tz="UTC")),
             }
             
@@ -1388,7 +1551,8 @@ class ModelEvaluationTab(QWidget):
                 f"Entry Threshold: {self.et_spin.value()}\n"
                 f"Exit Threshold: {self.ext_spin.value()}\n"
                 f"AND Ensemble: {self.chk_and_ensemble.isChecked()}\n"
-                f"MA-Only: {self.chk_ma_only.isChecked()}\n\n"
+                f"MA-Only: {self.chk_ma_only.isChecked()}\n"
+                f"MACD Filter: {self.chk_macd_filter.isChecked()}\n\n"
                 f"Soubor: {meta_path.name}"
             )
         except Exception as e:

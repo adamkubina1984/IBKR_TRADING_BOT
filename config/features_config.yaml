@@ -37,7 +37,7 @@ features:
   candlestick_patterns:
     enabled: true
 
-  rolling_stats:
+  rolling_stats:  # Byla to "rolling", opraveno na "rolling_stats"
     mean_std:
       enabled: true
       windows: [20, 50, 100]
