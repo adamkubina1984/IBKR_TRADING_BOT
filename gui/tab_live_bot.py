@@ -318,12 +318,14 @@ def _pick_direction_from_raw_proba(
     classes_i,
     raw_proba,
     label_map: dict,
-    hold_block_thr: float = 0.78,
-    hold_margin: float = 0.20,
+    short_threshold: float,
+    long_threshold: float,
 ):
     """
-    Určí směr z raw pravděpodobností u multi-class modelu.
-    HOLD blokuje směr jen při silné dominanci (thr + margin), jinak vrací LONG/SHORT.
+    Určí směr z raw pravděpodobností konzistentně s Tab 3:
+    - LONG pokud p_long >= long_threshold a současně p_long >= p_short
+    - SHORT pokud p_short >= short_threshold a současně p_short > p_long
+    - jinak FLAT
     """
     try:
         if classes_i is None or raw_proba is None or len(raw_proba) != len(classes_i):
@@ -345,13 +347,14 @@ def _pick_direction_from_raw_proba(
             elif d in ("HOLD", "FLAT", "NONE", "NEUTRAL"):
                 p_hold += p
 
-        dir_side = "LONG" if p_long >= p_short else "SHORT"
-        p_side = p_long if dir_side == "LONG" else p_short
+        t_short = float(short_threshold)
+        t_long = float(long_threshold)
+        if p_long >= t_long and p_long >= p_short:
+            return "LONG", float(p_long)
+        if p_short >= t_short and p_short > p_long:
+            return "SHORT", float(p_short)
 
-        if p_hold >= hold_block_thr and (p_hold - p_side) >= hold_margin:
-            return "FLAT", float(p_hold)
-
-        return dir_side, float(p_side)
+        return "FLAT", float(max(p_long, p_short, p_hold))
     except Exception:
         return None, 0.0
 
@@ -370,7 +373,7 @@ class LiveConfig:
     max_fresh_age_min: int = 5
     max_bars_buffer: int = 300  # Buffer pro live bars (po dropna z rolling bude ~200 validních)
     use_ma_only: bool = False
-    use_and_ensemble: bool = True  # MA ∧ Model
+    use_and_ensemble: bool = False  # default VOTE (AND vypnuto)
     alert_on_flip: bool = True
     alert_sound: str | None = r"C:\Users\adamk\Můj disk\Trader\ibkr_trading_bot\gui\assets\alert.wav"
     alert_cooldown_s: int = 5
@@ -385,8 +388,8 @@ class LiveConfig:
     smtp_use_ssl: bool = os.getenv("SMTP_USE_SSL", "1").lower() not in ("0","false","no")
     smtp_from: str | None = os.getenv("SMTP_FROM")
 
-    entry_thr: float = 0.60
-    exit_thr: float = 0.45
+    entry_thr: float = 0.50
+    exit_thr: float = 0.50
     rounds_enabled: bool = False
 
 # ==============================================
@@ -560,6 +563,7 @@ class _WarmAdapter:
         # Praktikovat práh z user_settings (nachází se z Tab 3)
         user_settings = self.w.user_settings or {}
         thr_ui = float(user_settings.get("entry_threshold", self.w._curr_entry_thr))
+        use_and = False
 
         classes = ["LONG", "SHORT"]
 
@@ -567,7 +571,7 @@ class _WarmAdapter:
         l0 = self._ma_sig_from_features(features) or "FLAT"
 
         # MA-only režim -> vrať rovnou MA
-        if user_settings.get("use_ma_only", False):
+        if False:
             probs = [1.0, 0.0] if l0 == "LONG" else [0.0, 1.0] if l0 == "SHORT" else [0.5, 0.5]
             return l0, probs, classes
 
@@ -577,14 +581,14 @@ class _WarmAdapter:
             return l0, probs, classes
 
         # L1: AND nebo VOTE podle nastavení (model-only = VOTE)
-        if user_settings.get("use_and_ensemble", True):
+        if use_and:
             label, conf_min, dirs, confs = self.w._predict_one_label_AND(features, thr=0.0)
         else:
             label, conf_min, dirs, confs = self.w._predict_one_label_VOTE(features)
         l1 = "LONG" if label == +1 else "SHORT" if label == -1 else "FLAT"
 
         # L2: (volitelně) MA ∧ L1 + aplikace prahu z UI (thr_ui) – stejná politika jako v _rescore_all
-        if user_settings.get("use_and_ensemble", True):
+        if use_and:
             # nejdřív jen směrové „proposal“
             if l0 == "FLAT":
                 proposal = l1 if (l1 in ("LONG", "SHORT")) else None
@@ -677,6 +681,8 @@ class LiveBotWidget(QWidget):
         self._live_entry_px = None
         self._curr_entry_thr = self.config.entry_thr
         self._curr_exit_thr = self.config.exit_thr
+        self._curr_t_short = None
+        self._curr_t_long = None
         self._rounds = {"grid": [], "tol_atr": 0.0}
         self.class_to_dir = {0: "SHORT", 1: "LONG"}
         
@@ -714,9 +720,13 @@ class LiveBotWidget(QWidget):
         p = PRESETS_BY_TF.get(tf, PRESETS_BY_TF["1 hour"])
 
         # UI práh (hystereze) - z user_settings (načteno z Tab 3)
-        s = self.user_settings.get("entry_threshold", self.config.sensitivity)
-        self._curr_entry_thr = float(s) if isinstance(s, (int, float)) else self.config.sensitivity
-        self._curr_exit_thr  = max(0.0, min(self._curr_entry_thr - 0.05, self._curr_entry_thr))
+        s_entry = self.user_settings.get("entry_threshold", self.config.sensitivity)
+        s_exit = self.user_settings.get("exit_threshold", self.config.exit_thr)
+        self._curr_entry_thr = float(s_entry) if isinstance(s_entry, (int, float)) else self.config.sensitivity
+        if isinstance(s_exit, (int, float)):
+            self._curr_exit_thr = float(s_exit)
+        else:
+            self._curr_exit_thr = max(0.0, min(self._curr_entry_thr - 0.05, self._curr_entry_thr))
 
         # presetované kulatá čísla
         self._rounds = {"grid": [], "tol_atr": 0.0}
@@ -808,15 +818,16 @@ class LiveBotWidget(QWidget):
         settings_box = QGroupBox("⚙️ Nastavení z Tab 3 (read-only)")
         settings_layout = QVBoxLayout()
         
-        self.lbl_decision_threshold = QLabel("Decision Threshold: –")
+        self.lbl_decision_threshold = QLabel("T-short/T-long: – / –")
         self.lbl_entry_threshold = QLabel("Entry Threshold: –")
         self.lbl_exit_threshold = QLabel("Exit Threshold: –")
         self.lbl_ma_only = QLabel("MA-Only: –")
         self.lbl_and_ensemble = QLabel("AND Ensemble: –")
+        self.lbl_ma_only.setVisible(False)
+        self.lbl_and_ensemble.setVisible(False)
         
         # Styl info panelu - viditelný text s bordelem
-        for lbl in [self.lbl_decision_threshold, self.lbl_entry_threshold, self.lbl_exit_threshold, 
-                    self.lbl_ma_only, self.lbl_and_ensemble]:
+        for lbl in [self.lbl_decision_threshold, self.lbl_entry_threshold, self.lbl_exit_threshold]:
             lbl.setStyleSheet(
                 "color: #000; font-size: 9pt; font-weight: 500; "
                 "background-color: #f5f5f5; padding: 6px 10px; "
@@ -958,6 +969,28 @@ class LiveBotWidget(QWidget):
                 return pred, meta
             raise TypeError("Objekt neobsahuje použitelný estimator.")
 
+        def _safe_float(v):
+            try:
+                out = float(v)
+                if np.isfinite(out):
+                    return out
+            except Exception:
+                pass
+            return None
+
+        def _meta_ternary_thresholds(meta_dict: dict) -> tuple[float | None, float | None]:
+            if not isinstance(meta_dict, dict):
+                return None, None
+            t_short = _safe_float(meta_dict.get("ternary_threshold_short"))
+            t_long = _safe_float(meta_dict.get("ternary_threshold_long"))
+            user = meta_dict.get("user_settings")
+            if isinstance(user, dict):
+                if t_short is None:
+                    t_short = _safe_float(user.get("ternary_threshold_short_eval"))
+                if t_long is None:
+                    t_long = _safe_float(user.get("ternary_threshold_long_eval"))
+            return t_short, t_long
+
         from pathlib import Path
         for p in parts:
             if not os.path.exists(p):
@@ -996,6 +1029,31 @@ class LiveBotWidget(QWidget):
                     if not meta_path.absolute().exists():
                         self._append_log(f"[META] ❌ Ani absolutní cesta neexistuje")
 
+                # Tab 4 hard gate: pouze ternární modely s modelovými T-short/T-long
+                if not hasattr(pred, "predict_proba"):
+                    self._append_log(f"[ERROR] Model nepodporuje predict_proba: {os.path.basename(p)}")
+                    return False
+                cls_raw = getattr(pred, "classes_", None)
+                classes_dbg = list(cls_raw) if cls_raw is not None else []
+                if len(classes_dbg) != 3:
+                    self._append_log(
+                        f"[ERROR] Tab 4 vyžaduje ternární model (3 třídy). "
+                        f"Model {os.path.basename(p)} má classes={classes_dbg}"
+                    )
+                    return False
+
+                t_short, t_long = _meta_ternary_thresholds(meta)
+                if not isinstance(t_short, (int, float)) or not isinstance(t_long, (int, float)):
+                    self._append_log(
+                        f"[ERROR] Chybí ternární prahy v metadatech: {os.path.basename(p)} "
+                        "(ternary_threshold_short/long)."
+                    )
+                    return False
+                self._append_log(
+                    f"[META] Ternary thresholds model={os.path.basename(p)} "
+                    f"T-short={float(t_short):.3f} T-long={float(t_long):.3f}"
+                )
+
                 # map tříd (poprvé převezmeme)
                 if not label_map_final:
                     meta_map = None
@@ -1031,13 +1089,11 @@ class LiveBotWidget(QWidget):
                     "path": p,
                     "exp_feats": exp_list if exp else None,
                     "label_map": dict(self.class_to_dir),
+                    "t_short": float(t_short),
+                    "t_long": float(t_long),
                     "metadata": meta,  # uložit metadata pro později
                 })
 
-                try:
-                    classes_dbg = list(getattr(pred, "classes_", []))
-                except Exception:
-                    classes_dbg = []
                 classes_summary.append({
                     "model": os.path.basename(p),
                     "classes": classes_dbg,
@@ -1052,6 +1108,20 @@ class LiveBotWidget(QWidget):
                 has_holdout = "metrics_holdout" in meta
                 self._append_log(f"[META] Model metadata obsahuje {len(meta_keys)} klíčů")
                 self._append_log(f"[META] metrics_train: {has_train}, metrics_holdout: {has_holdout}")
+
+                # Diagnostika směrového biasu už na holdoutu (důležité pro očekávání v LIVE)
+                try:
+                    hold = (meta.get("metrics_holdout") or {}) if isinstance(meta, dict) else {}
+                    n_long_h = hold.get("num_trades_long")
+                    n_short_h = hold.get("num_trades_short")
+                    if isinstance(n_long_h, (int, float)) and isinstance(n_short_h, (int, float)):
+                        self._append_log(f"[TAB4-DIAG] holdout_trades LONG={int(n_long_h)} SHORT={int(n_short_h)}")
+                        if int(n_long_h) == 0 and int(n_short_h) > 0:
+                            self._append_log("[TAB4-DIAG] ⚠️ Holdout bias: model negeneruje LONG obchody (jen SHORT).")
+                        elif int(n_short_h) == 0 and int(n_long_h) > 0:
+                            self._append_log("[TAB4-DIAG] ⚠️ Holdout bias: model negeneruje SHORT obchody (jen LONG).")
+                except Exception:
+                    pass
                 
                 self._append_log(f"[INFO] ✅ Načten model: {os.path.basename(p)}")
             except Exception as e:
@@ -1095,11 +1165,34 @@ class LiveBotWidget(QWidget):
         
         return True
 
+    @staticmethod
+    def _extract_ternary_thresholds_from_metadata(metadata: dict) -> tuple[float | None, float | None]:
+        def _sf(v):
+            try:
+                out = float(v)
+                if np.isfinite(out):
+                    return out
+            except Exception:
+                pass
+            return None
+
+        if not isinstance(metadata, dict):
+            return None, None
+        t_short = _sf(metadata.get("ternary_threshold_short"))
+        t_long = _sf(metadata.get("ternary_threshold_long"))
+        user = metadata.get("user_settings")
+        if isinstance(user, dict):
+            if t_short is None:
+                t_short = _sf(user.get("ternary_threshold_short_eval"))
+            if t_long is None:
+                t_long = _sf(user.get("ternary_threshold_long_eval"))
+        return t_short, t_long
+
     def _load_user_settings_from_first_model(self) -> None:
         """Načte user_settings z metadat prvního modelu a zobrazí je jako read-only info panel."""
         if not self.models or not self.models[0]:
             self._append_log("[SETTINGS] ❌ Žádné modely načteny")
-            self._update_settings_display({})
+            self._update_settings_display({}, {})
             self._load_reference_metrics({})
             return
         
@@ -1129,16 +1222,16 @@ class LiveBotWidget(QWidget):
             
             if not user_settings:
                 self._append_log("[INFO] Žádná uložená nastavení v modelu - ponechávám defaults")
-                self._update_settings_display({})
+                self._update_settings_display({}, metadata)
                 return
             
             # Zobraz nastavení v info panelu
-            self._update_settings_display(user_settings)
+            self._update_settings_display(user_settings, metadata)
             self._append_log("[SETTINGS] ✅ Nastavení modelu načtena z Tab 3")
             
         except Exception as e:
             self._append_log(f"[WARN] Nelze načít user_settings: {e}")
-            self._update_settings_display({})
+            self._update_settings_display({}, {})
             self._load_reference_metrics({})
     
     def _load_reference_metrics(self, metadata: dict) -> None:
@@ -1313,6 +1406,8 @@ class LiveBotWidget(QWidget):
                 # Batch prediction - rychlejší a bez warningů
                 X_pred = _align_X_for_model(model, X_prepared)
                 proba_all = _predict_proba_safely(model, X_pred)
+                t_short = float(self.models[0].get("t_short", 0.5))
+                t_long = float(self.models[0].get("t_long", 0.5))
                 
                 # Určení indexů LONG a SHORT v classes_
                 classes = getattr(model, "classes_", None)
@@ -1339,9 +1434,9 @@ class LiveBotWidget(QWidget):
                     pL = float(proba_row[idx_long]) if idx_long is not None else 0.5
                     pS = float(proba_row[idx_short]) if idx_short is not None else 0.5
                     
-                    if pL > 0.5:
+                    if pL >= t_long and pL >= pS:
                         predictions.append(1)  # LONG
-                    elif pS > 0.5:
+                    elif pS >= t_short and pS > pL:
                         predictions.append(-1)  # SHORT
                     else:
                         predictions.append(0)  # NEUTRAL
@@ -1395,35 +1490,44 @@ class LiveBotWidget(QWidget):
                 f"Diagnostika bude dostupná po načtení {self.degradation_window_size} live barů."
             )
     
-    def _update_settings_display(self, user_settings: dict) -> None:
+    def _update_settings_display(self, user_settings: dict, metadata: dict | None = None) -> None:
         """Aktualizuje display panelu s nastavením modelu (read-only) a uloží do self.user_settings."""
         self.user_settings = user_settings  # uložit pro použití v predikci
-        
-        decision_threshold = user_settings.get("decision_threshold", "–")
+
+        t_short, t_long = self._extract_ternary_thresholds_from_metadata(metadata or {})
         entry_threshold = user_settings.get("entry_threshold", "–")
         exit_threshold = user_settings.get("exit_threshold", "–")
-        use_ma_only = user_settings.get("use_ma_only", False)
-        use_and_ensemble = user_settings.get("use_and_ensemble", True)
-        
-        self.lbl_decision_threshold.setText(f"Decision Threshold: {decision_threshold}")
+        use_ma_only = False
+        use_and_ensemble = False
+
+        t_short_disp = f"{float(t_short):.3f}" if isinstance(t_short, (int, float)) else "–"
+        t_long_disp = f"{float(t_long):.3f}" if isinstance(t_long, (int, float)) else "–"
+        self.lbl_decision_threshold.setText(f"T-short/T-long: {t_short_disp} / {t_long_disp}")
         self.lbl_entry_threshold.setText(f"Entry Threshold: {entry_threshold}")
         self.lbl_exit_threshold.setText(f"Exit Threshold: {exit_threshold}")
         self.lbl_ma_only.setText(f"MA-Only: {'✓ zapnuto' if use_ma_only else '✗ vypnuto'}")
         self.lbl_and_ensemble.setText(f"AND Ensemble: {'✓ AND' if use_and_ensemble else '✗ VOTE'}")
 
         # Synchronizuj runtime chování Tab 4 s nastavením načteným z Tab 3
-        self.config.use_ma_only = bool(use_ma_only)
-        self.config.use_and_ensemble = bool(use_and_ensemble)
+        self.config.use_ma_only = False
+        self.config.use_and_ensemble = False
         
         # Aplikuj entry/exit thresholdy na aktivní konfiguraci
         if isinstance(entry_threshold, (int, float)):
             self._curr_entry_thr = float(entry_threshold)
         if isinstance(exit_threshold, (int, float)):
             self._curr_exit_thr = float(exit_threshold)
+        if isinstance(t_short, (int, float)):
+            self._curr_t_short = float(t_short)
+        if isinstance(t_long, (int, float)):
+            self._curr_t_long = float(t_long)
         
         # Log po aktualizaci
-        if user_settings:
-            self._append_log(f"[SETTINGS] Decision={decision_threshold}, Entry={entry_threshold}, Exit={exit_threshold}, MA-Only={use_ma_only}, AND={use_and_ensemble}")
+        if user_settings or isinstance(t_short, (int, float)) or isinstance(t_long, (int, float)):
+            self._append_log(
+                f"[SETTINGS] T-short={t_short_disp}, T-long={t_long_disp}, "
+                f"Entry={entry_threshold}, Exit={exit_threshold}, MA-Only={use_ma_only}, AND={use_and_ensemble}"
+            )
 
     # AND hlasování přes všechny modely
     def _predict_one_label_AND(self, Xrow: pd.DataFrame, thr: float) -> tuple[int, float, list[str], list[float]]:
@@ -1439,6 +1543,8 @@ class LiveBotWidget(QWidget):
             mdl = m["predictor"]
             exp = m.get("exp_feats")
             X_use = Xrow
+            t_short = float(m.get("t_short", self._curr_t_short if isinstance(self._curr_t_short, (int, float)) else 0.5))
+            t_long = float(m.get("t_long", self._curr_t_long if isinstance(self._curr_t_long, (int, float)) else 0.5))
             if exp:
                 X_use = self._prepare_X_for_model(Xrow, exp)
             try:
@@ -1455,18 +1561,15 @@ class LiveBotWidget(QWidget):
                 self._diag_counter += 1
 
         # výběr směru a konfidence (u ternary respektuj i HOLD)
-            direction, conf = _pick_direction_from_raw_proba(classes_i, raw_proba, label_map)
+            direction, conf = _pick_direction_from_raw_proba(
+                classes_i, raw_proba, label_map,
+                short_threshold=t_short,
+                long_threshold=t_long,
+            )
 
             if direction is None:
-                if pL > pS:
-                    direction = "LONG"
-                    conf = float(pL)
-                elif pS > pL:
-                    direction = "SHORT"
-                    conf = float(pS)
-                else:
-                    direction = "FLAT"
-                    conf = float(pL)
+                direction = "FLAT"
+                conf = 0.0
 
             dirs.append(direction)
             confs.append(conf)
@@ -1494,6 +1597,8 @@ class LiveBotWidget(QWidget):
             mdl = m["predictor"]
             exp = m.get("exp_feats")
             X_use = Xrow
+            t_short = float(m.get("t_short", self._curr_t_short if isinstance(self._curr_t_short, (int, float)) else 0.5))
+            t_long = float(m.get("t_long", self._curr_t_long if isinstance(self._curr_t_long, (int, float)) else 0.5))
             if exp:
                 X_use = self._prepare_X_for_model(Xrow, exp)
             try:
@@ -1502,18 +1607,15 @@ class LiveBotWidget(QWidget):
             except Exception:
                 pL, pS, classes_i, raw_proba = 0.5, 0.5, None, None
 
-            direction, conf = _pick_direction_from_raw_proba(classes_i, raw_proba, label_map)
+            direction, conf = _pick_direction_from_raw_proba(
+                classes_i, raw_proba, label_map,
+                short_threshold=t_short,
+                long_threshold=t_long,
+            )
 
             if direction is None:
-                if pL > pS:
-                    direction = "LONG"
-                    conf = float(pL)
-                elif pS > pL:
-                    direction = "SHORT"
-                    conf = float(pS)
-                else:
-                    direction = "FLAT"
-                    conf = float(pL)
+                direction = "FLAT"
+                conf = 0.0
 
             dirs.append(direction)
             confs.append(conf)
