@@ -75,6 +75,7 @@ def make_triple_barrier_labels_ternary(
     take_profit_bps: float = 60.0,
     stop_loss_bps: float = 40.0,
     price_col: str = "close",
+    same_bar_policy: str = "neutral",
 ) -> pd.Series:
     """
     Ternární triple‑barrier labels:
@@ -88,6 +89,9 @@ def make_triple_barrier_labels_ternary(
         raise ValueError(f"Sloupec '{price_col}' v datech chybí.")
 
     close = df[price_col].astype(float).to_numpy()
+    # Prefer intrabar barriers via high/low when available.
+    high = df["high"].astype(float).to_numpy() if "high" in df.columns else close
+    low = df["low"].astype(float).to_numpy() if "low" in df.columns else close
     n = len(close)
     y = np.zeros(n, dtype=int)
 
@@ -101,27 +105,32 @@ def make_triple_barrier_labels_ternary(
         tp = entry * (1.0 + take_profit_bps / 1e4)
         sl = entry * (1.0 - stop_loss_bps / 1e4)
 
-        path = close[i + 1 : j_end + 1]
-        if path.size == 0:
-            y[i] = 0
-            continue
-
-        # determine first hit (if any)
-        hit_tp_idx = None
-        hit_sl_idx = None
-        for k, p in enumerate(path, start=1):
-            if hit_tp_idx is None and p >= tp:
-                hit_tp_idx = k
-            if hit_sl_idx is None and p <= sl:
-                hit_sl_idx = k
-            if hit_tp_idx is not None or hit_sl_idx is not None:
+        decided = False
+        for j in range(i + 1, j_end + 1):
+            hit_tp = bool(high[j] >= tp)
+            hit_sl = bool(low[j] <= sl)
+            if hit_tp and hit_sl:
+                policy = str(same_bar_policy).strip().lower()
+                if policy == "tp":
+                    y[i] = 1
+                elif policy == "sl":
+                    y[i] = -1
+                elif policy == "close":
+                    y[i] = 1 if close[j] > entry else (-1 if close[j] < entry else 0)
+                else:
+                    # Ambiguous intrabar order -> neutral by default.
+                    y[i] = 0
+                decided = True
                 break
-
-        if hit_tp_idx is not None and (hit_sl_idx is None or hit_tp_idx <= hit_sl_idx):
-            y[i] = 1
-        elif hit_sl_idx is not None and (hit_tp_idx is None or hit_sl_idx < hit_tp_idx):
-            y[i] = -1
-        else:
+            if hit_tp:
+                y[i] = 1
+                decided = True
+                break
+            if hit_sl:
+                y[i] = -1
+                decided = True
+                break
+        if not decided:
             y[i] = 0
 
     return pd.Series(y, index=df.index, name="target")

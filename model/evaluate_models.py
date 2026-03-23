@@ -69,6 +69,25 @@ def _classification_metrics(y_true: pd.Series, y_pred: np.ndarray) -> tuple[floa
     return float(f1), float(precision), float(recall), accuracy
 
 
+def _predict_with_thresholds(model, X: pd.DataFrame, bundle: dict | None = None) -> np.ndarray:
+    """Prediction that respects stored binary/ternary thresholds when proba is available."""
+    bundle = bundle if isinstance(bundle, dict) else {}
+    thr = float(bundle.get("decision_threshold", 0.5))
+    thr_short = float(bundle.get("ternary_threshold_short", thr))
+    thr_long = float(bundle.get("ternary_threshold_long", thr))
+    if hasattr(model, "predict_proba"):
+        pr = model.predict_proba(X)
+        if isinstance(pr, np.ndarray) and pr.ndim == 2 and pr.shape[1] >= 3:
+            return np.where(pr[:, 2] >= thr_long, 2, np.where(pr[:, 0] >= thr_short, 0, 1)).astype(int)
+        if isinstance(pr, np.ndarray) and pr.ndim == 2 and pr.shape[1] >= 2:
+            return (pr[:, 1] >= thr).astype(int)
+    if hasattr(model, "decision_function"):
+        z = np.asarray(model.decision_function(X)).ravel()
+        p1 = 1.0 / (1.0 + np.exp(-z))
+        return (p1 >= thr).astype(int)
+    return np.asarray(model.predict(X)).astype(int)
+
+
 def _prepare_dataset_for_eval(df_raw: pd.DataFrame) -> pd.DataFrame:
     try:
         return prepare_dataset_with_targets(df_raw)
@@ -132,7 +151,7 @@ def evaluate_model(model_path: str, data_path: str) -> dict:
     X = _select_feature_matrix(dataset, model, bundle_feats)
 
     y_true = dataset["target"].astype(int)
-    y_pred = model.predict(X)
+    y_pred = _predict_with_thresholds(model, X, bundle_or_model if isinstance(bundle_or_model, dict) else None)
 
     f1, precision, recall, _ = _classification_metrics(y_true, y_pred)
 
@@ -168,7 +187,14 @@ def evaluate_model(model_path: str, data_path: str) -> dict:
     }
 
 # === Wrapper pro CLI: načte features, vyhodnotí model a zapíše 1 řádek do CSV ===
-def evaluate_model_once(features_csv: str, model_path: str, results_out: str) -> str:
+def evaluate_model_once(
+    features_csv: str,
+    model_path: str,
+    results_out: str,
+    *,
+    holdout_only: bool = False,
+    holdout_bars: int | None = None,
+) -> str:
     """
     Kompatibilní s příkazem: python -m ibkr_trading_bot.main evaluate --model ... [--features ...] [--results-out ...]
     - Podporuje joblib bundle {"model": ..., "features": [...]} i přímo estimator (XGB/LGBM/RF).
@@ -187,17 +213,29 @@ def evaluate_model_once(features_csv: str, model_path: str, results_out: str) ->
     df_raw = load_dataframe(features_csv)
     dataset = _prepare_dataset_for_eval(df_raw)
 
-    # 2) vybereme X/y
+    # 2) volitelně omezíme evaluaci jen na holdout segment
+    bundle_or_model = joblib.load(model_path)
+    model, model_feats = _unwrap_model_bundle(bundle_or_model)
+    if holdout_only:
+        n_hold = None
+        if holdout_bars is not None and int(holdout_bars) > 0:
+            n_hold = int(holdout_bars)
+        elif isinstance(bundle_or_model, dict):
+            try:
+                n_hold = int(bundle_or_model.get("n_holdout_bars", 0))
+            except Exception:
+                n_hold = None
+        if n_hold and n_hold > 0:
+            n_hold = min(n_hold, len(dataset))
+            dataset = dataset.tail(n_hold).reset_index(drop=True)
+
+    # 3) vybereme X/y
     if "target" not in dataset.columns:
         raise ValueError("Ve vstupním datasetu chybí sloupec 'target' po prepare_dataset_with_targets().")
     y_true = dataset["target"].astype(int)
     # numerické featury bez zjevných sloupců
     blacklist = {"timestamp", "open", "high", "low", "close", "volume", "target", "y", "signal"}
     num_cols = [c for c in dataset.columns if c not in blacklist and pd.api.types.is_numeric_dtype(dataset[c])]
-
-    # 3) načtení modelu (bundle i čistý estimator)
-    bundle_or_model = joblib.load(model_path)
-    model, model_feats = _unwrap_model_bundle(bundle_or_model)
 
     # 4) robustní výběr featur
     X = _select_feature_matrix(dataset, model, model_feats)
@@ -208,7 +246,7 @@ def evaluate_model_once(features_csv: str, model_path: str, results_out: str) ->
     y_pred = getattr(model, "predict", None)
     if y_pred is None:
         raise TypeError("Načtený objekt modelu nemá metodu .predict()")
-    y_hat = model.predict(X)
+    y_hat = _predict_with_thresholds(model, X, bundle_or_model if isinstance(bundle_or_model, dict) else None)
 
     # 6) metriky
     f1, precision, recall, accuracy = _classification_metrics(y_true, y_hat)

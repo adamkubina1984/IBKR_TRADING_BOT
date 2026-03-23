@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime
@@ -10,8 +9,10 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QTimer, Qt
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -28,15 +29,13 @@ from PySide6.QtWidgets import (
 
 from ibkr_trading_bot.core.services.model_service import load_model_with_meta
 
-# Výchozí (default) složka s modely
 DEFAULT_MODEL_DIR = Path(__file__).parent.parent / "model_outputs"
 
+
 def _as_float(x: Any, default: float = float("-inf")) -> float:
-    """Bezpečně převeď na float (např. '0', '0.0', None, 'nan', '0,1')."""
     if x is None:
         return default
     try:
-        # evropská desetinná čárka → tečka
         if isinstance(x, str):
             x2 = x.strip().replace(",", ".")
             if x2 == "":
@@ -46,24 +45,17 @@ def _as_float(x: Any, default: float = float("-inf")) -> float:
     except Exception:
         return default
 
-def _as_timestamp(created: Any, fallback_path) -> float:
-    """
-    Vrátí unix timestamp z různých tvarů 'created':
-    - datetime → .timestamp()
-    - číslo/string → parse na float/ISO
-    - jinak spadne na mtime souboru
-    """
+
+def _as_timestamp(created: Any, fallback_path: Path) -> float:
     try:
         if isinstance(created, datetime):
             return float(created.timestamp())
         if isinstance(created, (int, float)):
             return float(created)
         if isinstance(created, str) and created:
-            # zkus ISO (např. 2025-10-07T11:09:22)
             try:
                 return datetime.fromisoformat(created).timestamp()
             except Exception:
-                # zkus čisté číslo (sekundy)
                 return float(created)
     except Exception:
         pass
@@ -71,6 +63,7 @@ def _as_timestamp(created: Any, fallback_path) -> float:
         return float(fallback_path.stat().st_mtime)
     except Exception:
         return 0.0
+
 
 @dataclass
 class ModelRecord:
@@ -81,18 +74,44 @@ class ModelRecord:
     metrics: dict[str, float]
     features_n: int
     classes: list[str]
+    top_feature: str
+    file_size: int
+    file_mtime_ns: int
 
 
-def sha1_file(path: Path, buf_size: int = 1024 * 1024) -> str:
-    h = hashlib.sha1()
-    with open(path, "rb") as f:
-        while True:
-            b = f.read(buf_size)
-            if not b:
-                break
-            h.update(b)
-    return h.hexdigest()
+def _record_rank_key(r: ModelRecord) -> tuple[float, float, float, float]:
+    profit = _as_float(
+        r.metrics.get("profit_net", r.metrics.get("profit_gross", None)),
+        default=float("-inf"),
+    )
+    sharpe = _as_float(r.metrics.get("sharpe", None), default=float("-inf"))
+    trades = _as_float(r.metrics.get("trades", None), default=0.0)
+    ts = _as_timestamp(r.created, r.model_path)
+    return (profit, sharpe, trades, ts)
 
+
+def _top_feature_from_meta(meta: dict[str, Any]) -> str:
+    feat_imp = meta.get("feature_importance", {})
+    if not isinstance(feat_imp, dict) or not feat_imp:
+        return ""
+    try:
+        return str(max(feat_imp.keys(), key=lambda x: feat_imp[x]))[:12]
+    except Exception:
+        return ""
+
+
+def _directory_snapshot(dir_path: Path) -> tuple[tuple[str, int, int], ...]:
+    if not dir_path.exists():
+        return ()
+    snapshot: list[tuple[str, int, int]] = []
+    for p in dir_path.glob("*.pkl"):
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        snapshot.append((p.name, int(st.st_size), int(st.st_mtime_ns)))
+    snapshot.sort()
+    return tuple(snapshot)
 
 
 def discover_models(dir_path: Path) -> list[ModelRecord]:
@@ -101,38 +120,37 @@ def discover_models(dir_path: Path) -> list[ModelRecord]:
         return recs
 
     for p in dir_path.glob("*.pkl"):
-        sha1 = sha1_file(p)
+        try:
+            p_stat = p.stat()
+        except OSError:
+            continue
+
         meta_candidates = [p.with_name(p.stem + "_meta.json"), p.parent / "model_meta.json"]
-        meta = {}
+        meta: dict[str, Any] = {}
         meta_path = None
         for m in meta_candidates:
-            if m.exists():
-                try:
-                    meta = json.loads(m.read_text(encoding="utf-8"))
-                    meta_path = m
-                    break
-                except Exception:
-                    pass
+            if not m.exists():
+                continue
+            try:
+                loaded = json.loads(m.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if isinstance(loaded, dict):
+                meta = loaded
+                meta_path = m
+                break
 
-        # doplnění z modelu (fallbacky na classes/features)
-        try:
-            mdl = joblib.load(p)
-            predictor = mdl.get("model") if isinstance(mdl, dict) and "model" in mdl else mdl
-            if not meta.get("model_classes"):
-                if isinstance(meta.get("classes"), list):
-                    meta["model_classes"] = list(meta.get("classes"))
-                elif hasattr(predictor, "classes_"):
-                    meta["model_classes"] = list(getattr(predictor, "classes_"))
-            if not meta.get("trained_features"):
-                if isinstance(meta.get("features"), list):
-                    meta["trained_features"] = list(meta.get("features"))
-                elif hasattr(predictor, "feature_names_in_"):
-                    meta["trained_features"] = list(getattr(predictor, "feature_names_in_"))
-        except Exception:
-            pass
+        classes = meta.get("model_classes")
+        if not isinstance(classes, list) and isinstance(meta.get("classes"), list):
+            classes = list(meta.get("classes"))
+        features = meta.get("trained_features")
+        if not isinstance(features, list) and isinstance(meta.get("features"), list):
+            features = list(meta.get("features"))
+        sha1 = str(meta.get("sha1") or meta.get("model_sha1") or "")
 
-        # --- robustní parsování metrik na skaláry, s handlerováním Infinity a NaN ---
-        metrics_raw = meta.get("metrics") or {}
+        holdout_metrics_raw = meta.get("metrics_holdout") or {}
+        fallback_metrics_raw = meta.get("metrics") or {}
+        metrics_raw = holdout_metrics_raw if holdout_metrics_raw else fallback_metrics_raw
         metrics: dict[str, float] = {}
         for k, v in metrics_raw.items():
             try:
@@ -142,57 +160,31 @@ def discover_models(dir_path: Path) -> list[ModelRecord]:
                 elif isinstance(v, str):
                     v_clean = v.strip()
                     if v_clean.lower() in ("nan", "infinity", "inf", "-infinity"):
-                        continue  # skip NaN, Infinity
+                        continue
                     metrics[k] = float(v_clean)
                 elif isinstance(v, (list, tuple)) and len(v) == 1 and isinstance(v[0], (int, float)):
                     if np.isfinite(v[0]):
                         metrics[k] = float(v[0])
-                # jinák ignoruj (např. listy equity, dicty s kvantily apod.)
             except (ValueError, TypeError):
                 pass
-
-        # --- čas vytvoření (string pro UI + timestamp pro třídění) ---
-        created_str = str(meta.get("created_at_iso") or meta.get("created_at") or "")
-        def _to_ts(s: str) -> float:
-            if not s:
-                return p.stat().st_mtime
-            try:
-                return datetime.fromisoformat(s).timestamp()
-            except Exception:
-                try:
-                    return float(s)
-                except Exception:
-                    return p.stat().st_mtime
 
         recs.append(
             ModelRecord(
                 model_path=p,
                 meta_path=meta_path,
                 sha1=sha1,
-                created=created_str,                               # pro zobrazení
-                metrics=metrics,                                   # už očištěné
-                features_n=len(meta.get("trained_features", [])),
-                classes=list(meta.get("model_classes", [])),
+                created=str(meta.get("created_at_iso") or meta.get("created_at") or ""),
+                metrics=metrics,
+                features_n=len(features or []),
+                classes=[str(c) for c in list(classes or [])],
+                top_feature=_top_feature_from_meta(meta),
+                file_size=int(p_stat.st_size),
+                file_mtime_ns=int(p_stat.st_mtime_ns),
             )
         )
 
-    # třídění: nejdřív Sharpe (desc), pak čas (desc), pak profit (desc)
-    def _sort_key(r: ModelRecord):
-        sharpe = r.metrics.get("sharpe", float("-inf"))
-        profit = r.metrics.get("profit_net", float("-inf"))
-        try:
-            ts = datetime.fromisoformat(r.created).timestamp()
-        except Exception:
-            try:
-                ts = float(r.created)
-            except Exception:
-                ts = r.model_path.stat().st_mtime
-        # Primary: sharpe (desc), Secondary: profit (desc), Tertiary: timestamp (desc)
-        return (sharpe, profit, ts)
-
-    recs.sort(key=_sort_key, reverse=True)
+    recs.sort(key=_record_rank_key, reverse=True)
     return recs
-
 
 
 class ModelManagerTab(QWidget):
@@ -201,17 +193,22 @@ class ModelManagerTab(QWidget):
         self.setObjectName("tab_model_manager")
 
         self.dir_edit = QLineEdit(self)
-        self.dir_edit.setText(str(DEFAULT_MODEL_DIR))  # Nainicializuj na default cestu
-        self.btn_browse = QPushButton("Zvolit složku s modely…", self)
+        self.dir_edit.setText(str(DEFAULT_MODEL_DIR))
+        self.btn_browse = QPushButton("Zvolit složku s modely...", self)
         self.chk_auto = QCheckBox("Auto-load nejnovější/best model")
         self.chk_auto.setChecked(True)
 
         self.tbl = QTableWidget(self)
         self.tbl.setColumnCount(8)
-        self.tbl.setHorizontalHeaderLabels(["Model", "SHA1", "Vytvořen", "Sharpe", "Profit", "PF", "#Feats", "Top Feature"])
+        self.tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tbl.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tbl.setHorizontalHeaderLabels(
+            ["Model", "SHA1", "Vytvořen", "Sharpe(H)", "Profit(H)", "PF(H)", "#Feats", "Top Feature"]
+        )
         self.tbl.horizontalHeader().setStretchLastSection(True)
 
-        self.lbl_loaded = QLabel("Načten: –")
+        self.lbl_loaded = QLabel("Načten: -")
 
         self.sens = QDoubleSpinBox(self)
         self.sens.setRange(0.01, 0.99)
@@ -244,63 +241,111 @@ class ModelManagerTab(QWidget):
         lay.addWidget(self.lbl_loaded)
         lay.addLayout(bottom)
 
-        # Stav
         self.records: list[ModelRecord] = []
-        self.loaded = None  # výsledek load_model_with_meta(...)
+        self.loaded = None
+        self._last_snapshot: tuple[tuple[str, int, int], ...] = ()
 
-        # Signály
         self.btn_browse.clicked.connect(self._on_browse)
         self.btn_load.clicked.connect(self._on_load_selected)
         self.btn_validate.clicked.connect(self._on_validate)
         self.sens.valueChanged.connect(self._on_sens)
+        self.tbl.itemSelectionChanged.connect(self._on_selection_changed)
 
-        # Periodický refresh pro auto-load
+        self._delete_shortcut = QShortcut(QKeySequence.Delete, self)
+        self._delete_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self._delete_shortcut.activated.connect(self._on_delete_selected)
+
         self.timer = QTimer(self)
         self.timer.setInterval(5000)
         self.timer.timeout.connect(self._tick)
         self.timer.start()
 
-        # Načti modely z default cesty a auto-load nejlepší
-        self._refresh_list()
+        self._refresh_list(force=True)
         if self.chk_auto.isChecked():
             self._auto_load_best()
 
-    # ---------- UI callbacks ----------
     def _on_browse(self):
-        # Defaultně otevři dialog v DEFAULT_MODEL_DIR
         start_dir = str(DEFAULT_MODEL_DIR) if DEFAULT_MODEL_DIR.exists() else str(Path.home())
         d = QFileDialog.getExistingDirectory(self, "Zvol složku s modely", start_dir)
         if d:
             self.dir_edit.setText(d)
-            self._refresh_list()
+            self._refresh_list(force=True)
             if self.chk_auto.isChecked():
                 self._auto_load_best()
 
     def _on_sens(self, v: float):
-        # tady jen držíme číslo; předat do live tabu můžeš přes MainWindow, pokud chceš
         pass
 
     def _on_load_selected(self):
-        row = self.tbl.currentRow()
-        if row < 0 or row >= len(self.records):
+        rec = self._selected_record()
+        if rec is None:
             QMessageBox.warning(self, "Model", "Nejprve vyber model v tabulce.")
             return
-        self._load_model(self.records[row])
+        self._load_and_propagate_model(rec)
+
+    def _on_selection_changed(self):
+        rec = self._selected_record()
+        if rec is None:
+            return
+        self._propagate_model_path(rec.model_path)
+
+    def _on_delete_selected(self):
+        rec = self._selected_record()
+        row = self.tbl.currentRow()
+        if rec is None or row < 0:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Smazat model",
+            f"Opravdu smazat model?\n\n{rec.model_path.name}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        sidecar_path = rec.model_path.with_name(rec.model_path.stem + "_meta.json")
+        try:
+            if sidecar_path.exists():
+                sidecar_path.unlink()
+            rec.model_path.unlink()
+        except Exception as e:
+            QMessageBox.critical(self, "Mazani selhalo", str(e))
+            return
+
+        loaded = getattr(self, "loaded", None)
+        if loaded is not None:
+            try:
+                loaded_path = Path(loaded.path).resolve()
+            except Exception:
+                loaded_path = None
+            try:
+                rec_path = rec.model_path.resolve()
+            except Exception:
+                rec_path = rec.model_path
+            if loaded_path == rec_path:
+                self.loaded = None
+                self.lbl_loaded.setText("Nacten: -")
+
+        self._refresh_list(force=True)
+        if self.records:
+            next_row = min(row, len(self.records) - 1)
+            self.tbl.setCurrentCell(next_row, 0)
+
+    def _selected_record(self) -> ModelRecord | None:
+        row = self.tbl.currentRow()
+        if row < 0 or row >= len(self.records):
+            return None
+        return self.records[row]
 
     def _on_validate(self):
-        """
-        Porovná featury očekávané modelem (trained_features / feature_names_in_)
-        s live featurami z Tab 4. Vypíše konkrétní rozdíly (missing/extra/pořadí).
-        """
-        import joblib
-        from PySide6.QtWidgets import QApplication, QMessageBox
+        from PySide6.QtWidgets import QApplication
 
-        # 1) Musí být načtený model
         if not getattr(self, "loaded", None):
             QMessageBox.information(self, "Validace", "Nejprve načti model v této záložce.")
             return
 
-        # 2) Najdi callback v MainWindow – robustně (projdi parent chain + activeWindow)
         candidates = []
         w = self
         while w is not None:
@@ -321,7 +366,6 @@ class ModelManagerTab(QWidget):
             QMessageBox.warning(self, "Validace", "Hlavní okno neumí poskytnout live featury.")
             return
 
-        # 3) Získej live featury z Tab 4
         try:
             live_df = get_live()
         except Exception as e:
@@ -329,13 +373,11 @@ class ModelManagerTab(QWidget):
             return
 
         if live_df is None or (isinstance(live_df, pd.DataFrame) and live_df.empty):
-            QMessageBox.information(self, "Validace", "Žádná live data. Otevři Tab 4 a načti snapshot.")
+            QMessageBox.information(self, "Validace", "Zadna live data. Otevri Tab 5 a nacti snapshot.")
             return
 
-        # 4) Očekávané featury z metadat (fallback: feature_names_in_ z modelu)
         trained_feats = list(self.loaded.meta.get("trained_features", []) or [])
         if not trained_feats:
-            # fallback – zkus načíst model a vzít feature_names_in_
             try:
                 mdl_obj = joblib.load(self.loaded.path)
                 mdl = mdl_obj.get("model") if isinstance(mdl_obj, dict) and "model" in mdl_obj else mdl_obj
@@ -348,125 +390,210 @@ class ModelManagerTab(QWidget):
             QMessageBox.warning(self, "Validace", "Model nemá uložené featury (meta ani feature_names_in_).")
             return
 
-        # 5) Porovnání
         live_cols = [str(c) for c in list(live_df.columns)]
         missing = [c for c in trained_feats if c not in live_cols]
-        extra   = [c for c in live_cols if c not in trained_feats]
+        extra = [c for c in live_cols if c not in trained_feats]
 
         if missing or extra:
             msg = []
             if missing:
-                msg.append("Chybí (expected → live není): " + ", ".join(missing[:20]) + ("…" if len(missing) > 20 else ""))
+                msg.append("Chybí (expected -> live není): " + ", ".join(missing[:20]) + ("..." if len(missing) > 20 else ""))
             if extra:
-                msg.append("Navíc (live → trénink nezná): " + ", ".join(extra[:20]) + ("…" if len(extra) > 20 else ""))
+                msg.append("Navíc (live -> trénink nezná): " + ", ".join(extra[:20]) + ("..." if len(extra) > 20 else ""))
             QMessageBox.critical(self, "Featury nesedí", "\n".join(msg))
             return
 
-        # 6) Kontrola pořadí (jen když se množiny shodují)
         if live_cols != trained_feats:
-            # najdi prvních pár rozdílů v pořadí
             diffs = []
             for i, (a, b) in enumerate(zip(trained_feats, live_cols)):
                 if a != b:
                     diffs.append(f"{i}: expected='{a}' vs live='{b}'")
                 if len(diffs) >= 10:
                     break
-            QMessageBox.warning(self, "Pořadí featur",
-                                "Sloupce sedí, ale pořadí je jiné.\n" + "\n".join(diffs))
+            QMessageBox.warning(
+                self,
+                "Pořadí featur",
+                "Sloupce sedí, ale pořadí je jiné.\n" + "\n".join(diffs),
+            )
             return
 
-        # 7) Vše OK
-        QMessageBox.information(self, "Validace", "OK – featury i pořadí sedí.")
+        QMessageBox.information(self, "Validace", "OK - featury i pořadí sedí.")
 
-    # ---------- periodic auto-load ----------
     def _tick(self):
         if not self.chk_auto.isChecked():
             return
         d = self._models_dir()
         if not d:
             return
-        prev_sha = getattr(self.loaded, "sha1", None)
-        self._refresh_list()
+        if not self._refresh_list():
+            return
         best = self._pick_best(self.records)
-        if best and best.sha1 != prev_sha:
-            self._load_model(best)
+        if best and self._should_auto_load(best):
+            self._load_and_propagate_model(best)
 
-    # ---------- helpers ----------
     def _models_dir(self) -> Path | None:
         t = self.dir_edit.text().strip()
         return Path(t) if t else None
 
-    def _refresh_list(self):
+    def _refresh_list(self, *, force: bool = False) -> bool:
         d = self._models_dir()
         if not d:
-            return
-        recs = discover_models(d)
-        self.records = recs
+            return False
+        snapshot = _directory_snapshot(d)
+        if not force and snapshot == self._last_snapshot:
+            return False
+        self._last_snapshot = snapshot
+        self.records = discover_models(d)
         self._render_table()
+        return True
 
     def _render_table(self):
+        selected = self._selected_record()
+        selected_path = None
+        if selected is not None:
+            try:
+                selected_path = selected.model_path.resolve()
+            except Exception:
+                selected_path = selected.model_path
+
+        self.tbl.blockSignals(True)
         self.tbl.setRowCount(len(self.records))
         for i, r in enumerate(self.records):
             self.tbl.setItem(i, 0, QTableWidgetItem(r.model_path.name))
-            self.tbl.setItem(i, 1, QTableWidgetItem(r.sha1[:8]))
+            self.tbl.setItem(i, 1, QTableWidgetItem(r.sha1[:8] if r.sha1 else "-"))
             self.tbl.setItem(i, 2, QTableWidgetItem(r.created or ""))
-            
-            # Sharpe - zobraz N/A pokud chybí
+
             sharpe_val = r.metrics.get("sharpe")
-            sharpe_txt = f"{sharpe_val:.3f}" if sharpe_val is not None else "–"
+            sharpe_txt = f"{sharpe_val:.3f}" if sharpe_val is not None else "-"
             self.tbl.setItem(i, 3, QTableWidgetItem(sharpe_txt))
-            
-            # Profit - zobraz N/A pokud chybí
-            profit_val = r.metrics.get("profit_net")
-            profit_txt = f"{profit_val:.0f}" if profit_val is not None else "–"
+
+            profit_val = r.metrics.get("profit_net", r.metrics.get("profit_gross"))
+            profit_txt = f"{profit_val:.0f}" if profit_val is not None else "-"
             self.tbl.setItem(i, 4, QTableWidgetItem(profit_txt))
-            
-            # Profit Factor - zobraz N/A pokud chybí
+
             pf_val = r.metrics.get("profit_factor") or r.metrics.get("pf")
-            pf_txt = f"{pf_val:.2f}" if pf_val is not None else "–"
+            pf_txt = f"{pf_val:.2f}" if pf_val is not None else "-"
             self.tbl.setItem(i, 5, QTableWidgetItem(pf_txt))
-            
+
             self.tbl.setItem(i, 6, QTableWidgetItem(str(r.features_n)))
-            # Top feature z feature_importance
-            top_feat = ""
-            if r.model_path.exists():
-                try:
-                    meta_path = r.model_path.with_name(f"{r.model_path.stem}_meta.json")
-                    if meta_path.exists():
-                        meta_txt = meta_path.read_text(encoding="utf-8")
-                        meta = json.loads(meta_txt)
-                        feat_imp = meta.get("feature_importance", {})
-                        if feat_imp and isinstance(feat_imp, dict):
-                            # najdi feature s největší importante
-                            top_feat = max(feat_imp.keys(), key=lambda x: feat_imp[x])[:12]  # první feature, zkrácený
-                except Exception as e:
-                    pass
-            self.tbl.setItem(i, 7, QTableWidgetItem(top_feat))
+            self.tbl.setItem(i, 7, QTableWidgetItem(r.top_feature))
+        self.tbl.blockSignals(False)
+
+        if selected_path is None:
+            return
+
+        for i, rec in enumerate(self.records):
+            try:
+                rec_path = rec.model_path.resolve()
+            except Exception:
+                rec_path = rec.model_path
+            if rec_path == selected_path:
+                self.tbl.setCurrentCell(i, 0)
+                return
 
     def _pick_best(self, recs: list[ModelRecord]) -> ModelRecord | None:
         if not recs:
             return None
-        recs2 = sorted(
-            recs,
-            key=lambda r: (
-                _as_float(r.metrics.get("sharpe", None)),
-                _as_timestamp(r.created, r.model_path),
-            ),
-            reverse=True,
-        )
-        return recs2[0]
+        return max(recs, key=_record_rank_key)
 
     def _auto_load_best(self):
         best = self._pick_best(self.records)
         if best:
-            self._load_model(best)
+            self._load_and_propagate_model(best)
+
+    def _should_auto_load(self, rec: ModelRecord) -> bool:
+        loaded = getattr(self, "loaded", None)
+        if loaded is None:
+            return True
+        try:
+            loaded_path = Path(loaded.path).resolve()
+        except Exception:
+            loaded_path = None
+        try:
+            rec_path = rec.model_path.resolve()
+        except Exception:
+            rec_path = rec.model_path
+        if loaded_path != rec_path:
+            return True
+        try:
+            loaded_stat = Path(loaded.path).stat()
+        except OSError:
+            return True
+        return (
+            int(loaded_stat.st_size) != int(rec.file_size)
+            or int(loaded_stat.st_mtime_ns) != int(rec.file_mtime_ns)
+        )
 
     def _load_model(self, rec: ModelRecord):
         try:
             self.loaded = load_model_with_meta(str(rec.model_path))
             classes = self.loaded.meta.get("model_classes")
+            version_suffix = ""
+            if getattr(self.loaded, "version_warning", None):
+                model_ver = self.loaded.meta.get("sklearn_version") or "?"
+                runtime_ver = "?"
+                try:
+                    runtime_ver = str(self.loaded.version_warning).split("runtime=")[-1].split(". Compatibility")[0]
+                except Exception:
+                    pass
+                version_suffix = f" | sklearn={model_ver}/runtime={runtime_ver}"
             self.lbl_loaded.setText(
                 f"Načten: {rec.model_path.name} | sha1={self.loaded.sha1[:8]} | třídy={classes}"
             )
         except Exception as e:
             QMessageBox.critical(self, "Načtení selhalo", str(e))
+    def _load_and_propagate_model(self, rec: ModelRecord) -> None:
+        before = getattr(self, "loaded", None)
+        self._load_model(rec)
+        after = getattr(self, "loaded", None)
+        self._refresh_loaded_label(rec)
+        if after is not None and after is not before:
+            self._propagate_model_path(rec.model_path)
+
+    def _refresh_loaded_label(self, rec: ModelRecord) -> None:
+        loaded = getattr(self, "loaded", None)
+        if loaded is None:
+            return
+        classes = loaded.meta.get("model_classes")
+        version_suffix = ""
+        if getattr(loaded, "version_warning", None):
+            model_ver = loaded.meta.get("sklearn_version") or "?"
+            runtime_ver = "?"
+            try:
+                runtime_ver = str(loaded.version_warning).split("runtime=")[-1].split(". Compatibility")[0]
+            except Exception:
+                pass
+            version_suffix = f" | sklearn={model_ver}/runtime={runtime_ver}"
+        self.lbl_loaded.setText(
+            f"Nacten: {rec.model_path.name} | sha1={loaded.sha1[:8]} | tridy={classes}{version_suffix}"
+        )
+
+    def _propagate_model_path(self, model_path: Path) -> None:
+        win = self.window()
+        if win is None:
+            return
+
+        try:
+            ensure_tab_loaded = getattr(win, "_ensure_tab_loaded", None)
+            if callable(ensure_tab_loaded):
+                ensure_tab_loaded(3)
+                ensure_tab_loaded(4)
+        except Exception:
+            pass
+
+        tab_eval = getattr(win, "tab_eval", None)
+        if tab_eval is not None and hasattr(tab_eval, "set_model_path"):
+            try:
+                tab_eval.set_model_path(str(model_path))
+            except Exception:
+                pass
+
+        tab_live = getattr(win, "tab_live", None)
+        if tab_live is not None:
+            try:
+                if hasattr(tab_live, "set_model_paths"):
+                    tab_live.set_model_paths([str(model_path)])
+                elif hasattr(tab_live, "le_model_path"):
+                    tab_live.le_model_path.setText(str(model_path))
+            except Exception:
+                pass

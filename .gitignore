@@ -1,0 +1,31 @@
+# Python cache/bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+
+# Local env/settings
+.env
+.env.*
+
+# Runtime logs
+*.log
+
+# Generated market data
+data/raw/**/*.csv
+data/processed/**/*.csv
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Generated models/diagnostics
+model_outputs/**/*.pkl
+model_outputs/**/*_meta.json
+model_outputs/**/*_rejected_meta.json
+model_outputs/**/*_chain_shortlist.json
+

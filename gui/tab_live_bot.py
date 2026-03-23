@@ -12,8 +12,10 @@ import os
 import smtplib
 import threading
 import warnings
+from collections import deque
 from dataclasses import dataclass
 from email.message import EmailMessage
+from pathlib import Path
 from typing import Any
 
 import joblib
@@ -23,10 +25,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from PySide6.QtCore import QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QSettings, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -39,6 +40,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -55,6 +57,8 @@ except Exception:
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from ibkr_trading_bot.core.services.model_service import build_sklearn_version_warning, read_sidecar_model_meta
+from ibkr_trading_bot.gui.components.workers import TaskWorker
 
 # Warm-up service
 try:
@@ -65,15 +69,31 @@ except Exception as e:
 
 # TradingView klient (různé fallback importy)
 try:
-    from ibkr_trading_bot.core.datasource.tradingview_client import TradingViewClient
+    from ibkr_trading_bot.core.datasource.tradingview_client import (
+        TradingViewClient,
+        load_saved_tv_credentials,
+        save_tv_credentials,
+    )
 except ModuleNotFoundError:
     try:
-        from ibkr_trading_bot.core.data_sources.tradingview_client import TradingViewClient
+        from ibkr_trading_bot.core.data_sources.tradingview_client import (
+            TradingViewClient,
+            load_saved_tv_credentials,
+            save_tv_credentials,
+        )
     except ModuleNotFoundError:
         try:
-            from core.datasource.tradingview_client import TradingViewClient
+            from core.datasource.tradingview_client import (
+                TradingViewClient,
+                load_saved_tv_credentials,
+                save_tv_credentials,
+            )
         except ModuleNotFoundError:
-            from core.data_sources.tradingview_client import TradingViewClient
+            from core.data_sources.tradingview_client import (
+                TradingViewClient,
+                load_saved_tv_credentials,
+                save_tv_credentials,
+            )
 
 # Logger
 try:
@@ -372,6 +392,7 @@ class LiveConfig:
     dry_run: bool = True
     max_fresh_age_min: int = 5
     max_bars_buffer: int = 300  # Buffer pro live bars (po dropna z rolling bude ~200 validních)
+    display_bars: int = 144  # Pocet svicek zobrazenych v grafech
     use_ma_only: bool = False
     use_and_ensemble: bool = False  # default VOTE (AND vypnuto)
     alert_on_flip: bool = True
@@ -391,6 +412,283 @@ class LiveConfig:
     entry_thr: float = 0.50
     exit_thr: float = 0.50
     rounds_enabled: bool = False
+
+
+@dataclass
+class LiveBootstrapPayload:
+    bars: list[dict[str, Any]]
+    live_df: pd.DataFrame
+    label_maps: list[dict[int, str] | None]
+    snapshot_bars: int
+
+
+@dataclass
+class DegradationPreloadPayload:
+    predictions: list[int]
+    prices: list[float]
+    timestamps: list[Any]
+
+
+def _empty_live_bootstrap_payload(model_count: int = 0) -> LiveBootstrapPayload:
+    return LiveBootstrapPayload(
+        bars=[],
+        live_df=pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"]),
+        label_maps=[None] * max(0, int(model_count)),
+        snapshot_bars=0,
+    )
+
+
+def _sanitize_live_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "average" not in out.columns and all(c in out.columns for c in ["open", "high", "low", "close"]):
+        out["average"] = (out["open"] + out["high"] + out["low"] + out["close"]) / 4.0
+    for c in out.columns:
+        key = str(c).strip().lower()
+        if key in {"date", "time", "timestamp", "datetime"}:
+            ts = pd.to_datetime(out[c], utc=True, errors="coerce")
+            out[c] = pd.Series(
+                np.where(ts.notna(), ts.astype("int64"), np.nan),
+                index=out.index,
+                dtype="float64",
+            )
+        elif not pd.api.types.is_bool_dtype(out[c]):
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+    med = out.median(numeric_only=True)
+    return out.fillna(med).fillna(0.0).astype("float32")
+
+
+def _compute_snapshot_features(live_df: pd.DataFrame) -> pd.DataFrame | None:
+    if live_df is None or live_df.empty:
+        return None
+    df = live_df.copy()
+    if "timestamp" not in df.columns:
+        time_col = next((col for col in ("time", "date") if col in df.columns), None)
+        if time_col is None:
+            return None
+        df = df.rename(columns={time_col: "timestamp"})
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df = df[["timestamp", "open", "high", "low", "close", "volume"]].dropna(subset=["timestamp", "close"]).copy()
+    if df.empty:
+        return None
+    feat = compute_all_features(df)
+    feat["ma_fast"] = feat["close"].rolling(9, min_periods=1).mean()
+    feat["ma_slow"] = feat["close"].rolling(21, min_periods=1).mean()
+    if "average" not in feat.columns:
+        feat["average"] = (feat["open"] + feat["high"] + feat["low"] + feat["close"]) / 4.0
+    if "timestamp" in feat.columns:
+        feat["timestamp"] = pd.to_datetime(feat["timestamp"], utc=True, errors="coerce")
+        feat = feat.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
+    elif not isinstance(feat.index, pd.DatetimeIndex):
+        return None
+    return _sanitize_live_feature_frame(feat)
+
+
+def _prepare_X_for_model_static(Xrow: pd.DataFrame, exp: list[str] | None) -> pd.DataFrame:
+    X_use = Xrow.copy()
+    if "average" not in X_use.columns and all(c in X_use.columns for c in ["open", "high", "low", "close"]):
+        X_use["average"] = (X_use["open"] + X_use["high"] + X_use["low"] + X_use["close"]) / 4.0
+    exp_list = [str(c) for c in (exp or [])]
+    if exp_list:
+        missing = [c for c in exp_list if c not in X_use.columns]
+        for c in missing:
+            if "close" in X_use.columns:
+                X_use[c] = X_use["close"].median()
+            else:
+                numeric_cols = X_use.select_dtypes(include=[np.number]).columns
+                X_use[c] = X_use[numeric_cols[0]].median() if len(numeric_cols) > 0 else 0.0
+        X_use = X_use[exp_list]
+    return _sanitize_live_feature_frame(X_use).astype(float)
+
+
+def _build_live_bootstrap_payload_from_history_df(
+    df: pd.DataFrame | None,
+    models: list[dict[str, Any]],
+    *,
+    max_bars_buffer: int | None = None,
+) -> LiveBootstrapPayload:
+    if df is None or df.empty:
+        return _empty_live_bootstrap_payload(len(models))
+
+    work = df.copy()
+    time_col = next((col for col in ("time", "timestamp", "date") if col in work.columns), None)
+    required_cols = {"open", "high", "low", "close"}
+    if time_col is None or not required_cols.issubset(work.columns):
+        return _empty_live_bootstrap_payload(len(models))
+
+    if "volume" not in work.columns:
+        work["volume"] = 0.0
+
+    work = work.rename(columns={time_col: "time"}).copy()
+    work["time"] = pd.to_datetime(work["time"], utc=True, errors="coerce")
+    for col in ("open", "high", "low", "close", "volume"):
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+    work = work.dropna(subset=["time", "open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
+    if work.empty:
+        return _empty_live_bootstrap_payload(len(models))
+
+    if max_bars_buffer is not None:
+        initial_download = max(700, int(max_bars_buffer) + 200)
+        if len(work) > initial_download:
+            work = work.tail(initial_download).reset_index(drop=True)
+
+    bars: list[dict[str, Any]] = []
+    for _, r in work.iterrows():
+        bars.append(
+            {
+                "time": r["time"],
+                "open": float(r.get("open", np.nan)),
+                "high": float(r.get("high", np.nan)),
+                "low": float(r.get("low", np.nan)),
+                "close": float(r.get("close", np.nan)),
+                "volume": float(r.get("volume", 0) or 0),
+            }
+        )
+
+    live_df = pd.DataFrame(
+        {
+            "timestamp": work["time"].to_numpy(),
+            "open": work["open"].astype(float).to_numpy(),
+            "high": work["high"].astype(float).to_numpy(),
+            "low": work["low"].astype(float).to_numpy(),
+            "close": work["close"].astype(float).to_numpy(),
+            "volume": work["volume"].astype(float).to_numpy(),
+        }
+    )
+
+    label_maps: list[dict[int, str] | None] = [None] * len(models)
+    feat_all = _compute_snapshot_features(live_df)
+    raw_df = live_df.rename(columns={"timestamp": "date"})[["date", "open", "high", "low", "close", "volume"]].copy()
+    raw_df["date"] = pd.to_datetime(raw_df["date"], utc=True, errors="coerce")
+    raw_df = raw_df.dropna(subset=["date"]).sort_values("date")
+
+    if feat_all is not None and not feat_all.empty:
+        for idx, m in enumerate(models):
+            try:
+                mdl = m.get("predictor")
+                exp = m.get("exp_feats")
+                if mdl is None:
+                    continue
+                cls_vals = [int(c) for c in list(getattr(mdl, "classes_", []))]
+            except Exception:
+                cls_vals = []
+            try:
+                if len(set(cls_vals)) > 2:
+                    continue
+                X_use = feat_all
+                if exp:
+                    X_use = _prepare_X_for_model_static(feat_all, exp)
+                auto_map = _auto_detect_label_polarity(mdl, X_use, raw_df)
+                if auto_map and set(auto_map.values()) == {"LONG", "SHORT"}:
+                    label_maps[idx] = dict(auto_map)
+            except Exception:
+                continue
+
+    return LiveBootstrapPayload(
+        bars=bars,
+        live_df=live_df,
+        label_maps=label_maps,
+        snapshot_bars=int(len(live_df)),
+    )
+
+
+def _task_build_live_bootstrap(
+    *,
+    models: list[dict[str, Any]],
+    symbol: str,
+    exchange: str,
+    bar_size: str,
+    max_bars_buffer: int,
+    progress_cb=None,
+) -> LiveBootstrapPayload:
+    if callable(progress_cb):
+        progress_cb("Live bootstrap: nacitam snapshot...")
+    tv = TradingViewClient(username=os.getenv("TV_USERNAME"), password=os.getenv("TV_PASSWORD"))
+    tf_label = (bar_size or "1 hour").replace("mins", "min")
+    initial_download = max(700, int(max_bars_buffer) + 200)
+    df = tv.get_history(symbol, exchange, tf_label, limit=initial_download)
+    if callable(progress_cb) and df is not None and not df.empty:
+        progress_cb("Live bootstrap: autodetekce polarity modelu...")
+    return _build_live_bootstrap_payload_from_history_df(
+        df,
+        models,
+        max_bars_buffer=int(max_bars_buffer),
+    )
+
+
+def _task_preload_degradation(
+    *,
+    models: list[dict[str, Any]],
+    symbol: str,
+    exchange: str,
+    timeframe: str,
+    degradation_window_size: int,
+    progress_cb=None,
+) -> DegradationPreloadPayload:
+    if not models:
+        return DegradationPreloadPayload(predictions=[], prices=[], timestamps=[])
+
+    if callable(progress_cb):
+        progress_cb("Degradation: nacitam historicka data...")
+    bars_needed = int(degradation_window_size) + 200
+    tv = TradingViewClient(username=os.getenv("TV_USERNAME"), password=os.getenv("TV_PASSWORD"))
+    df = tv.get_history(symbol, exchange, timeframe, limit=bars_needed)
+    if df is None or df.empty:
+        return DegradationPreloadPayload(predictions=[], prices=[], timestamps=[])
+
+    df = df.copy()
+    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+    df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+    df["timestamp"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+    df = df.dropna(subset=["timestamp"]).set_index("timestamp")
+    df.index.name = "timestamp"
+
+    df_feats = compute_all_features(df)
+    if df_feats.empty:
+        return DegradationPreloadPayload(predictions=[], prices=[], timestamps=[])
+
+    df_recent = df_feats.tail(int(degradation_window_size)).copy().reset_index(drop=True)
+    model_info = models[0]
+    model = model_info["predictor"]
+    exp_feats = model_info.get("exp_feats")
+    X_prepared = df_recent
+    if exp_feats:
+        X_prepared = _prepare_X_for_model_static(df_recent, exp_feats)
+
+    try:
+        label_map = model_info.get("label_map") or _infer_label_map_from_classes(getattr(model, "classes_", None))
+        X_pred = _align_X_for_model(model, X_prepared)
+        proba_all = _predict_proba_safely(model, X_pred)
+        t_short = float(model_info.get("t_short", 0.5))
+        t_long = float(model_info.get("t_long", 0.5))
+        classes = getattr(model, "classes_", None)
+        if classes is not None:
+            if any(isinstance(c, str) for c in classes):
+                lut = {str(c).upper(): i for i, c in enumerate(classes)}
+                idx_long = lut.get("LONG")
+                idx_short = lut.get("SHORT")
+            else:
+                idx_long = next((i for i, c in enumerate(classes) if str(label_map.get(int(c), "")).upper() == "LONG"), None)
+                idx_short = next((i for i, c in enumerate(classes) if str(label_map.get(int(c), "")).upper() == "SHORT"), None)
+        else:
+            idx_long = 1
+            idx_short = 0
+
+        predictions: list[int] = []
+        for proba_row in proba_all:
+            pL = float(proba_row[idx_long]) if idx_long is not None else 0.5
+            pS = float(proba_row[idx_short]) if idx_short is not None else 0.5
+            if pL >= t_long and pL >= pS:
+                predictions.append(1)
+            elif pS >= t_short and pS > pL:
+                predictions.append(-1)
+            else:
+                predictions.append(0)
+    except Exception:
+        predictions = [0] * len(df_recent)
+
+    prices = df_recent["close"].astype(float).tolist()
+    timestamps = df_recent["time"].tolist()
+    return DegradationPreloadPayload(predictions=predictions, prices=prices, timestamps=timestamps)
 
 # ==============================================
 # TV Worker – polling posledních uzavřených barů
@@ -425,6 +723,7 @@ class TVWorker(QThread):
         try:
             self.statusChanged.emit("Connected")
             stale_count = 0
+            wait_status_step = 6  # emit wait status every N stale polls
             while not self._stop:
                 tf_label = (self.cfg.bar_size or "1 hour").replace("mins", "min")
                 exchange = (getattr(self.cfg, "exchange", None) or "COMEX")
@@ -438,6 +737,7 @@ class TVWorker(QThread):
                     if ts_ns != self._last_ns:
                         self._last_ns = ts_ns
                         stale_count = 0
+                        self.statusChanged.emit("Connected")
                         self.barClosed.emit({
                             "time": str(ts),
                             "open": float(last.get("open", 0)),
@@ -451,9 +751,13 @@ class TVWorker(QThread):
                 else:
                     stale_count += 1
 
+                if stale_count > 0 and (stale_count % wait_status_step) == 0:
+                    wait_min = (stale_count * max(1, self._poll_interval_s())) / 60.0
+                    self.statusChanged.emit(f"Waiting for closed bar ({wait_min:.1f}m)")
+
                 if stale_count >= 30:
                     try:
-                        self.statusChanged.emit("Reconnecting…")
+                        self.statusChanged.emit("Reconnecting...")
                         self.tv = TradingViewClient(
                             username=os.getenv("TV_USERNAME"),
                             password=os.getenv("TV_PASSWORD")
@@ -653,10 +957,14 @@ class _WarmAdapter:
 # Hlavní widget
 # ==============================================
 class LiveBotWidget(QWidget):
+    log_message = Signal(str)
+
     def __init__(self, parent: QWidget | None = None, config: LiveConfig | None = None) -> None:
         super().__init__(parent)
         self.logger = get_logger("live_bot.gui")
         self.config = config or LiveConfig()
+        self._ui_settings = QSettings("ibkr_trading_bot", "live_tab")
+        self._load_ui_settings()
         self.model = None                          # používá se jen pro feature_names_in_
         self.models: list[dict[str, Any]] = []     # členové ensemble
         self.class_to_dir = {1: "LONG", 0: "SHORT"}  # lze přepsat z meta
@@ -664,14 +972,22 @@ class LiveBotWidget(QWidget):
         self.label_map_from_meta = False
         self.model_expected_features: list[str] | None = None
         self.worker: TVWorker | None = None
+        self._bootstrap_worker: TaskWorker | None = None
+        self._degradation_worker: TaskWorker | None = None
         self.warm: LiveWarmupService | None = None
 
         self.live_df = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
         self._bars: list[dict[str, Any]] = []
         self._bar_index: dict[int, int] = {}
         self._last_arrival_utc: pd.Timestamp | None = None
+        self._pending_bar_payloads: list[dict[str, Any]] = []
+        self._bar_refresh_scheduled = False
+        self._bootstrap_request_id = 0
+        self._degradation_request_id = 0
+        self._log_queue = deque()
 
         self._build_ui()
+        self._load_tv_credentials_into_ui()
         self._wire_basic_logic()
         self._last_alert_sig: str | None = None
         self._last_alert_bar_key: int | None = None
@@ -714,6 +1030,50 @@ class LiveBotWidget(QWidget):
         self._last_alert_bar_ns = None
         self._last_beep_time = None
         self._last_signal = None
+        self._last_tv_status: str | None = None
+        self.log_message.connect(self._enqueue_log_text)
+        self._log_timer = QTimer(self)
+        self._log_timer.setInterval(100)
+        self._log_timer.timeout.connect(self._flush_log_queue)
+        self._log_timer.start()
+
+    def _load_ui_settings(self) -> None:
+        try:
+            raw = self._ui_settings.value("display_bars", self.config.display_bars)
+            bars = int(raw)
+            self.config.display_bars = max(30, min(2000, bars))
+        except Exception:
+            self.config.display_bars = max(30, min(2000, int(self.config.display_bars)))
+
+    def _save_ui_settings(self) -> None:
+        try:
+            self._ui_settings.setValue("display_bars", int(self.config.display_bars))
+            self._ui_settings.sync()
+        except Exception:
+            pass
+
+    def _load_tv_credentials_into_ui(self) -> None:
+        try:
+            username, password = load_saved_tv_credentials()
+            self.ed_tv_username.setText(str(username or ""))
+            self.ed_tv_password.setText(str(password or ""))
+            self.lbl_tv_auth.setText("TV login: ulozen" if username and password else "TV login: neni ulozen")
+        except Exception:
+            self.lbl_tv_auth.setText("TV login: chyba nacteni")
+
+    def _save_tv_credentials_from_ui(self) -> None:
+        username = (self.ed_tv_username.text() or "").strip()
+        password = self.ed_tv_password.text() or ""
+        try:
+            save_tv_credentials(username, password)
+            if username and password:
+                self.lbl_tv_auth.setText("TV login: ulozen")
+                self._append_log("[TV] Login ulozen lokalne. Klikni Reconnect, pokud uz bezi session.")
+            else:
+                self.lbl_tv_auth.setText("TV login: neni ulozen")
+                self._append_log("[TV] Ulozeny login byl vymazan.")
+        except Exception as exc:
+            self._append_log(f"[TV][ERROR] Nelze ulozit login: {exc}")
 
     def _apply_tf_presets(self):
         tf = self.cmb_interval.currentText()
@@ -797,13 +1157,39 @@ class LiveBotWidget(QWidget):
         self.ed_expiry = QLineEdit(self.config.exchange)
         self.cmb_interval = QComboBox(); self.cmb_interval.addItems(["5 min", "15 min", "30 min", "1 hour"])
         self.cmb_interval.setCurrentText(self.config.bar_size)
+        self.spn_display_bars = QSpinBox()
+        self.spn_display_bars.setRange(30, 2000)
+        self.spn_display_bars.setSingleStep(12)
+        self.spn_display_bars.setValue(max(30, int(getattr(self.config, "display_bars", 144))))
+        self.spn_display_bars.setToolTip("Kolik poslednich uzavrenych svicek zobrazit v grafech.")
         self.btn_start = QPushButton("Start"); self.btn_stop = QPushButton("Stop"); self.btn_reconnect = QPushButton("Reconnect")
         h.addWidget(QLabel("Režim:"));      h.addWidget(self.cmb_mode)
         h.addWidget(QLabel("Symbol:"));     h.addWidget(self.ed_symbol)
         h.addWidget(QLabel("Exchange:"));   h.addWidget(self.ed_expiry)
         h.addWidget(QLabel("Timeframe:"));  h.addWidget(self.cmb_interval)
+        h.addWidget(QLabel("Svíček:"));     h.addWidget(self.spn_display_bars)
         h.addWidget(self.btn_start);        h.addWidget(self.btn_stop); h.addWidget(self.btn_reconnect)
         session_box.setLayout(h)
+
+        tv_auth_box = QGroupBox("TradingView login")
+        tv_auth_layout = QHBoxLayout()
+        self.ed_tv_username = QLineEdit()
+        self.ed_tv_username.setPlaceholderText("TV username")
+        self.ed_tv_username.setFixedWidth(180)
+        self.ed_tv_password = QLineEdit()
+        self.ed_tv_password.setPlaceholderText("TV password")
+        self.ed_tv_password.setEchoMode(QLineEdit.Password)
+        self.ed_tv_password.setFixedWidth(180)
+        self.btn_tv_save = QPushButton("Ulozit TV login")
+        self.lbl_tv_auth = QLabel("TV login: neni ulozen")
+        tv_auth_layout.addWidget(QLabel("Uzivatel:"))
+        tv_auth_layout.addWidget(self.ed_tv_username)
+        tv_auth_layout.addWidget(QLabel("Heslo:"))
+        tv_auth_layout.addWidget(self.ed_tv_password)
+        tv_auth_layout.addWidget(self.btn_tv_save)
+        tv_auth_layout.addWidget(self.lbl_tv_auth)
+        tv_auth_layout.addStretch(1)
+        tv_auth_box.setLayout(tv_auth_layout)
 
         # Model
         model_box = QGroupBox("Model")
@@ -838,19 +1224,10 @@ class LiveBotWidget(QWidget):
         
         settings_box.setLayout(settings_layout)
         
-        # Invert labels (diagnostic - zachová u sebe)
-        invert_layout = QHBoxLayout()
-        self.chk_invert_labels = QCheckBox("Invert labels 0↔1")
-        self.chk_invert_labels.setToolTip("Ručně prohodí mapu tříd (0↔1). Použij jen pokud DIAG ukazuje opačnou polaritu.")
-        self.chk_invert_labels.stateChanged.connect(self._on_toggle_invert_labels)
-        invert_layout.addWidget(self.chk_invert_labels)
-        invert_layout.addStretch()
-        
         # Finální layout pro model_box
         model_layout = QVBoxLayout()
         model_layout.addLayout(g)
         model_layout.addWidget(settings_box)
-        model_layout.addLayout(invert_layout)
         model_box.setLayout(model_layout)
 
         # Diagnostika degradace modelu
@@ -887,6 +1264,7 @@ class LiveBotWidget(QWidget):
         left = QVBoxLayout()
         left.addWidget(status_box)
         left.addWidget(session_box)
+        left.addWidget(tv_auth_box)
         left.addWidget(model_box)
         left.addWidget(degradation_box)
         left.addWidget(log_box, 1)
@@ -917,7 +1295,8 @@ class LiveBotWidget(QWidget):
         self.btn_start.clicked.connect(self._on_start)
         self.btn_stop.clicked.connect(self._on_stop)
         self.btn_reconnect.clicked.connect(self._on_reconnect)
-        self.chk_invert_labels.stateChanged.connect(self._on_toggle_invert_labels)
+        self.btn_tv_save.clicked.connect(self._save_tv_credentials_from_ui)
+        self.spn_display_bars.valueChanged.connect(self._on_display_bars_changed)
 
         self.fresh_timer = QTimer(self); self.fresh_timer.setInterval(1000)
         self.fresh_timer.timeout.connect(self._update_clock)
@@ -1028,6 +1407,10 @@ class LiveBotWidget(QWidget):
                     self._append_log(f"[META] Zkouším absolutní cestu: {meta_path.absolute()}")
                     if not meta_path.absolute().exists():
                         self._append_log(f"[META] ❌ Ani absolutní cesta neexistuje")
+
+                version_warning = build_sklearn_version_warning(meta, model_path=p)
+                if version_warning:
+                    self._append_log(f"[WARN] {version_warning}")
 
                 # Tab 4 hard gate: pouze ternární modely s modelovými T-short/T-long
                 if not hasattr(pred, "predict_proba"):
@@ -1659,7 +2042,16 @@ class LiveBotWidget(QWidget):
                     else:
                         X_use[c] = 0.0
         
-        X_use = X_use[exp]
+        X_use = X_use[exp].copy()
+        for c in X_use.columns:
+            key = str(c).strip().lower()
+            if key in {"date", "time", "timestamp", "datetime"}:
+                ts = pd.to_datetime(X_use[c], utc=True, errors="coerce")
+                X_use[c] = pd.Series(
+                    np.where(ts.notna(), ts.astype("int64"), np.nan),
+                    index=X_use.index,
+                    dtype="float64",
+                )
         return X_use.astype(float)
 
     @Slot()
@@ -1667,7 +2059,7 @@ class LiveBotWidget(QWidget):
         default_dir = DEFAULT_MODEL_DIR if os.path.isdir(DEFAULT_MODEL_DIR) else os.getcwd()
         fnames, _ = QFileDialog.getOpenFileNames(self, "Vybrat modely", default_dir, "Pickle files (*.pkl);;All files (*)")
         if fnames:
-            self.le_model_path.setText(";".join(fnames))
+            self.set_model_paths(fnames)
 
     # ---------- Ovládání ----------
     @Slot()
@@ -1678,6 +2070,10 @@ class LiveBotWidget(QWidget):
         self._start_worker()
         self._append_log("[INFO] Start sezení…")
         self._append_log(f"[MODE] MA-only={self.config.use_ma_only} | AND={self.config.use_and_ensemble}")
+        self._append_log(
+            f"[INFO] Cekam na uzavreni nove svicky ({self.config.bar_size}). "
+            "Mimo obchodni hodiny muze byt delsi pauza bez noveho baru."
+        )
 
         try:
             adapter = _WarmAdapter(self)
@@ -1698,6 +2094,7 @@ class LiveBotWidget(QWidget):
             cfg = getattr(self.warm, "config", None)
             self._append_log(f"[WARMUP-CONFIG] {cfg if cfg is not None else 'MISSING'}")
             self.warm.start(self.config.symbol, self.config.exchange, self.config.bar_size)
+            self._seed_snapshot_from_warmup_history(adapter)
             self.lbl_mode.setText("Mode: LIVE" if self.warm.state == "LIVE" else "Mode: WARM-UP")
         except Exception as e:
             self._append_log(f"[WARN] Warm-up inicializace selhala: {e}")
@@ -1737,6 +2134,14 @@ class LiveBotWidget(QWidget):
             self._append_log("[INFO] Restart streamu kvůli změně intervalu…")
             self._stop_worker()
             self._start_worker()
+
+    @Slot(int)
+    def _on_display_bars_changed(self, val: int) -> None:
+        bars = max(30, int(val))
+        self.config.display_bars = bars
+        self._save_ui_settings()
+        self._append_log(f"[INFO] Zobrazeni svicek nastaveno na {bars}.")
+        self._render_charts()
 
     # ---------- Worker reakce ----------
     @Slot(dict)
@@ -1822,7 +2227,11 @@ class LiveBotWidget(QWidget):
 
     @Slot(str)
     def _on_ib_status(self, status: str) -> None:
-        self.lbl_ib_status.setText(f"TV: {status}")
+        status_text = str(status or "").strip() or "Unknown"
+        self.lbl_ib_status.setText(f"TV: {status_text}")
+        if status_text != self._last_tv_status:
+            self._append_log(f"[TV] {status_text}")
+            self._last_tv_status = status_text
 
     @Slot(str)
     def _on_error(self, message: str) -> None:
@@ -1923,28 +2332,6 @@ class LiveBotWidget(QWidget):
         self.worker.barClosed.connect(self._on_bar_closed)
         self.worker.start()
 
-    def _on_toggle_invert_labels(self, state):
-        if not hasattr(self, "class_to_dir") or not self.class_to_dir:
-            self.class_to_dir = {0: "SHORT", 1: "LONG"}
-        # invertuj
-        inv = {}
-        for k, v in self.class_to_dir.items():
-            vv = str(v).upper()
-            if vv == "SHORT":
-                inv[k] = "LONG"
-            elif vv == "LONG":
-                inv[k] = "SHORT"
-            else:
-                inv[k] = vv
-        self.class_to_dir = inv
-        self._append_log(f"[MANUAL] Invertuji mapu tříd: {self.class_to_dir}")
-        # přepočítej okamžitě posledních N barů, ať vidíš efekt
-        try:
-            self._rescore_all()
-        except Exception as e:
-            self._append_log(f"[MANUAL] Rescore po invertu selhal: {e!r}")
-
-
     def _stop_worker(self) -> None:
         if self.worker is None:
             return
@@ -2019,7 +2406,15 @@ class LiveBotWidget(QWidget):
 
         # Číselná konverze + imputace mediánem (žádné doplňování *nových* sloupců nulami)
         for c in df.columns:
-            if not pd.api.types.is_bool_dtype(df[c]):
+            key = str(c).strip().lower()
+            if key in {"date", "time", "timestamp", "datetime"}:
+                ts = pd.to_datetime(df[c], utc=True, errors="coerce")
+                df[c] = pd.Series(
+                    np.where(ts.notna(), ts.astype("int64"), np.nan),
+                    index=df.index,
+                    dtype="float64",
+                )
+            elif not pd.api.types.is_bool_dtype(df[c]):
                 df[c] = pd.to_numeric(df[c], errors="coerce")
         med = df.median(numeric_only=True)
         df = df.fillna(med).fillna(0.0).astype('float32')
@@ -2032,7 +2427,15 @@ class LiveBotWidget(QWidget):
             df['average'] = (df['open'] + df['high'] + df['low'] + df['close']) / 4.0
 
         for c in df.columns:
-            if not pd.api.types.is_bool_dtype(df[c]):
+            key = str(c).strip().lower()
+            if key in {"date", "time", "timestamp", "datetime"}:
+                ts = pd.to_datetime(df[c], utc=True, errors="coerce")
+                df[c] = pd.Series(
+                    np.where(ts.notna(), ts.astype("int64"), np.nan),
+                    index=df.index,
+                    dtype="float64",
+                )
+            elif not pd.api.types.is_bool_dtype(df[c]):
                 df[c] = pd.to_numeric(df[c], errors="coerce")
         med = df.median(numeric_only=True)
         df = df.fillna(med).fillna(0.0).astype('float32')
@@ -2726,13 +3129,24 @@ class LiveBotWidget(QWidget):
                 self.lbl_fresh.setText("Freshness: --"); self.lbl_fresh.setStyleSheet(""); return
             age_s = max(0, int((now_utc - last_ts).total_seconds()))
         mins, secs = divmod(age_s, 60)
-        self.lbl_fresh.setText(f"Freshness: {mins}m {secs}s")
+        wait_suffix = ""
+        if self.worker is not None:
+            try:
+                poll_s = max(1, int(self.worker._poll_interval_s()))
+            except Exception:
+                poll_s = 30
+            if age_s > max(poll_s * 2, 30):
+                wait_suffix = " (cekam na novy uzavreny bar)"
+        self.lbl_fresh.setText(f"Freshness: {mins}m {secs}s{wait_suffix}")
         self.lbl_fresh.setStyleSheet("color: #119911;" if age_s <= ok_threshold else "color: #cc0000;")
 
     def _render_charts(self) -> None:
         if not self._bars:
             self.ax_price.cla(); self.ax_macd.cla(); self.canvas.draw_idle(); return
+        display_n = max(30, int(getattr(self.config, "display_bars", 144)))
         df = pd.DataFrame(self._bars).reset_index(drop=True)
+        if len(df) > display_n:
+            df = df.tail(display_n).reset_index(drop=True)
 
         # MACD 12-26-9
         ema12 = df['close'].ewm(span=12, adjust=False).mean()
@@ -2780,6 +3194,550 @@ class LiveBotWidget(QWidget):
 
 
 # Kompatibilitní aliasy
+    def _enqueue_log_text(self, text: str) -> None:
+        self._log_queue.append(str(text))
+
+    def _flush_log_queue(self) -> None:
+        if not hasattr(self, "console"):
+            return
+        while self._log_queue:
+            self.console.appendPlainText(self._log_queue.popleft())
+        cursor = self.console.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self.console.setTextCursor(cursor)
+
+    def _append_log(self, text: str) -> None:
+        try:
+            self.log_message.emit(str(text))
+        except Exception:
+            pass
+
+    def _stop_background_workers(self) -> None:
+        for attr_name in ("_bootstrap_worker",):
+            worker = getattr(self, attr_name, None)
+            if worker is None:
+                continue
+            try:
+                worker.stop()
+            except Exception:
+                pass
+            setattr(self, attr_name, None)
+
+    def _stop_worker(self) -> None:
+        self._stop_background_workers()
+        self._pending_bar_payloads.clear()
+        self._bar_refresh_scheduled = False
+        if self.worker is None:
+            return
+        try:
+            self.worker.stop()
+        except Exception:
+            pass
+        finally:
+            self.worker = None
+
+    def _launch_stream_worker(self) -> None:
+        if self.worker is not None:
+            try:
+                self.worker.stop()
+            except Exception:
+                pass
+        self.worker = TVWorker(self.config, parent=self)
+        self.worker.statusChanged.connect(self._on_ib_status)
+        self.worker.error.connect(self._on_error)
+        self.worker.barClosed.connect(self._on_bar_closed)
+        self.worker.start()
+
+    def _start_worker(self) -> None:
+        if self.worker is not None:
+            self._stop_worker()
+        self._stop_background_workers()
+        self._pending_bar_payloads.clear()
+        self._bar_refresh_scheduled = False
+        self._bars.clear()
+        self._bar_index.clear()
+        self.live_df = self.live_df.iloc[0:0].copy()
+        self._render_charts()
+
+        self.config.mode = self.cmb_mode.currentText()
+        self.config.symbol = (self.ed_symbol.text() or "GOLD").strip()
+        self.config.exchange = (self.ed_expiry.text() or "TVC").strip()
+        self.config.bar_size = self.cmb_interval.currentText()
+
+        self._bootstrap_request_id += 1
+        req_id = self._bootstrap_request_id
+        self._append_log("[INFO] Nacitam pocatecni snapshot...")
+        worker = TaskWorker(
+            _task_build_live_bootstrap,
+            models=self.models,
+            symbol=self.config.symbol,
+            exchange=self.config.exchange,
+            bar_size=self.config.bar_size,
+            max_bars_buffer=int(self.config.max_bars_buffer),
+        )
+        self._bootstrap_worker = worker
+        worker.progress_text.connect(self._append_log)
+        worker.result.connect(lambda payload, rid=req_id: self._on_bootstrap_result(rid, payload))
+        worker.error.connect(lambda msg, rid=req_id: self._on_bootstrap_error(rid, msg))
+        worker.finished.connect(lambda rid=req_id: self._on_bootstrap_finished(rid))
+        worker.start()
+
+    def _on_bootstrap_result(self, req_id: int, payload: LiveBootstrapPayload) -> None:
+        if req_id != self._bootstrap_request_id or payload is None:
+            return
+        used_local_snapshot = False
+        if int(payload.snapshot_bars or 0) < 2:
+            existing_snapshot_bars = int(len(self.live_df.index)) if isinstance(self.live_df, pd.DataFrame) else 0
+            if existing_snapshot_bars >= 2:
+                self._append_log(
+                    f"[INFO] Pocatecni snapshot z TradingView vratil jen {int(payload.snapshot_bars or 0)} baru. "
+                    "Ponechavam cerstvou historii z warm-upu."
+                )
+                used_local_snapshot = True
+            elif payload.snapshot_bars > 0:
+                self._append_log(
+                    f"[WARN] Pocatecni snapshot vratil jen {payload.snapshot_bars} bar. Zkousim lokalni CSV fallback."
+                )
+                used_local_snapshot = self._try_seed_local_snapshot()
+            else:
+                self._append_log("[WARN] Pocatecni snapshot prazdny. Zkousim lokalni CSV fallback.")
+                used_local_snapshot = self._try_seed_local_snapshot()
+
+        if not used_local_snapshot:
+            self._apply_bootstrap_payload(payload, source_label="pocatecni snapshot")
+
+        self._launch_stream_worker()
+
+    def _on_bootstrap_error(self, req_id: int, message: str) -> None:
+        if req_id != self._bootstrap_request_id:
+            return
+        self._append_log(f"[WARN] Pocatecni snapshot selhal: {message}")
+        existing_snapshot_bars = int(len(self.live_df.index)) if isinstance(self.live_df, pd.DataFrame) else 0
+        if existing_snapshot_bars >= 2:
+            self._append_log("[INFO] Ponechavam cerstvou historii z warm-upu a preskakuji lokalni CSV fallback.")
+        else:
+            self._try_seed_local_snapshot()
+        self._launch_stream_worker()
+
+    def _on_bootstrap_finished(self, req_id: int) -> None:
+        if req_id == self._bootstrap_request_id:
+            self._bootstrap_worker = None
+
+    def _seed_snapshot_from_warmup_history(self, adapter: _WarmAdapter | None) -> bool:
+        hist_df = getattr(adapter, "_hist_df", None)
+        if not isinstance(hist_df, pd.DataFrame) or hist_df.empty:
+            self._append_log("[WARN] Warm-up historie z TradingView je prazdna.")
+            return False
+
+        payload = _build_live_bootstrap_payload_from_history_df(
+            hist_df,
+            self.models,
+            max_bars_buffer=int(self.config.max_bars_buffer),
+        )
+        if int(payload.snapshot_bars or 0) < 2:
+            self._append_log(
+                f"[WARN] Warm-up historie z TradingView vratila jen {int(payload.snapshot_bars or 0)} bar."
+            )
+            return False
+
+        existing_snapshot_bars = int(len(self.live_df.index)) if isinstance(self.live_df, pd.DataFrame) else 0
+        if existing_snapshot_bars >= payload.snapshot_bars:
+            return False
+
+        self._apply_bootstrap_payload(payload, source_label="warm-up snapshot z TradingView")
+        return True
+
+    def _preload_historical_data_for_degradation(self) -> None:
+        if not self.models:
+            self._append_log("[DEGRADATION] Preskakuji preload - zadne modely nacteny")
+            self.degradation_console.setPlainText("(Nactete model pro spusteni diagnostiky)")
+            return
+
+        if not self.reference_metrics:
+            self._append_log("[DEGRADATION] Preskakuji preload - zadne referencni metriky")
+            self.degradation_console.setPlainText("(Model neobsahuje referencni metriky)")
+            return
+
+        existing = getattr(self, "_degradation_worker", None)
+        if existing is not None:
+            try:
+                existing.stop()
+            except Exception:
+                pass
+            self._degradation_worker = None
+
+        self._degradation_request_id += 1
+        req_id = self._degradation_request_id
+        self.degradation_console.setPlainText("Nacitam historicka data z TradingView...\nMuze trvat nekolik sekund...")
+
+        worker = TaskWorker(
+            _task_preload_degradation,
+            models=self.models,
+            symbol=(self.ed_symbol.text() or "GOLD").strip(),
+            exchange=(self.ed_expiry.text() or "TVC").strip(),
+            timeframe=self.cmb_interval.currentText().replace("mins", "min"),
+            degradation_window_size=int(self.degradation_window_size),
+        )
+        self._degradation_worker = worker
+        worker.progress_text.connect(lambda text: self._append_log(f"[DEGRADATION] {text}"))
+        worker.result.connect(lambda payload, rid=req_id: self._on_degradation_preload_result(rid, payload))
+        worker.error.connect(lambda msg, rid=req_id: self._on_degradation_preload_error(rid, msg))
+        worker.finished.connect(lambda rid=req_id: self._on_degradation_preload_finished(rid))
+        worker.start()
+
+    def _on_degradation_preload_result(self, req_id: int, payload: DegradationPreloadPayload) -> None:
+        if req_id != self._degradation_request_id or payload is None:
+            return
+        if not payload.predictions:
+            self.degradation_console.setPlainText(
+                f"Diagnostika bude dostupna po nacteni {self.degradation_window_size} live baru."
+            )
+            self._append_log("[DEGRADATION] Historicky preload nevratil zadna data.")
+            return
+
+        self._prediction_buffer = list(payload.predictions)
+        self._price_buffer = list(payload.prices)
+        self._y_true_buffer = [None] * len(payload.predictions)
+        self._tracked_timestamps = {str(ts) for ts in payload.timestamps}
+        self._append_log(f"[DEGRADATION] Nacteno {len(payload.predictions)} historickych baru")
+
+        if len(self._prediction_buffer) >= self.degradation_window_size:
+            self._update_degradation_diagnostics()
+            self._last_degradation_check = len(self._prediction_buffer)
+        else:
+            self.degradation_console.setPlainText(
+                f"Nacteno {len(self._prediction_buffer)} baru (potreba {self.degradation_window_size})"
+            )
+
+    def _on_degradation_preload_error(self, req_id: int, message: str) -> None:
+        if req_id != self._degradation_request_id:
+            return
+        self._append_log(f"[ERROR] Preload historickych dat selhal: {message}")
+        self.degradation_console.setPlainText(
+            f"Preload historickych dat selhal: {message}\n\n"
+            f"Diagnostika bude dostupna po nacteni {self.degradation_window_size} live baru."
+        )
+
+    def _on_degradation_preload_finished(self, req_id: int) -> None:
+        if req_id == self._degradation_request_id:
+            self._degradation_worker = None
+
+    @Slot(dict)
+    def _on_bar_closed(self, bar: dict) -> None:
+        ts_raw = bar.get("time")
+        close = float(bar.get("close", 0.0))
+        self._append_log(f"[BAR] {ts_raw} close={close}")
+
+        ts = pd.to_datetime(ts_raw, utc=True, errors="coerce")
+        if pd.isna(ts):
+            return
+        payload = {
+            "time": ts,
+            "open": float(bar.get("open", np.nan)),
+            "high": float(bar.get("high", np.nan)),
+            "low": float(bar.get("low", np.nan)),
+            "close": close,
+            "volume": float(bar.get("volume", 0) or 0),
+        }
+
+        key = int(ts.value)
+        idx = self._bar_index.get(key)
+        if idx is None:
+            self._bar_index[key] = len(self._bars)
+            self._bars.append(payload)
+        else:
+            self._bars[idx] = payload
+
+        if len(self._bars) > self.config.max_bars_buffer:
+            self._bars = self._bars[-self.config.max_bars_buffer:]
+            self._bar_index = {int(pd.to_datetime(x["time"]).value): i for i, x in enumerate(self._bars)}
+
+        row = {
+            "timestamp": ts,
+            "open": payload["open"],
+            "high": payload["high"],
+            "low": payload["low"],
+            "close": payload["close"],
+            "volume": payload["volume"],
+        }
+        self.live_df = pd.concat([self.live_df, pd.DataFrame([row])], ignore_index=True)
+        self.live_df.dropna(subset=["timestamp"], inplace=True)
+        self.live_df.drop_duplicates(subset=["timestamp"], keep="last", inplace=True)
+        self.live_df.sort_values("timestamp", inplace=True)
+        max_live_buffer = max(700, self.config.max_bars_buffer + 400)
+        if len(self.live_df) > max_live_buffer:
+            self.live_df = self.live_df.tail(max_live_buffer).reset_index(drop=True)
+
+        self._pending_bar_payloads.append(payload)
+        self._last_arrival_utc = pd.Timestamp.now(tz="UTC")
+        self._schedule_bar_refresh()
+
+    def _schedule_bar_refresh(self) -> None:
+        if self._bar_refresh_scheduled:
+            return
+        self._bar_refresh_scheduled = True
+        QTimer.singleShot(0, self._process_pending_bar_updates)
+
+    def _maybe_send_flip_email_on_last_bar(self) -> None:
+        try:
+            if self.config.alert_email_enabled and self._bars:
+                last = self._bars[-1]
+                sig = last.get("signal")
+                if sig in ("LONG", "SHORT"):
+                    bar_key = int(pd.to_datetime(last["time"]).value)
+                    if self._last_alert_bar_key is None or bar_key > self._last_alert_bar_key:
+                        prev = self._last_alert_sig
+                        if prev in ("LONG", "SHORT") and prev != sig:
+                            subj, body = self._format_flip_email(prev, sig, last["time"], float(last.get("close", float("nan"))))
+                            for addr in (self.config.alert_email_to or "").split(","):
+                                addr = addr.strip()
+                                if addr:
+                                    self._send_email_async(addr, subj, body)
+                        self._last_alert_sig = sig
+                        self._last_alert_bar_key = bar_key
+        except Exception:
+            pass
+
+    def _process_pending_bar_updates(self) -> None:
+        self._bar_refresh_scheduled = False
+        pending = self._pending_bar_payloads
+        self._pending_bar_payloads = []
+        if not pending:
+            return
+
+        try:
+            if self.warm is not None:
+                for payload in pending:
+                    self.warm.on_new_bar(payload)
+                self.lbl_mode.setText("Mode: LIVE" if self.warm.state == "LIVE" else "Mode: WARM-UP")
+            self._rescore_all()
+            self._maybe_alert_flip_on_last_bar()
+            self._maybe_send_flip_email_on_last_bar()
+        except Exception as e:
+            self._append_log(f"[WARN] Re-score selhal: {e}")
+
+        self._update_freshness()
+        self._render_charts()
+        if self._pending_bar_payloads:
+            self._schedule_bar_refresh()
+
+    def _apply_bootstrap_payload(self, payload: LiveBootstrapPayload, *, source_label: str) -> None:
+        self._bars = list(payload.bars or [])
+        self._bar_index = {
+            int(pd.to_datetime(bar["time"]).value): idx
+            for idx, bar in enumerate(self._bars)
+            if pd.notna(pd.to_datetime(bar.get("time"), utc=True, errors="coerce"))
+        }
+        if isinstance(payload.live_df, pd.DataFrame):
+            self.live_df = payload.live_df.copy()
+        else:
+            self.live_df = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+        changed = 0
+        for idx, label_map in enumerate(payload.label_maps or []):
+            if idx >= len(self.models) or not label_map:
+                continue
+            self.models[idx]["label_map"] = dict(label_map)
+            changed += 1
+
+        if payload.snapshot_bars > 0:
+            self._append_log(f"[INFO] Nacten {source_label}: {payload.snapshot_bars} baru.")
+            if payload.bars:
+                try:
+                    first_ts = pd.to_datetime(payload.bars[0].get("time"), utc=True, errors="coerce")
+                    last_ts = pd.to_datetime(payload.bars[-1].get("time"), utc=True, errors="coerce")
+                    self._append_log(f"[INFO] Snapshot rozsah: {first_ts} -> {last_ts}")
+                except Exception:
+                    pass
+            self._last_arrival_utc = pd.Timestamp.now(tz="UTC")
+            try:
+                self._rescore_all()
+            except Exception as e:
+                self._append_log(f"[WARN] Re-score snapshotu selhal: {e}")
+            self._update_freshness()
+            self._render_charts()
+        else:
+            self._append_log(f"[WARN] {source_label.capitalize()} prazdny.")
+
+        self._append_log(f"[AUTO] Per-model mapy trid nastaveny pro {changed}/{len(self.models)} modelu.")
+
+    def _local_snapshot_interval_tokens(self) -> tuple[str, ...]:
+        tf = (self.cmb_interval.currentText() or getattr(self.config, "bar_size", "1 hour") or "1 hour").strip().lower()
+        mapping = {
+            "5 min": ("5m", "5min", "5_min"),
+            "15 min": ("15m", "15min", "15_min"),
+            "30 min": ("30m", "30min", "30_min"),
+            "1 hour": ("1hour", "1_hour", "60m", "60min", "1h"),
+        }
+        return mapping.get(tf, tuple(part for part in tf.replace(" ", "").split(";") if part))
+
+    def _local_snapshot_symbol_tokens(self) -> tuple[str, ...]:
+        raw_tokens = {
+            str(self.ed_symbol.text() or "").strip().lower(),
+            str(getattr(self.config, "symbol", "") or "").strip().lower(),
+            str(self.ed_expiry.text() or "").strip().lower(),
+            str(getattr(self.config, "exchange", "") or "").strip().lower(),
+        }
+        raw_tokens.discard("")
+        if raw_tokens & {"gold", "gc"}:
+            raw_tokens.update({"gold", "gc", "comex", "tvc"})
+        return tuple(sorted(raw_tokens))
+
+    def _find_local_snapshot_csv(self) -> Path | None:
+        raw_dir = Path(__file__).resolve().parents[1] / "data" / "raw"
+        if not raw_dir.exists():
+            return None
+
+        files = [p for p in raw_dir.glob("*.csv") if p.is_file()]
+        if not files:
+            return None
+
+        interval_tokens = self._local_snapshot_interval_tokens()
+        symbol_tokens = self._local_snapshot_symbol_tokens()
+
+        def _score(path: Path) -> tuple[int, int, int]:
+            stem = path.stem.lower()
+            interval_score = 1 if any(tok and tok in stem for tok in interval_tokens) else 0
+            symbol_score = 1 if any(tok and tok in stem for tok in symbol_tokens) else 0
+            try:
+                mtime_ns = int(path.stat().st_mtime_ns)
+            except OSError:
+                mtime_ns = 0
+            return (interval_score + symbol_score, interval_score, mtime_ns)
+
+        files.sort(key=_score, reverse=True)
+        return files[0] if files else None
+
+    def _load_local_snapshot_payload(self, csv_path: Path) -> LiveBootstrapPayload | None:
+        df = pd.read_csv(
+            csv_path,
+            encoding="utf-8",
+            engine="python",
+            usecols=lambda c: c in {"date", "timestamp", "time", "open", "high", "low", "close", "volume"},
+        )
+        if df is None or df.empty:
+            return None
+
+        time_col = next((col for col in ("timestamp", "time", "date") if col in df.columns), None)
+        required_cols = {"open", "high", "low", "close"}
+        if time_col is None or not required_cols.issubset(df.columns):
+            return None
+
+        if "volume" not in df.columns:
+            df["volume"] = 0.0
+        payload = _build_live_bootstrap_payload_from_history_df(
+            df.rename(columns={time_col: "time"}),
+            self.models,
+            max_bars_buffer=int(self.config.max_bars_buffer),
+        )
+        if int(payload.snapshot_bars or 0) < 1:
+            return None
+        return payload
+
+    def _try_seed_local_snapshot(self) -> bool:
+        csv_path = self._find_local_snapshot_csv()
+        if csv_path is None:
+            self._append_log("[WARN] Lokalni CSV fallback nebyl nalezen.")
+            return False
+
+        try:
+            payload = self._load_local_snapshot_payload(csv_path)
+        except Exception as e:
+            self._append_log(f"[WARN] Lokalni CSV fallback selhal ({csv_path.name}): {e}")
+            return False
+
+        if payload is None or int(payload.snapshot_bars or 0) < 2:
+            self._append_log(f"[WARN] Lokalni CSV fallback nema dost baru: {csv_path.name}")
+            return False
+
+        self._apply_bootstrap_payload(payload, source_label=f"lokalni snapshot {csv_path.name}")
+        return True
+
+    def _apply_market_context_from_model_paths(self, paths: list[str]) -> None:
+        for raw_path in paths:
+            model_path = str(raw_path or "").strip()
+            if not model_path:
+                continue
+            try:
+                meta = read_sidecar_model_meta(model_path)
+            except Exception:
+                continue
+            context = live_market_context_from_model_meta(meta)
+            if not isinstance(context, dict):
+                continue
+
+            symbol = str(context.get("symbol") or "").strip()
+            exchange = str(context.get("exchange") or "").strip()
+            bar_size = str(context.get("bar_size") or "").strip()
+            if symbol and self.ed_symbol.text().strip() != symbol:
+                self.ed_symbol.setText(symbol)
+            if exchange and self.ed_expiry.text().strip() != exchange:
+                self.ed_expiry.setText(exchange)
+            if bar_size:
+                idx = self.cmb_interval.findText(bar_size)
+                if idx >= 0 and self.cmb_interval.currentIndex() != idx:
+                    self.cmb_interval.setCurrentIndex(idx)
+
+            self.config.symbol = symbol or self.config.symbol
+            self.config.exchange = exchange or self.config.exchange
+            self.config.bar_size = bar_size or self.config.bar_size
+            self._append_log(
+                f"[MODEL] TradingView session synchronizovana z metadata: "
+                f"{self.config.symbol} / {self.config.exchange} / {self.config.bar_size}"
+            )
+            return
+
+    def set_model_paths(self, paths: str | list[str]) -> None:
+        if isinstance(paths, str):
+            items = [paths]
+        else:
+            items = [str(path).strip() for path in (paths or []) if str(path).strip()]
+        text = ";".join(items)
+        if text and self.le_model_path.text() != text:
+            self.le_model_path.setText(text)
+        if items:
+            self._apply_market_context_from_model_paths(items)
+
+def live_interval_label_from_model_timeframe(timeframe: str | None) -> str | None:
+    raw = str(timeframe or "").strip().lower().replace(" ", "")
+    mapping = {
+        "5m": "5 min",
+        "5min": "5 min",
+        "15m": "15 min",
+        "15min": "15 min",
+        "30m": "30 min",
+        "30min": "30 min",
+        "1h": "1 hour",
+        "1hour": "1 hour",
+        "60m": "1 hour",
+        "60min": "1 hour",
+    }
+    return mapping.get(raw)
+
+def live_tradingview_market_from_model(symbol: str | None, exchange: str | None) -> tuple[str | None, str | None]:
+    raw_symbol = str(symbol or "").strip().upper() or None
+    raw_exchange = str(exchange or "").strip().upper() or None
+    tv_mapping = {
+        ("GC", "COMEX"): ("GOLD", "TVC"),
+    }
+    return tv_mapping.get((raw_symbol, raw_exchange), (raw_symbol, raw_exchange))
+
+def live_market_context_from_model_meta(meta: dict[str, Any] | None) -> dict[str, str] | None:
+    if not isinstance(meta, dict):
+        return None
+    symbol, exchange = live_tradingview_market_from_model(
+        meta.get("instrument"),
+        meta.get("exchange"),
+    )
+    bar_size = live_interval_label_from_model_timeframe(meta.get("timeframe"))
+    if not symbol or not exchange or not bar_size:
+        return None
+    return {
+        "symbol": symbol,
+        "exchange": exchange,
+        "bar_size": bar_size,
+    }
+
 class LiveTradingBotTab(LiveBotWidget):
     pass
 

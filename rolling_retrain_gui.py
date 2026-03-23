@@ -183,6 +183,7 @@ class RollingRetrainGUI(QWidget):
                     holdout_bars=len(test_prepared),
                     fee_per_trade=0.0,
                     slippage_bps=0.0,
+                    label_lookahead_bars=1,
                     mc_enabled=False,
                     annualize_sharpe=True,
                 )

@@ -2,6 +2,8 @@
 # 🟦 Modul pro walk-forward validaci a export datasetů
 
 import os
+from pathlib import Path
+import json
 
 import pandas as pd
 
@@ -64,6 +66,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import GridSearchCV, StratifiedKFold
 from xgboost import XGBClassifier
 
+from ibkr_trading_bot.core.services.model_service import runtime_python_version, runtime_sklearn_version
 from ibkr_trading_bot.features.augmentations import add_noise, mix_dataframes, roll_shift
 from ibkr_trading_bot.features.feature_engineering import prepare_dataset_with_targets
 from ibkr_trading_bot.utils.io_helpers import load_dataframe
@@ -360,13 +363,31 @@ def train_simple_model(features_csv: str, model_out: str) -> str:
     if const_cols:
         X = X.drop(columns=const_cols)
 
-    model = RandomForestClassifier(n_estimators=200, max_depth=10, random_state=42, n_jobs=-1)
+    model = RandomForestClassifier(n_estimators=200, max_depth=10, random_state=42, n_jobs=1)
     model.fit(X, y)
 
     out_dir = os.path.dirname(model_out)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    joblib.dump({"model": model, "features": list(X.columns), "decision_threshold": 0.5}, model_out)
+    payload = {"model": model, "features": list(X.columns), "decision_threshold": 0.5}
+    joblib.dump(payload, model_out)
+
+    model_path = Path(model_out)
+    meta_path = model_path.with_name(model_path.stem + "_meta.json")
+    meta = {
+        "created_at": pd.Timestamp.utcnow().strftime("%Y-%m-%dT%H:%M:%S"),
+        "created_at_iso": pd.Timestamp.utcnow().isoformat(),
+        "trained_features": list(X.columns),
+        "model_classes": [str(c) for c in list(getattr(model, "classes_", []))],
+        "decision_threshold": 0.5,
+        "metrics": {},
+        "sklearn_version": runtime_sklearn_version(),
+        "python_version": runtime_python_version(),
+        "schema_version": 1,
+    }
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Model ulozen: {model_out} | n_features={X.shape[1]}")
+    return model_out
 
     print(f"✅ Model uložen: {model_out} | n_features={X.shape[1]}")
     return model_out
@@ -517,5 +538,3 @@ def split_by_calendar_days(
         raise ValueError("Po očištění nezbyly žádné featury pro train/test.")
 
     return X_train, y_train, X_test, y_test
-
-

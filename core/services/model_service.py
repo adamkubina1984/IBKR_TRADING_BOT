@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,69 @@ class LoadedModel:
     path: Path
     sha1: str
     size: int
+    version_warning: str | None = None
+
+
+def runtime_python_version() -> str:
+    return sys.version.split()[0]
+
+
+def runtime_sklearn_version() -> str | None:
+    try:
+        import sklearn
+
+        return str(sklearn.__version__)
+    except Exception:
+        return None
+
+
+def build_sklearn_version_warning(meta: dict[str, Any] | None, *, model_path: str | Path | None = None) -> str | None:
+    if not isinstance(meta, dict):
+        return None
+
+    stored = str(meta.get("sklearn_version") or "").strip()
+    current = str(runtime_sklearn_version() or "").strip()
+    if not stored or not current or stored == current:
+        return None
+
+    model_label = Path(model_path).name if model_path else "model"
+    return (
+        f"scikit-learn mismatch for {model_label}: "
+        f"model={stored}, runtime={current}. Compatibility is not guaranteed."
+    )
+
+
+def model_sidecar_meta_path(model_path: str | Path) -> Path:
+    p = Path(model_path).expanduser().resolve()
+    return p.with_name(p.stem + "_meta.json")
+
+
+def read_sidecar_model_meta(model_path: str | Path) -> dict[str, Any]:
+    meta_path = model_sidecar_meta_path(model_path)
+    if not meta_path.exists():
+        return {}
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.warning("Cannot read metadata %s: %s", meta_path, e)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def merge_model_metadata(embedded: dict[str, Any] | None, sidecar: dict[str, Any] | None) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    if isinstance(embedded, dict):
+        merged.update(embedded)
+    if isinstance(sidecar, dict):
+        merged.update(sidecar)
+    return merged
+
+
+def write_sidecar_model_meta(model_path: str | Path, meta: dict[str, Any]) -> Path:
+    meta_path = model_sidecar_meta_path(model_path)
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    return meta_path
 
 def _sha1_file(path: Path, buf_size: int = 1024 * 1024) -> str:
     h = hashlib.sha1()
@@ -44,7 +108,7 @@ def load_model_with_meta(model_path: str | Path) -> LoadedModel:
 
     # metadata file search: <stem>_meta.json or sibling model_meta.json
     meta = {}
-    candidates = [p.with_name(p.stem + "_meta.json")]
+    candidates = [model_sidecar_meta_path(p)]
     if p.is_file():
         candidates.append(p.parent / "model_meta.json")
     for cand in candidates:
@@ -70,12 +134,16 @@ def load_model_with_meta(model_path: str | Path) -> LoadedModel:
         elif hasattr(predictor, "feature_names_in_"):
             meta["trained_features"] = list(getattr(predictor, "feature_names_in_"))
 
+    version_warning = build_sklearn_version_warning(meta, model_path=p)
+    if version_warning:
+        log.warning(version_warning)
+
     log.info(
         "Model loaded | path=%s | size=%.1f kB | sha1=%s | classes=%s | n_features=%s",
         str(p), size / 1024.0, sha1, meta.get("model_classes"), len(meta.get("trained_features", [])),
     )
 
-    return LoadedModel(model=model, meta=meta, path=p, sha1=sha1, size=size)
+    return LoadedModel(model=model, meta=meta, path=p, sha1=sha1, size=size, version_warning=version_warning)
 
 def save_model_with_meta(
     model,
@@ -127,9 +195,10 @@ def save_model_with_meta(
         "trained_features": feats or [],
         "model_classes": classes or [],
         "metrics": metrics or {},
+        "sklearn_version": runtime_sklearn_version(),
+        "python_version": runtime_python_version(),
         "schema_version": 1,
     }
     p_meta = p.with_name(p.stem + "_meta.json")
     p_meta.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     return str(p), str(p_meta)
-

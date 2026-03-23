@@ -22,6 +22,8 @@ python -m venv .venv
 
 pip install -r requirements.txt
 
+\# Po změně pinu scikit-learn obnov virtuální prostředí nebo proveď čistý reinstall závislostí.
+
 
 
 \# 3) Generování featur z historických dat (CSV se sloupci: timestamp, open/high/low/close/volume)
@@ -45,6 +47,5 @@ python -m ibkr\_trading\_bot.main evaluate --model model\_outputs/model.pkl --fe
 \# 6) Spuštění desktop GUI
 
 python -m ibkr\_trading\_bot.main gui
-
 
 

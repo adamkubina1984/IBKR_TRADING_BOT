@@ -3,6 +3,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 
+from ibkr_trading_bot.core.services.futures_roll_chain_service import validate_training_dataset_metadata
 from ibkr_trading_bot.features.feature_engineering import prepare_dataset_with_targets
 from ibkr_trading_bot.labels import make_triple_barrier_labels
 from ibkr_trading_bot.labels.triple_barrier import make_triple_barrier_labels_ternary
@@ -33,6 +34,7 @@ class DatasetService:
         horizon: int = 12,
         take_profit_bps: float = 60.0,
         stop_loss_bps: float = 40.0,
+        same_bar_policy: Literal["neutral", "tp", "sl", "close"] = "neutral",
         fee_per_trade: float = 0.0,
         slippage_bps: float = 0.0,
         dropna_minimal: bool = True,
@@ -41,6 +43,7 @@ class DatasetService:
     ) -> pd.DataFrame:
 
         # --- 1) načtení
+        validate_training_dataset_metadata(path)
         raw = load_dataframe(path)
 
         # --- 2) timestamp normalizace (UTC) + sort
@@ -84,6 +87,7 @@ class DatasetService:
                     horizon=horizon,
                     take_profit_bps=take_profit_bps,
                     stop_loss_bps=stop_loss_bps,
+                    same_bar_policy=same_bar_policy,
                 )
             else:
                 tb = make_triple_barrier_labels(

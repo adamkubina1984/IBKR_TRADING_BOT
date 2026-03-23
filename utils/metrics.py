@@ -307,6 +307,20 @@ def calculate_metrics(
     out["f1_macro_3"]  = f1_macro_3
     out["f1_weighted_3"] = f1_weighted_3
 
+    # For ternary tasks expose true 3-class metrics as primary keys.
+    uniq3 = set(np.unique(np.concatenate([yt, yp])).tolist())
+    is_ternary_task = uniq3.issubset({-1, 0, 1}) and len(uniq3) >= 3
+    if is_ternary_task:
+        out["accuracy_binary"] = out["accuracy"]
+        out["precision_binary"] = out["precision"]
+        out["recall_binary"] = out["recall"]
+        out["f1_binary"] = out["f1"]
+        out["accuracy"] = float((yt == yp).mean())
+        out["precision"] = float(np.nanmean(np.asarray(prec3, dtype=float)))
+        out["recall"] = float(np.nanmean(np.asarray(rec3, dtype=float)))
+        out["f1"] = float(f1_macro_3)
+        out["signals"] = int((yp != 0).sum())
+
     # ---------- trading metriky (pokud máme ceny)
     px = _pick_price_series(df)
     sharpe_ann = None

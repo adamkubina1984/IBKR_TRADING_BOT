@@ -7,6 +7,7 @@ Nové: download_ibkr_by_date_range() - stahování od data Do do teď po 5000 z�
 """
 
 import argparse
+import asyncio
 import os
 import shutil
 import tempfile
@@ -14,7 +15,25 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
-from ib_insync import IB, Future, ContFuture, util
+
+
+def _ensure_thread_event_loop() -> tuple[asyncio.AbstractEventLoop, bool]:
+    """
+    ib_insync expects an asyncio event loop even in worker threads.
+    QThread-backed workers do not have one by default on Python 3.10+.
+    """
+    try:
+        return asyncio.get_event_loop(), False
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop, True
+
+
+def _import_ib_insync():
+    from ib_insync import IB, Future, ContFuture, util
+
+    return IB, Future, ContFuture, util
 
 
 def download_ibkr_by_date_range(
@@ -50,6 +69,8 @@ def download_ibkr_by_date_range(
     Returns:
         Cesta k finálnímu sloučenému CSV souboru
     """
+    loop, created_loop = _ensure_thread_event_loop()
+    IB, Future, ContFuture, util = _import_ib_insync()
     if end_date is None:
         end_date = datetime.now()
     
@@ -73,6 +94,7 @@ def download_ibkr_by_date_range(
             # Map GOLD/TVC to COMEX gold future GC (example expiry 202602)
             expiry_used = expiry or "202602"
             contract = Future("GC", expiry_used, "COMEX", currency="USD")
+            contract.includeExpired = True
             what_to_show = "TRADES"
         else:
             if contract_mode.upper() == "CONT":
@@ -82,6 +104,7 @@ def download_ibkr_by_date_range(
                 if not expiry:
                     raise ValueError("Expirace (--expiry) je povinná pro kontrakty FUT")
                 contract = Future(symbol, expiry, "COMEX", currency="USD")
+                contract.includeExpired = True
                 what_to_show = "TRADES"
         
         ib.qualifyContracts(contract)
@@ -100,6 +123,7 @@ def download_ibkr_by_date_range(
                 getattr(contract, "exchange", "COMEX"),
                 currency=getattr(contract, "currency", "USD"),
             )
+            contract.includeExpired = True
             ib.qualifyContracts(contract)
 
         # Stahování po batchích
@@ -213,7 +237,13 @@ def download_ibkr_by_date_range(
         # Uložení
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         bar_tag = bar_size.replace(" ", "").replace("mins", "m")
-        fname = f"{symbol}_{bar_tag}_{len(df_merged)}bars_{start_date.strftime('%Y%m%d')}_{timestamp}.csv"
+        if contract_mode.upper() == "FUT" and expiry:
+            fname = (
+                f"{symbol}_{expiry}_{bar_tag}_{len(df_merged)}bars_"
+                f"{start_date.strftime('%Y%m%d')}_{timestamp}.csv"
+            )
+        else:
+            fname = f"{symbol}_{bar_tag}_{len(df_merged)}bars_{start_date.strftime('%Y%m%d')}_{timestamp}.csv"
         output_path = Path(output_dir) / fname
         
         # Formát: date,open,high,low,close,volume
@@ -237,12 +267,29 @@ def download_ibkr_by_date_range(
         return str(output_path)
     
     finally:
-        ib.disconnect()
+        try:
+            ib.disconnect()
+        finally:
+            if created_loop:
+                try:
+                    loop.stop()
+                except Exception:
+                    pass
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+                try:
+                    asyncio.set_event_loop(None)
+                except Exception:
+                    pass
 
 
 
 
 def download_data(symbol: str, expiry: str, days_back: int, bar_size: str, output_dir: str = "data/raw"):
+    loop, created_loop = _ensure_thread_event_loop()
+    IB, Future, _ContFuture, util = _import_ib_insync()
     # Připojení k IB Gateway
     ib = IB()
     ib.connect('127.0.0.1', 7496, clientId=1)
@@ -311,7 +358,22 @@ def download_data(symbol: str, expiry: str, days_back: int, bar_size: str, outpu
     else:
         print("❌ Nepodařilo se stáhnout žádná data.")
 
-    ib.disconnect()
+    try:
+        ib.disconnect()
+    finally:
+        if created_loop:
+            try:
+                loop.stop()
+            except Exception:
+                pass
+            try:
+                loop.close()
+            except Exception:
+                pass
+            try:
+                asyncio.set_event_loop(None)
+            except Exception:
+                pass
 
 
 # Volitelně: samostatné spouštění pro test

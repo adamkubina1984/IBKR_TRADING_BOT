@@ -7,6 +7,23 @@ import pandas as pd
 from matplotlib.patches import Rectangle
 
 
+def _is_datetime_like_series(s: pd.Series) -> bool:
+    try:
+        return bool(
+            pd.api.types.is_datetime64_any_dtype(s)
+            or pd.api.types.is_datetime64tz_dtype(s)
+        )
+    except Exception:
+        return False
+
+
+def _is_numeric_like_series(s: pd.Series) -> bool:
+    try:
+        return bool(pd.api.types.is_numeric_dtype(s))
+    except Exception:
+        return False
+
+
 class Plotting:
     def candle_macd(self, df):
         # Placeholder: zachováváme stávající kreslení v GUI; tohle je připravené API pro pozdější přesun
@@ -60,7 +77,9 @@ class Plotting:
 
         # převod na datetime (podpora epoch s/ms i textu)
         try:
-            if np.issubdtype(ts.dtype, np.number):
+            if _is_datetime_like_series(ts):
+                ts_parsed = pd.to_datetime(ts, errors="coerce", utc=False)
+            elif _is_numeric_like_series(ts):
                 maxv = float(np.nanmax(ts.values))
                 unit = "ms" if maxv > 1e12 else "s"
                 ts_parsed = pd.to_datetime(ts, unit=unit, errors="coerce", utc=False)
@@ -311,13 +330,16 @@ class Plotting:
 def _parse_time_series(s: pd.Series) -> pd.DatetimeIndex:
     """Bezpečně naparsuje různé formáty času (stringy, epoch s/ms/ns). Vrací UTC DatetimeIndex."""
     s = s.dropna()
+    if _is_datetime_like_series(s):
+        dt = pd.to_datetime(s, errors="coerce", utc=True)
+        return pd.DatetimeIndex(dt)
     # stringy → standardně
     if s.dtype == "O":
         dt = pd.to_datetime(s, errors="coerce", utc=True)
         return pd.DatetimeIndex(dt)
 
     # numerické epochy (heuristika podle řádu)
-    if np.issubdtype(s.dtype, np.integer) or np.issubdtype(s.dtype, np.floating):
+    if _is_numeric_like_series(s):
         v = pd.Series(s.astype("float64"))
         # odhad řádu
         vmax = float(np.nanmax(v.values)) if len(v) else 0.0
@@ -493,4 +515,3 @@ def plot_candles(fig, ax, canvas, df: pd.DataFrame):
     ax.grid(True, alpha=0.3)
     fig.autofmt_xdate()
     canvas.draw_idle()
-

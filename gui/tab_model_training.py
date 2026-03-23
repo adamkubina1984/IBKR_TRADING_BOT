@@ -28,6 +28,13 @@ from PySide6.QtWidgets import (
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
 from ibkr_trading_bot.core.services.dataset_service import DatasetService
+from ibkr_trading_bot.core.services.futures_roll_chain_service import read_dataset_sidecar_meta
+from ibkr_trading_bot.core.services.model_training_service import (
+    compute_holdout_bars as runtime_compute_holdout_bars,
+    name_and_meta_from_csv as runtime_name_and_meta_from_csv,
+    run_training_job,
+    training_profile_for_mode,
+)
 from ibkr_trading_bot.model.train_models import (
     _model_dir,
     _select_feature_columns,
@@ -265,10 +272,21 @@ class AutoSearchWorker(QThread):
     @staticmethod
     def _normalize_search_profile(profile: str) -> str:
         p = str(profile or "").strip().lower()
-        return p if p in {"fast", "full"} else "fast"
+        return p if p in {"fast", "full", "weekly"} else "fast"
 
     def _build_spec(self) -> dict[str, Any]:
         # full keeps the original exhaustive search; fast trims redundant branches.
+        if self.search_profile == "weekly":
+            return {
+                "version": 1,
+                "search_profile": "weekly",
+                "quick_models": ["lgb", "hgbt", "xgb", "et", "rf"],
+                "criteria": ["profit_first"],
+                "label_horizon_bars": [8, 12, 16],
+                "label_tp_bps": [40.0, 50.0, 60.0],
+                "label_sl_bps": [40.0, 50.0, 60.0],
+                "promote_top_k": 10,
+            }
         if self.search_profile == "full":
             return {
                 "version": 1,
@@ -426,158 +444,21 @@ class AutoSearchWorker(QThread):
         horizon = int(cfg.get("horizon", 12))
         tp_bps = float(cfg.get("tp_bps", 50.0))
         sl_bps = float(cfg.get("sl_bps", 50.0))
-
-        svc = DatasetService()
-        df = svc.prepare_from_csv(
-            self.csv_path,
-            labeling="triple_barrier",
-            target_mode="ternary",
-            horizon=int(horizon),
-            take_profit_bps=float(tp_bps),
-            stop_loss_bps=float(sl_bps),
-            same_bar_policy="neutral",
-        ).sort_values("timestamp").reset_index(drop=True)
-
-        n_total = int(len(df))
-        n_hold = self._compute_holdout_bars(
-            n_total=n_total,
-            pct=self.holdout_pct,
-            min_bars=self.holdout_min_bars,
-            max_bars=self.holdout_max_bars,
+        return run_training_job(
+            csv_path=self.csv_path,
+            holdout_pct=float(self.holdout_pct),
+            holdout_min_bars=int(self.holdout_min_bars),
+            holdout_max_bars=int(self.holdout_max_bars),
+            phase=phase,
+            estimator_name=estimator_name,
+            criterion=criterion,
+            horizon=horizon,
+            tp_bps=tp_bps,
+            sl_bps=sl_bps,
+            candidate_top_n=int(self.candidate_top_n),
+            candidate_fresh_ratio=float(self.candidate_fresh_ratio),
+            training_profile=dict(self.training_profiles.get(phase) or {}),
         )
-        n_train = int(max(0, n_total - n_hold))
-        name_prefix, meta_extra = self._name_and_meta_from_csv(self.csv_path, n_total, n_train, n_hold)
-
-        profile = dict(self.training_profiles.get(phase) or {})
-        profile["training_mode"] = phase
-        profile["candidate_chain_enabled"] = True
-        profile["candidate_selection_criterion"] = criterion
-        profile["candidate_top_n"] = int(self.candidate_top_n)
-        profile["candidate_fresh_ratio"] = float(self.candidate_fresh_ratio)
-
-        tf = str((meta_extra.get("timeframe") or "")).lower()
-        mc_block = 100
-        if tf in ("5min", "5m"):
-            mc_block = 40
-        elif tf in ("15min", "15m"):
-            mc_block = 80
-        elif tf in ("30min", "30m"):
-            mc_block = 120
-        elif tf in ("1hour", "1h"):
-            mc_block = 150
-        profile["mc_block_len"] = int(mc_block)
-
-        meta_extra["mc_block_len"] = int(mc_block)
-        meta_extra["label_horizon_bars"] = int(horizon)
-        meta_extra["label_take_profit_bps"] = float(tp_bps)
-        meta_extra["label_stop_loss_bps"] = float(sl_bps)
-        meta_extra["label_same_bar_policy"] = "neutral"
-        meta_extra["label_lookahead_bars"] = int(horizon)
-        meta_extra["holdout_mode"] = "pct"
-        meta_extra["holdout_pct"] = float(self.holdout_pct)
-        meta_extra["holdout_min_bars"] = int(self.holdout_min_bars)
-        meta_extra["holdout_max_bars"] = int(self.holdout_max_bars)
-        meta_extra["training_mode"] = phase
-        meta_extra["training_profile"] = dict(profile)
-
-        started_ts = pd.Timestamp.now(tz="UTC").timestamp()
-        model_path = ""
-        meta_path = ""
-        meta_obj: dict[str, Any] = {}
-        status = "ok"
-        err_msg = ""
-
-        try:
-            train_and_evaluate_model(
-                df,
-                estimator_name=estimator_name,
-                param_grid=None,
-                on_progress=None,
-                n_splits=int(profile.get("n_splits", 5)),
-                holdout_bars=int(n_hold),
-                holdout_pct=float(self.holdout_pct),
-                holdout_min_bars=int(self.holdout_min_bars),
-                holdout_max_bars=int(self.holdout_max_bars),
-                name_prefix=name_prefix,
-                meta_extra=meta_extra,
-                mc_enabled=bool(profile.get("mc_enabled", True)),
-                mc_iters=int(profile.get("mc_iters", 200)),
-                mc_block_len=int(profile.get("mc_block_len", 100)),
-                annualize_sharpe=True,
-                top_k_features=int(profile.get("top_k_features", 12)),
-                label_lookahead_bars=int(horizon),
-                quality_gate_enabled=bool(profile.get("quality_gate_enabled", True)),
-                quality_gate_hard_reject=bool(profile.get("quality_gate_hard_reject", True)),
-                quality_min_trades=int(profile.get("quality_min_trades", 8)),
-                quality_min_side_recall=float(profile.get("quality_min_side_recall", 0.01)),
-                quality_require_mc_nonnegative=bool(profile.get("quality_require_mc_nonnegative", True)),
-                quality_min_mc_sharpe_p50=float(profile.get("quality_min_mc_sharpe_p50", -0.02)),
-                quality_min_profit_net=float(profile.get("quality_min_profit_net", 0.0)),
-                quality_min_holdout_sharpe=float(profile.get("quality_min_holdout_sharpe", 0.0)),
-                max_param_candidates=profile.get("max_param_candidates"),
-                param_sample_seed=int(profile.get("param_sample_seed", 42)),
-                training_mode=phase,
-                candidate_chain_enabled=True,
-                candidate_selection_criterion=str(criterion),
-                candidate_top_n=int(self.candidate_top_n),
-                candidate_fresh_ratio=float(self.candidate_fresh_ratio),
-            )
-        except Exception as e:
-            status = "rejected" if "QUALITY_GATE_REJECT" in str(e) else "error"
-            err_msg = str(e)
-            m = re.search(r"\|\s*diag_meta=(.+)$", err_msg)
-            if m:
-                mp = m.group(1).strip().strip('"').strip("'")
-                p = Path(mp)
-                if p.exists():
-                    meta_path = p.as_posix()
-                    try:
-                        meta_obj = jsonlib.loads(p.read_text(encoding="utf-8"))
-                    except Exception:
-                        meta_obj = {}
-
-        if not meta_obj:
-            out_dir = Path(_model_dir())
-            patt = f"{name_prefix}_{estimator_name}_*.pkl"
-            files = [p for p in out_dir.glob(patt) if p.stat().st_mtime >= (started_ts - 3.0)]
-            if files:
-                latest = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[0]
-                model_path = latest.as_posix()
-                mp = latest.with_name(latest.stem + "_meta.json")
-                if mp.exists():
-                    meta_path = mp.as_posix()
-                    try:
-                        meta_obj = jsonlib.loads(mp.read_text(encoding="utf-8"))
-                    except Exception:
-                        meta_obj = {}
-
-        mh = self._meta_metrics(meta_obj)
-        try:
-            qg = (meta_obj.get("quality_gate") or {}) if isinstance(meta_obj, dict) else {}
-            qg_reasons = list(qg.get("reasons") or []) if isinstance(qg, dict) else []
-        except Exception:
-            qg_reasons = []
-
-        return {
-            "phase": phase,
-            "model": estimator_name,
-            "criterion": criterion,
-            "horizon": int(horizon),
-            "tp_bps": float(tp_bps),
-            "sl_bps": float(sl_bps),
-            "status": status,
-            "error": err_msg,
-            "model_path": model_path,
-            "meta_path": meta_path,
-            "profit_net": mh.get("profit_net"),
-            "sharpe": mh.get("sharpe"),
-            "pf": mh.get("pf"),
-            "trades": mh.get("trades", mh.get("num_trades")),
-            "num_trades_short": mh.get("num_trades_short"),
-            "num_trades_long": mh.get("num_trades_long"),
-            "qg_reasons": qg_reasons,
-            "created_at": self._now_str(),
-        }
 
     def run(self):
         try:
@@ -671,6 +552,7 @@ class ModelTrainingTab(QWidget):
         root.setSpacing(10)
 
         box1 = QGroupBox("1) Nacteni dat pro trenink")
+        box1.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         lay1 = QHBoxLayout(box1)
         self.lbl_csv = QLabel("Vybrany soubor: -")
         self.btn_csv = QPushButton("Vybrat CSV...")
@@ -680,27 +562,25 @@ class ModelTrainingTab(QWidget):
         lay1.addWidget(self.btn_csv)
         root.addWidget(box1)
 
-        box2 = QGroupBox("2) Trenovani modelu")
+        box2 = QGroupBox("2) Auto-search modelu")
+        box2.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         lay2 = QVBoxLayout(box2)
 
         row = QHBoxLayout()
-        row.addWidget(QLabel("Model:"))
         self.cmb_model = QComboBox()
         self.cmb_model.addItems(["hgbt", "rf", "et", "xgb", "lgb", "svm"])
-        row.addWidget(self.cmb_model)
-        row.addWidget(QLabel("Rezim:"))
+        self.cmb_model.hide()
         self.cmb_training_mode = QComboBox()
         self.cmb_training_mode.addItems(["quick", "standard", "strict"])
         self.cmb_training_mode.setCurrentText("standard")
         self.cmb_training_mode.currentTextChanged.connect(lambda _: self._refresh_train_button_text())
-        row.addWidget(self.cmb_training_mode)
-        row.addWidget(QLabel("Kriterium kandidatu:"))
+        self.cmb_training_mode.hide()
         self.cmb_candidate_criterion = QComboBox()
         self.cmb_candidate_criterion.addItems(
             ["balanced", "profit_first", "robustness_first", "recall_balance"]
         )
         self.cmb_candidate_criterion.setCurrentText("balanced")
-        row.addWidget(self.cmb_candidate_criterion)
+        self.cmb_candidate_criterion.hide()
         row.addWidget(QLabel("Top N:"))
         self.cmb_candidate_top_n = QComboBox()
         self.cmb_candidate_top_n.addItems(["3", "5", "8", "12"])
@@ -713,7 +593,7 @@ class ModelTrainingTab(QWidget):
         row.addWidget(self.cmb_candidate_fresh_pct)
         row.addWidget(QLabel("Auto profil:"))
         self.cmb_auto_search_profile = QComboBox()
-        self.cmb_auto_search_profile.addItems(["fast", "full"])
+        self.cmb_auto_search_profile.addItems(["fast", "full", "weekly"])
         self.cmb_auto_search_profile.setCurrentText("fast")
         row.addWidget(self.cmb_auto_search_profile)
         row.addStretch(1)
@@ -721,7 +601,7 @@ class ModelTrainingTab(QWidget):
         self.btn_train = QPushButton("Trenovat (standard)")
         self.btn_train.setEnabled(False)
         self.btn_train.clicked.connect(self.run_training)
-        row.addWidget(self.btn_train)
+        self.btn_train.hide()
         self.btn_auto_search = QPushButton("Auto-search (resume)")
         self.btn_auto_search.setEnabled(False)
         self.btn_auto_search.clicked.connect(self.run_auto_search)
@@ -734,14 +614,14 @@ class ModelTrainingTab(QWidget):
 
         self.prog = QProgressBar()
         self.prog.setRange(0, 1)
-        lay2.addWidget(self.prog)
+        self.prog.hide()
 
         self.tbl = QTableWidget(0, 4)
         self.tbl.setHorizontalHeaderLabels(["#", "mean score (CV)", "std", "params"])
         self.tbl.horizontalHeader().setStretchLastSection(True)
         self.tbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        lay2.addWidget(self.tbl, 1)
-        root.addWidget(box2, 2)
+        self.tbl.hide()
+        root.addWidget(box2)
 
         box3 = QGroupBox("3) Konzole")
         lay3 = QVBoxLayout(box3)
@@ -756,69 +636,7 @@ class ModelTrainingTab(QWidget):
         return txt if txt in {"quick", "standard", "strict"} else "standard"
 
     def _training_profile_for_mode(self, mode: str) -> dict[str, Any]:
-        m = (mode or "").strip().lower()
-        if m == "quick":
-            return {
-                "n_splits": 3,
-                "top_k_features": 8,
-                "max_param_candidates": 48,
-                "param_sample_seed": 42,
-                "mc_enabled": False,
-                "mc_iters": 80,
-                "quality_gate_enabled": False,
-                "quality_gate_hard_reject": False,
-                "quality_min_trades": 6,
-                "quality_min_side_recall": 0.005,
-                "quality_require_mc_nonnegative": False,
-                "quality_min_mc_sharpe_p50": -0.05,
-                "quality_min_profit_net": -50.0,
-                "quality_min_holdout_sharpe": -0.05,
-                "candidate_chain_enabled": True,
-                "candidate_selection_criterion": "balanced",
-                "candidate_top_n": 5,
-                "candidate_fresh_ratio": 0.30,
-            }
-        if m == "strict":
-            return {
-                "n_splits": 6,
-                "top_k_features": 14,
-                "max_param_candidates": 160,
-                "param_sample_seed": 42,
-                "mc_enabled": True,
-                "mc_iters": 300,
-                "quality_gate_enabled": True,
-                "quality_gate_hard_reject": True,
-                "quality_min_trades": 8,
-                "quality_min_side_recall": 0.01,
-                "quality_require_mc_nonnegative": True,
-                "quality_min_mc_sharpe_p50": 0.0,
-                "quality_min_profit_net": 120.0,
-                "quality_min_holdout_sharpe": 0.01,
-                "candidate_chain_enabled": True,
-                "candidate_selection_criterion": "balanced",
-                "candidate_top_n": 5,
-                "candidate_fresh_ratio": 0.30,
-            }
-        return {
-            "n_splits": 5,
-            "top_k_features": 12,
-            "max_param_candidates": 96,
-            "param_sample_seed": 42,
-            "mc_enabled": True,
-            "mc_iters": 300,
-            "quality_gate_enabled": True,
-            "quality_gate_hard_reject": True,
-            "quality_min_trades": 8,
-            "quality_min_side_recall": 0.01,
-            "quality_require_mc_nonnegative": True,
-            "quality_min_mc_sharpe_p50": -0.03,
-            "quality_min_profit_net": 60.0,
-            "quality_min_holdout_sharpe": 0.005,
-            "candidate_chain_enabled": True,
-            "candidate_selection_criterion": "balanced",
-            "candidate_top_n": 5,
-            "candidate_fresh_ratio": 0.30,
-        }
+        return training_profile_for_mode(mode)
 
     def _refresh_train_button_text(self):
         mode = self._current_training_mode()
@@ -881,19 +699,18 @@ class ModelTrainingTab(QWidget):
 
     def _current_auto_search_profile(self) -> str:
         txt = (self.cmb_auto_search_profile.currentText() or "").strip().lower()
-        return txt if txt in {"fast", "full"} else "fast"
+        return txt if txt in {"fast", "full", "weekly"} else "fast"
 
     def _compute_holdout_bars(self, n_total: int) -> int:
-        n = int(max(0, n_total))
-        pct = float(np.clip(float(self.holdout_pct_default), 0.0, 0.95))
-        n_hold = int(round(float(n) * pct))
-        n_hold = max(int(self.holdout_min_bars_default), n_hold)
-        n_hold = min(int(self.holdout_max_bars_default), n_hold)
-        n_hold = min(max(0, n_hold), max(n - 50, 0))
-        return int(n_hold)
+        return runtime_compute_holdout_bars(
+            int(n_total),
+            float(self.holdout_pct_default),
+            int(self.holdout_min_bars_default),
+            int(self.holdout_max_bars_default),
+        )
 
     def pick_csv(self):
-        base_dir = Path(__file__).resolve().parents[1] / "data" / "raw"
+        base_dir = Path(__file__).resolve().parents[1] / "data" / "processed"
         path, _ = QFileDialog.getOpenFileName(self, "Vyber CSV s daty", base_dir.as_posix(), "CSV Files (*.csv)")
         if not path:
             return
@@ -922,6 +739,20 @@ class ModelTrainingTab(QWidget):
                 f"tp_bps={float(self._label_take_profit_bps):.1f} "
                 f"sl_bps={float(self._label_stop_loss_bps):.1f} same_bar=neutral"
             )
+            dataset_meta = read_dataset_sidecar_meta(path)
+            if dataset_meta:
+                self.log.appendPlainText(
+                    "INFO Dataset meta: "
+                    f"kind={dataset_meta.get('dataset_kind')} "
+                    f"canonical={dataset_meta.get('canonical')} "
+                    f"quality={dataset_meta.get('quality_gate_passed')}"
+                )
+                if "prepared_retention_ratio" in dataset_meta:
+                    self.log.appendPlainText(
+                        "INFO Dataset quality: "
+                        f"prepared_ratio={float(dataset_meta.get('prepared_retention_ratio', 0.0)):.3f} "
+                        f"flat_zero_ratio={float((dataset_meta.get('quality_report') or {}).get('flat_zero_ratio', 0.0)):.3f}"
+                    )
             self.log.appendPlainText(f"OK Nacteno: {path} | radku={n_rows}")
             self._log_dataset_audit(df)
             self._set_controls_running(False)
@@ -1052,7 +883,7 @@ class ModelTrainingTab(QWidget):
         if not safe:
             safe = "dataset"
         profile_norm = str(profile or "").strip().lower()
-        if profile_norm not in {"fast", "full"}:
+        if profile_norm not in {"fast", "full", "weekly"}:
             profile_norm = "fast"
         state_dir = Path(_model_dir()) / "auto_search"
         prof_path = state_dir / f"{safe}_{profile_norm}_state.json"
@@ -1155,31 +986,7 @@ class ModelTrainingTab(QWidget):
         self._refresh_train_button_text()
 
     def _name_and_meta_from_csv(self, path: str, n_total: int, n_train: int, n_hold: int):
-        base = os.path.basename(path)
-        instrument, exchange, timeframe = ("UNKNOWN", "UNK", "UNK")
-
-        m = re.match(r"tv_([^_]+)_([^_]+)_([^_]+)_.+\.csv$", base)
-        if m:
-            instrument = m.group(1)
-            exchange = m.group(2)
-            timeframe = m.group(3)
-        else:
-            m = re.match(r"([A-Z0-9]+)_([0-9]+m|[0-9]+h|[0-9]+d)_(.+\.csv)$", base)
-            if m:
-                instrument = m.group(1)
-                timeframe = m.group(2)
-                exchange = "COMEX"  # default for IBKR
-
-        name_prefix = f"{instrument}_{exchange}_{timeframe}_{n_total}bars"
-        meta_extra = {
-            "instrument": instrument,
-            "exchange": exchange,
-            "timeframe": timeframe,
-            "n_total_bars": int(n_total),
-            "n_train_bars": int(n_train),
-            "n_holdout_bars": int(n_hold),
-        }
-        return name_prefix, meta_extra
+        return runtime_name_and_meta_from_csv(path, n_total, n_train, n_hold)
 
     def _on_progress_row(self, idx: int, total: int, params: dict, mean_f1: float, std_f1: float):
         if self.prog.maximum() != total:

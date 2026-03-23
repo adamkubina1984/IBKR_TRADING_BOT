@@ -19,7 +19,12 @@ import pandas as pd
 from ibkr_trading_bot.model.train_models import train_and_evaluate_model
 
 
-def main(input_path: str, estimator_name: str = "hgbt", holdout_bars: int = 500):
+def main(
+    input_path: str,
+    estimator_name: str = "hgbt",
+    holdout_bars: int = 500,
+    label_lookahead_bars: int = 12,
+):
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Input file not found: {input_path}")
     
@@ -50,6 +55,7 @@ def main(input_path: str, estimator_name: str = "hgbt", holdout_bars: int = 500)
         slippage_bps=0.0,
         calibrate=False,
         holdout_bars=holdout_bars,
+        label_lookahead_bars=label_lookahead_bars,
         mc_enabled=True,
         annualize_sharpe=True,
     )
@@ -68,6 +74,12 @@ if __name__ == '__main__':
     p.add_argument("--input", default="data/processed/features_with_labels.csv", help="CSV with features+targets")
     p.add_argument("--model", default="hgbt", help="Estimator: hgbt, rf, et, xgb, lgb, svm")
     p.add_argument("--holdout", type=int, default=500, help="Holdout bars for final test")
+    p.add_argument("--label-lookahead", type=int, default=12, help="Forward label lookahead in bars (anti-leak guard)")
     args = p.parse_args()
 
-    main(args.input, estimator_name=args.model, holdout_bars=args.holdout)
+    main(
+        args.input,
+        estimator_name=args.model,
+        holdout_bars=args.holdout,
+        label_lookahead_bars=args.label_lookahead,
+    )

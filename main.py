@@ -62,6 +62,10 @@ def main():
     eval_parser.add_argument("--model", type=str, required=True, help="Cesta k uloženému modelu (*.joblib)")
     eval_parser.add_argument("--results-out", type=str, default=None,
                              help="Kam zapsat results.csv (default: results/results.csv)")
+    eval_parser.add_argument("--holdout-only", action="store_true",
+                             help="Vyhodnotí jen poslední holdout segment (tail).")
+    eval_parser.add_argument("--holdout-bars", type=int, default=None,
+                             help="Počet posledních barů pro holdout evaluaci (přepíše metadata modelu).")
 
     # === SELECT-BEST ===
     select_parser = subparsers.add_parser(
@@ -206,7 +210,13 @@ def main():
         print(f"📊 Vyhodnocuji model {args.model} na {features_csv}")
         from ibkr_trading_bot.model.evaluate_models import evaluate_model_once
         results_out.parent.mkdir(parents=True, exist_ok=True)
-        evaluate_model_once(features_csv=features_csv.as_posix(), model_path=args.model, results_out=results_out.as_posix())
+        evaluate_model_once(
+            features_csv=features_csv.as_posix(),
+            model_path=args.model,
+            results_out=results_out.as_posix(),
+            holdout_only=bool(args.holdout_only),
+            holdout_bars=args.holdout_bars,
+        )
         print(f"✅ Výsledky uloženy do: {results_out}")
         return
 
