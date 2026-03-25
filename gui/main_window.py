@@ -1,6 +1,7 @@
 import sys
 
 from dotenv import load_dotenv
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QApplication, QMainWindow, QTabWidget, QVBoxLayout, QWidget
 
 load_dotenv()
@@ -101,6 +102,19 @@ class MainWindow(QMainWindow):
 
     def get_live_feature_df(self):
         return self.get_live_features_df()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        for attr_name, _, _ in self._tab_specs:
+            widget = getattr(self, attr_name, None)
+            if widget is None:
+                continue
+            shutdown = getattr(widget, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    shutdown()
+                except Exception:
+                    pass
+        super().closeEvent(event)
 
 
 if __name__ == "__main__":

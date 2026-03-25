@@ -61,6 +61,9 @@ dl = [
     "tensorflow>=2.16.0",
     "torch>=2.2.0",
 ]
+optuna = [
+    "optuna>=3.6.0",
+]
 
 [tool.setuptools]
 packages = ["ibkr_trading_bot"]

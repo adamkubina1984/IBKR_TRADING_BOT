@@ -97,12 +97,19 @@ except ModuleNotFoundError:
 
 # Logger
 try:
-    from ibkr_trading_bot.core.utils.loggers import get_logger
+    from ibkr_trading_bot.core.utils.logging_setup import get_logger
 except Exception:
     def get_logger(name: str):
         import logging
-        logging.basicConfig(level=logging.INFO)
-        return logging.getLogger(name)
+        logger = logging.getLogger(name)
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+            logger.addHandler(handler)
+        if logger.level == logging.NOTSET:
+            logger.setLevel(logging.INFO)
+        logger.propagate = False
+        return logger
 
 DEFAULT_MODEL_DIR = r"C:\Users\adamk\Můj disk\Trader\ibkr_trading_bot\model_outputs"
 

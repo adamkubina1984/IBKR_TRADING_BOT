@@ -6,7 +6,6 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-
 import pandas as pd
 
 try:
@@ -20,7 +19,7 @@ from dotenv import load_dotenv
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from PySide6.QtCore import QDate, QProcess, Qt, QTimer
-from PySide6.QtGui import QTextCursor
+from PySide6.QtGui import QCloseEvent, QTextCursor
 from PySide6.QtWidgets import (
     QComboBox,
     QDateEdit,
@@ -40,6 +39,8 @@ from ibkr_trading_bot.config.settings import paths
 from ibkr_trading_bot.core.services.futures_roll_chain_service import (
     download_and_build_gc_roll_chain,
     parse_expiry_list,
+    read_dataset_sidecar_meta,
+    update_gc_roll_chain_latest_contract,
 )
 from ibkr_trading_bot.core.utils.plotting import plot_candles, prepare_for_chart
 from ibkr_trading_bot.gui.components.log_console import LogConsole
@@ -77,9 +78,11 @@ def _write_log_file(prefix: str, content: str) -> str:
 @dataclass
 class DownloadTaskPayload:
     operation: str
-    chart_df: pd.DataFrame
+    chart_df: pd.DataFrame | None
     status_text: str
     status_ok: bool
+    output_path: str | None = None
+    auto_plot: bool = False
 
 
 class DataDownloadTab(QWidget):
@@ -96,7 +99,7 @@ class DataDownloadTab(QWidget):
         self._log_timer.setInterval(100)
         self._log_timer.timeout.connect(self._flush_log_queue)
         self._task_worker: TaskWorker | None = None
-        self.tv_client = TradingViewClient(username=os.getenv("TV_USERNAME"), password=os.getenv("TV_PASSWORD"))
+        self.tv_client: TradingViewClient | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 10, 12, 10)
@@ -281,15 +284,40 @@ class DataDownloadTab(QWidget):
     def _new_tv_client(self) -> TradingViewClient:
         return TradingViewClient(username=os.getenv("TV_USERNAME"), password=os.getenv("TV_PASSWORD"))
 
-    def _start_task(self, worker: TaskWorker) -> None:
-        if self._task_worker is not None:
+    def _stop_task_worker(self, *, wait_ms: int = 1500) -> None:
+        worker = self._task_worker
+        self._task_worker = None
+        if worker is None:
+            return
+        try:
+            worker.progress_text.disconnect(self.log_msg)
+        except Exception:
+            pass
+        try:
+            worker.finished.disconnect(self._on_task_finished)
+        except Exception:
+            pass
+        try:
+            worker.stop()
+        except Exception:
+            pass
+        if worker.isRunning() and not worker.wait(wait_ms):
+            # App shutdown should not leave a live QThread behind.
             try:
-                self._task_worker.stop()
+                worker.terminate()
             except Exception:
                 pass
+            try:
+                worker.wait(wait_ms)
+            except Exception:
+                pass
+
+    def _start_task(self, worker: TaskWorker) -> None:
+        self._stop_task_worker(wait_ms=250)
         self._task_worker = worker
         worker.progress_text.connect(self.log_msg)
         worker.finished.connect(self._on_task_finished)
+        worker.finished.connect(worker.deleteLater)
         worker.start()
 
     def _on_task_finished(self) -> None:
@@ -297,8 +325,9 @@ class DataDownloadTab(QWidget):
         self._flush_log_queue(force=True)
 
     def _apply_download_payload(self, payload: DownloadTaskPayload) -> None:
-        self.df = payload.chart_df
-        self._plot_candles(payload.chart_df)
+        if payload.auto_plot and payload.chart_df is not None:
+            self.df = payload.chart_df
+            self._plot_candles(payload.chart_df)
         self._set_status(payload.status_text, ok=payload.status_ok)
 
     def _task_load_csv(self, path: str) -> DownloadTaskPayload:
@@ -309,6 +338,8 @@ class DataDownloadTab(QWidget):
             chart_df=df_chart,
             status_text=f"Nacteno {len(df_chart)} radku z {os.path.basename(path)}",
             status_ok=True,
+            output_path=path,
+            auto_plot=True,
         )
 
     def _task_download_tv(self, symbol: str, exchange: str, tf_label: str, limit: int) -> DownloadTaskPayload:
@@ -338,16 +369,18 @@ class DataDownloadTab(QWidget):
         except Exception as e:
             pass
 
-        df_plot = df_out[["date", "open", "high", "low", "close", "volume"]].copy()
-        df_chart = self._prepare_for_chart(df_plot)
         return DownloadTaskPayload(
             operation="download_tv",
-            chart_df=df_chart,
-            status_text=f"Stazeno {len(df_out)} radku (poslednich {limit} baru).",
+            chart_df=None,
+            status_text=(
+                f"Stazeno {len(df_out)} radku do {Path(fpath).name}. "
+                "Graf se vykresli az po kliknuti na Nacist CSV."
+            ),
             status_ok=True,
+            output_path=fpath,
         )
 
-    def _task_download_ibkr(
+    def _task_download_ibkr_legacy(
         self,
         symbol: str,
         start_date: datetime,
@@ -401,13 +434,22 @@ class DataDownloadTab(QWidget):
             status_ok=True,
         )
 
-    def _task_update_ibkr_csv(
+    def _task_update_ibkr_csv_legacy(
         self,
         csv_path: str,
         mode: str,
         expiry: str | None,
         progress_cb=None,
     ) -> DownloadTaskPayload:
+        roll_meta = self._load_canonical_roll_chain_meta(csv_path)
+        if roll_meta is not None:
+            return self._task_update_roll_chain_csv(csv_path, roll_meta, progress_cb=progress_cb)
+        if self._looks_like_roll_chain_csv(csv_path):
+            raise ValueError(
+                "Vybrany roll-chain CSV nema validni canonical _meta.json. "
+                "Aktualizace obycejnym raw merge by nebyla bezpecna."
+            )
+
         existing = self._read_ohlc_csv_strict(csv_path)
         file_symbol, file_bar_size = self._infer_symbol_bar_from_filename(csv_path)
         bar_min = self._bar_size_to_minutes(file_bar_size)
@@ -528,7 +570,7 @@ class DataDownloadTab(QWidget):
 
     def _on_download_tv_success(self, payload: DownloadTaskPayload) -> None:
         self._apply_download_payload(payload)
-        self.log_msg(f"[TV] OK: {len(payload.chart_df)} radku.")
+        self.log_msg(f"[TV] OK: {payload.status_text}")
         self._lock_buttons(False)
 
     def _on_download_tv_error(self, message: str) -> None:
@@ -626,6 +668,290 @@ class DataDownloadTab(QWidget):
         }
         return symbol, tf_map.get(tf_code, bar_size)
 
+    def _looks_like_roll_chain_csv(self, path: str) -> bool:
+        return "rollchain" in Path(path).stem.lower()
+
+    def _load_canonical_roll_chain_meta(self, path: str) -> dict[str, object] | None:
+        meta = read_dataset_sidecar_meta(path)
+        if not isinstance(meta, dict) or not meta:
+            return None
+        if str(meta.get("dataset_kind") or "").strip().lower() != "gc_roll_chain":
+            return None
+        if meta.get("canonical") is not True:
+            raise ValueError("Vybrany roll-chain dataset neni oznacen jako canonical.")
+        return meta
+
+    def _roll_chain_expiries_from_meta(self, meta: dict[str, object]) -> list[str]:
+        raw_items = meta.get("expiries_used") or []
+        items = raw_items if isinstance(raw_items, (list, tuple)) else parse_expiry_list(str(raw_items))
+        expiries: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            expiry = str(item).strip()
+            if not re.fullmatch(r"\d{6}", expiry) or expiry in seen:
+                continue
+            seen.add(expiry)
+            expiries.append(expiry)
+        return expiries
+
+    def _roll_chain_contract_paths_from_meta(self, meta: dict[str, object]) -> dict[str, str]:
+        mapping: dict[str, str] = {}
+        raw_items = meta.get("source_contracts") or []
+        if not isinstance(raw_items, list):
+            return mapping
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            expiry = str(item.get("expiry") or "").strip()
+            csv_path = str(item.get("csv_path") or "").strip()
+            if re.fullmatch(r"\d{6}", expiry) and csv_path:
+                mapping[expiry] = csv_path
+        return mapping
+
+    def _task_update_roll_chain_csv_legacy(
+        self,
+        csv_path: str,
+        meta: dict[str, object],
+        progress_cb=None,
+    ) -> DownloadTaskPayload:
+        instrument = str(meta.get("instrument") or "GC").strip().upper()
+        if instrument != "GC":
+            raise ValueError("Update canonical roll-chain datasetu je zatim podporen jen pro GC.")
+
+        expiries = self._roll_chain_expiries_from_meta(meta)
+        if len(expiries) < 2:
+            raise ValueError("Canonical roll-chain meta neobsahuje alespon 2 validni expirace.")
+
+        bar_size = str(meta.get("bar_size") or "").strip()
+        if not bar_size:
+            _, bar_size = self._infer_symbol_bar_from_filename(csv_path)
+
+        existing = self._read_ohlc_csv_strict(csv_path)
+        bar_min = self._bar_size_to_minutes(bar_size)
+        self._validate_ohlc_integrity(existing, bar_min, "Puvodni roll-chain dataset")
+        start_date = pd.to_datetime(existing["date"]).min().to_pydatetime()
+        output_dir = str(Path(csv_path).expanduser().resolve().parent)
+
+        if progress_cb:
+            progress_cb(
+                f"[ROLL][UPDATE] Rebuild {Path(csv_path).name} | "
+                f"start={start_date:%Y-%m-%d} | expiries={','.join(expiries)} | bar={bar_size}"
+            )
+
+        result = download_and_build_gc_roll_chain(
+            start_date=start_date,
+            end_date=datetime.now(),
+            expiries=expiries,
+            bar_size=bar_size,
+            output_dir=output_dir,
+            raw_dir=RAW_DIR,
+            progress_cb=progress_cb,
+        )
+        df_chart = self._prepare_for_chart(result["chart_df"])
+        status_text = str(result["status_text"]) + f" | file={Path(str(result['csv_path'])).name}"
+        return DownloadTaskPayload(
+            operation="update_ibkr_roll_chain",
+            chart_df=df_chart,
+            status_text=status_text,
+            status_ok=bool(result.get("quality_gate_passed", False)),
+        )
+
+    def _task_download_ibkr(
+        self,
+        symbol: str,
+        start_date: datetime,
+        mode: str,
+        expiry: str | None,
+        bar_size: str,
+        progress_cb=None,
+    ) -> DownloadTaskPayload:
+        expiries = parse_expiry_list(expiry)
+        if str(symbol).upper() == "GC" and str(mode).upper() == "FUT" and len(expiries) > 1:
+            result = download_and_build_gc_roll_chain(
+                start_date=start_date,
+                end_date=datetime.now(),
+                expiries=expiries,
+                bar_size=bar_size,
+                output_dir=PROCESSED_DIR,
+                raw_dir=RAW_DIR,
+                progress_cb=progress_cb,
+            )
+            status_text = str(result["status_text"]) + f" | file={Path(str(result['csv_path'])).name}"
+            return DownloadTaskPayload(
+                operation="download_ibkr_roll_chain",
+                chart_df=None,
+                status_text=status_text + " | Pro vykresleni klikni na Nacist CSV.",
+                status_ok=bool(result.get("quality_gate_passed", False)),
+                output_path=str(result["csv_path"]),
+            )
+
+        from ibkr_trading_bot.utils.download_ibkr_data import download_ibkr_by_date_range
+
+        output_path = download_ibkr_by_date_range(
+            symbol=symbol,
+            start_date=start_date,
+            end_date=datetime.now(),
+            bar_size=bar_size,
+            contract_mode=mode,
+            expiry=expiry,
+            output_dir=RAW_DIR,
+            max_bars_per_batch=5000,
+            on_progress=lambda bn, tb, rec: progress_cb(f"[IBKR] Batch {bn}: {rec} baru") if progress_cb else None,
+        )
+        return DownloadTaskPayload(
+            operation="download_ibkr",
+            chart_df=None,
+            status_text=f"OK: ulozeno do {Path(output_path).name}. Pro vykresleni klikni na Nacist CSV.",
+            status_ok=True,
+            output_path=str(output_path),
+        )
+
+    def _task_update_ibkr_csv(
+        self,
+        csv_path: str,
+        mode: str,
+        expiry: str | None,
+        progress_cb=None,
+    ) -> DownloadTaskPayload:
+        roll_meta = self._load_canonical_roll_chain_meta(csv_path)
+        if roll_meta is not None:
+            return self._task_update_roll_chain_csv(csv_path, roll_meta, progress_cb=progress_cb)
+        if self._looks_like_roll_chain_csv(csv_path):
+            raise ValueError(
+                "Vybrany roll-chain CSV nema validni canonical _meta.json. "
+                "Aktualizace obycejnym raw merge by nebyla bezpecna."
+            )
+
+        existing = self._read_ohlc_csv_strict(csv_path)
+        file_symbol, file_bar_size = self._infer_symbol_bar_from_filename(csv_path)
+        bar_min = self._bar_size_to_minutes(file_bar_size)
+        self._validate_ohlc_integrity(existing, bar_min, "Puvodni dataset")
+
+        last_ts = pd.to_datetime(existing["date"]).max().to_pydatetime()
+        overlap_bars = 200
+        fetch_start = last_ts - timedelta(minutes=bar_min * overlap_bars)
+        if progress_cb:
+            progress_cb(
+                f"[IBKR][UPDATE] Symbol={file_symbol} TF={file_bar_size} "
+                f"last_ts={last_ts} fetch_start={fetch_start} overlap_bars={overlap_bars}"
+            )
+
+        if mode == "FUT" and not expiry:
+            raise ValueError("Pro FUT rezim je nutna expirace.")
+
+        from ibkr_trading_bot.utils.download_ibkr_data import download_ibkr_by_date_range
+
+        downloaded_path = download_ibkr_by_date_range(
+            symbol=file_symbol,
+            start_date=fetch_start,
+            end_date=datetime.now(),
+            bar_size=file_bar_size,
+            contract_mode=mode,
+            expiry=expiry,
+            output_dir=RAW_DIR,
+            max_bars_per_batch=5000,
+            on_progress=lambda bn, tb, rec: progress_cb(f"[IBKR][UPDATE] Batch {bn}: {rec} baru") if progress_cb else None,
+        )
+        if progress_cb:
+            progress_cb(f"[IBKR][UPDATE] Docasne stazeno: {downloaded_path}")
+
+        incoming = self._read_ohlc_csv_strict(downloaded_path)
+        self._validate_ohlc_integrity(incoming, bar_min, "Nove stazena data")
+
+        merged = pd.concat([existing, incoming], ignore_index=True)
+        merged = merged.sort_values("date").drop_duplicates(subset=["date"], keep="last")
+        self._validate_ohlc_integrity(merged, bar_min, "Slouceny dataset")
+
+        old_n = int(len(existing))
+        new_n = int(len(merged))
+        added = int(max(0, new_n - old_n))
+        new_max = pd.to_datetime(merged["date"]).max().to_pydatetime()
+        old_max = pd.to_datetime(existing["date"]).max().to_pydatetime()
+
+        bar_tag = file_bar_size.replace(" mins", "m").replace(" min", "m").replace(" hour", "h").replace(" ", "")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        start_tag = pd.to_datetime(merged["date"]).min().strftime("%Y%m%d")
+        end_tag = pd.to_datetime(merged["date"]).max().strftime("%Y%m%d")
+        out_name = f"{file_symbol}_{bar_tag}_{len(merged)}bars_{start_tag}_{end_tag}_{ts}.csv"
+        out_path = Path(RAW_DIR) / out_name
+
+        out_cols = ["date", "open", "high", "low", "close", "volume"]
+        for opt in ("average", "barCount"):
+            if opt in merged.columns:
+                out_cols.append(opt)
+        merged[out_cols].to_csv(out_path, index=False)
+
+        if progress_cb:
+            progress_cb(
+                f"[IBKR][UPDATE] OK: old={old_n} new={new_n} added={added} "
+                f"old_max={old_max} new_max={new_max}"
+            )
+            progress_cb(f"[IBKR][UPDATE] Ulozeno: {out_path}")
+
+        status_text = (
+            "Update dokoncen, ale bez novejsich timestampu (jen prepsany overlap)."
+            if new_max <= old_max
+            else f"Update OK: +{added} radku, posledni bar {new_max}."
+        )
+        return DownloadTaskPayload(
+            operation="update_ibkr_csv",
+            chart_df=None,
+            status_text=f"{status_text} | file={out_path.name} | Pro vykresleni klikni na Nacist CSV.",
+            status_ok=True,
+            output_path=str(out_path),
+        )
+
+    def _task_update_roll_chain_csv(
+        self,
+        csv_path: str,
+        meta: dict[str, object],
+        progress_cb=None,
+    ) -> DownloadTaskPayload:
+        instrument = str(meta.get("instrument") or "GC").strip().upper()
+        if instrument != "GC":
+            raise ValueError("Update canonical roll-chain datasetu je zatim podporen jen pro GC.")
+
+        expiries = self._roll_chain_expiries_from_meta(meta)
+        if len(expiries) < 2:
+            raise ValueError("Canonical roll-chain meta neobsahuje alespon 2 validni expirace.")
+
+        bar_size = str(meta.get("bar_size") or "").strip()
+        if not bar_size:
+            _, bar_size = self._infer_symbol_bar_from_filename(csv_path)
+
+        existing = self._read_ohlc_csv_strict(csv_path)
+        bar_min = self._bar_size_to_minutes(bar_size)
+        self._validate_ohlc_integrity(existing, bar_min, "Puvodni roll-chain dataset")
+        start_date = pd.to_datetime(existing["date"]).min().to_pydatetime()
+        output_dir = str(Path(csv_path).expanduser().resolve().parent)
+        preferred_contract_paths = self._roll_chain_contract_paths_from_meta(meta)
+
+        if progress_cb:
+            progress_cb(
+                f"[ROLL][UPDATE] Rebuild {Path(csv_path).name} | "
+                f"start={start_date:%Y-%m-%d} | expiries={','.join(expiries)} | "
+                f"bar={bar_size} | update_mode=latest_only"
+            )
+
+        result = update_gc_roll_chain_latest_contract(
+            start_date=start_date,
+            end_date=datetime.now(),
+            expiries=expiries,
+            bar_size=bar_size,
+            output_dir=output_dir,
+            raw_dir=RAW_DIR,
+            preferred_contract_paths=preferred_contract_paths,
+            progress_cb=progress_cb,
+        )
+        status_text = str(result["status_text"]) + f" | file={Path(str(result['csv_path'])).name}"
+        return DownloadTaskPayload(
+            operation="update_ibkr_roll_chain",
+            chart_df=None,
+            status_text=status_text + " | Pro vykresleni klikni na Nacist CSV.",
+            status_ok=bool(result.get("quality_gate_passed", False)),
+            output_path=str(result["csv_path"]),
+        )
+
     def _read_ohlc_csv_strict(self, path: str) -> pd.DataFrame:
         df = pd.read_csv(path)
         if df.empty:
@@ -683,7 +1009,12 @@ class DataDownloadTab(QWidget):
                 )
 
     def on_update_ibkr_csv(self) -> None:
-        start_dir = RAW_DIR if os.path.isdir(RAW_DIR) else str(Path.home())
+        if os.path.isdir(PROCESSED_DIR):
+            start_dir = PROCESSED_DIR
+        elif os.path.isdir(RAW_DIR):
+            start_dir = RAW_DIR
+        else:
+            start_dir = str(Path.home())
         csv_path, _ = QFileDialog.getOpenFileName(self, "Vyber existujici CSV pro update", start_dir, "CSV (*.csv)")
         if not csv_path:
             return
@@ -702,6 +1033,11 @@ class DataDownloadTab(QWidget):
 
     def _on_update_ibkr_success(self, payload: DownloadTaskPayload) -> None:
         self._apply_download_payload(payload)
+        if payload.operation == "update_ibkr_roll_chain":
+            prefix = "[ROLL][UPDATE] OK:" if payload.status_ok else "[ROLL][UPDATE][WARN]"
+            self.log_msg(f"{prefix} {payload.status_text}")
+        else:
+            self.log_msg(f"[IBKR][UPDATE] {payload.status_text}")
         self._lock_buttons(False)
 
     def _on_update_ibkr_error(self, message: str) -> None:
@@ -733,3 +1069,19 @@ class DataDownloadTab(QWidget):
 
     def _plot_candles(self, df: pd.DataFrame) -> None:
         return plot_candles(self.fig, self.ax, self.canvas, df)
+
+    def shutdown(self) -> None:
+        if self._log_timer.isActive():
+            self._log_timer.stop()
+        if self._proc is not None:
+            try:
+                self._proc.kill()
+                self._proc.waitForFinished(1000)
+            except Exception:
+                pass
+            self._proc = None
+        self._stop_task_worker(wait_ms=2000)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self.shutdown()
+        super().closeEvent(event)

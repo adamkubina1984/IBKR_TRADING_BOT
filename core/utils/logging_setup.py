@@ -17,4 +17,5 @@ def get_logger(name: str = "ibkr") -> logging.Logger:
         logger.addHandler(handler)
     if logger.level == logging.NOTSET:
         logger.setLevel(logging.INFO)
+    logger.propagate = False
     return logger

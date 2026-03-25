@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json as jsonlib
+import logging
 import pathlib
 from datetime import datetime
 from typing import Any
@@ -36,6 +37,16 @@ try:
     HAS_LGB = True
 except Exception:
     HAS_LGB = False
+
+try:
+    import optuna  # type: ignore
+    HAS_OPTUNA = True
+except Exception:
+    optuna = None  # type: ignore[assignment]
+    HAS_OPTUNA = False
+
+
+LOGGER = logging.getLogger(__name__)
 
 # --- purged walk-forward split
 try:
@@ -120,6 +131,86 @@ def _normalize_candidate_criterion(v: str | None) -> str:
         "recall": "recall_balance",
     }
     return aliases.get(x, "balanced")
+
+
+def _normalize_search_backend(value: str | None) -> str:
+    txt = str(value or "").strip().lower()
+    return txt if txt in {"grid", "optuna"} else "grid"
+
+
+def _normalize_estimator_family(value: str | None) -> str:
+    txt = str(value or "").strip().lower()
+    if txt in {"hgbt", "histgb", "histgradientboosting"}:
+        return "hgbt"
+    if txt in {"lgb", "lightgbm"}:
+        return "lgb"
+    if txt in {"xgb", "xgboost"}:
+        return "xgb"
+    if txt in {"rf", "random_forest", "randomforest"}:
+        return "rf"
+    if txt in {"et", "extratrees", "extra_trees"}:
+        return "et"
+    if txt in {"svm", "svc"}:
+        return "svm"
+    return txt or "hgbt"
+
+
+def _optuna_supported_estimator(value: str | None) -> bool:
+    return _normalize_estimator_family(value) in {"hgbt", "lgb"}
+
+
+def _normalize_optuna_trials(value: Any) -> int | None:
+    try:
+        iv = int(value)
+        return iv if iv > 0 else None
+    except Exception:
+        return None
+
+
+def _normalize_optuna_timeout_seconds(value: Any) -> float | None:
+    try:
+        fv = float(value)
+        return float(fv) if np.isfinite(fv) and fv > 0.0 else None
+    except Exception:
+        return None
+
+
+def _resolve_search_backend(
+    value: str | None,
+    *,
+    estimator_name: str | None = None,
+) -> tuple[str, str, str | None]:
+    requested = _normalize_search_backend(value)
+    if requested == "optuna" and not HAS_OPTUNA:
+        LOGGER.warning(
+            "search_backend='optuna' requested but Optuna is not available; falling back to 'grid'."
+        )
+        return requested, "grid", "optuna_not_available"
+    if requested == "optuna" and not _optuna_supported_estimator(estimator_name):
+        LOGGER.warning(
+            "search_backend='optuna' requested for unsupported estimator '%s'; falling back to 'grid'.",
+            estimator_name,
+        )
+        return requested, "grid", "optuna_estimator_not_supported"
+    return requested, requested, None
+
+
+def _coerce_grid_choices(grid: dict[str, Any] | None) -> dict[str, list[Any]]:
+    choices: dict[str, list[Any]] = {}
+    if not isinstance(grid, dict):
+        return choices
+    for key, raw_values in grid.items():
+        if isinstance(raw_values, (str, bytes)):
+            values = [raw_values]
+        else:
+            try:
+                values = list(raw_values)
+            except Exception:
+                values = [raw_values]
+        values = [v for v in values if v is not None]
+        if values:
+            choices[str(key)] = values
+    return choices
 
 
 def _build_chain_signature(
@@ -1539,6 +1630,9 @@ def train_and_evaluate_model(
     quality_min_holdout_sharpe: float = float(kwargs.pop("quality_min_holdout_sharpe", 0.0))
     max_param_candidates_kw = kwargs.pop("max_param_candidates", None)
     param_sample_seed_kw = kwargs.pop("param_sample_seed", 42)
+    search_backend_kw = kwargs.pop("search_backend", "grid")
+    optuna_trials_kw = kwargs.pop("optuna_trials", None)
+    optuna_timeout_seconds_kw = kwargs.pop("optuna_timeout_seconds", None)
     training_mode_kw = kwargs.pop("training_mode", "standard")
     candidate_chain_enabled_kw = kwargs.pop("candidate_chain_enabled", True)
     candidate_selection_criterion_kw = kwargs.pop("candidate_selection_criterion", "balanced")
@@ -1825,6 +1919,14 @@ def train_and_evaluate_model(
     except Exception:
         param_sample_seed = 42
 
+    optuna_trials_requested = _normalize_optuna_trials(optuna_trials_kw)
+    optuna_timeout_seconds = _normalize_optuna_timeout_seconds(optuna_timeout_seconds_kw)
+
+    search_backend_requested, search_backend_used, search_backend_fallback_reason = _resolve_search_backend(
+        search_backend_kw,
+        estimator_name=estimator_name,
+    )
+
     all_param_sets = all_param_sets_full
     sampled_candidates = False
     candidate_source_by_key: dict[str, str] = {_params_key(p): "grid" for p in all_param_sets_full}
@@ -1861,7 +1963,11 @@ def train_and_evaluate_model(
     }
 
     carry_params: list[dict[str, Any]] = []
-    if bool(candidate_chain_enabled) and chain_source_mode is not None:
+    if (
+        search_backend_used == "grid"
+        and bool(candidate_chain_enabled)
+        and chain_source_mode is not None
+    ):
         try:
             if chain_path.exists():
                 chain_raw = jsonlib.loads(chain_path.read_text(encoding="utf-8"))
@@ -1907,7 +2013,9 @@ def train_and_evaluate_model(
         except Exception as e_chain_load:
             chain_info["load_error"] = str(e_chain_load)
 
-    if carry_params:
+    if search_backend_used != "grid":
+        chain_info["disabled_for_backend"] = str(search_backend_used)
+    elif carry_params:
         # Keep unique order from stored ranking.
         seen_carry: set[str] = set()
         carry_unique: list[dict[str, Any]] = []
@@ -1960,6 +2068,16 @@ def train_and_evaluate_model(
                 candidate_source_by_key[_params_key(p)] = "sampled"
 
     search_plan = {
+        "search_backend_requested": str(search_backend_requested),
+        "search_backend_used": str(search_backend_used),
+        "search_backend_fallback_reason": search_backend_fallback_reason,
+        "optuna_available": bool(HAS_OPTUNA),
+        "optuna_trials_requested": (int(optuna_trials_requested) if optuna_trials_requested is not None else None),
+        "optuna_timeout_seconds": (float(optuna_timeout_seconds) if optuna_timeout_seconds is not None else None),
+        "optuna_completed_trials": 0,
+        "optuna_pruned_trials": 0,
+        "optuna_best_score": None,
+        "optuna_best_params": None,
         "grid_total_candidates": int(len(all_param_sets_full)),
         "grid_used_candidates": int(len(all_param_sets)),
         "sampled_candidates": bool(sampled_candidates),
@@ -1968,8 +2086,21 @@ def train_and_evaluate_model(
         "candidate_chain": chain_info,
     }
 
+    optuna_param_space = _coerce_grid_choices(grid_base) if search_backend_used == "optuna" else {}
+    optuna_trials_effective = optuna_trials_requested
+    if search_backend_used == "optuna" and optuna_trials_effective is None:
+        optuna_trials_effective = max(1, len(all_param_sets_full))
+    search_plan["optuna_trials_effective"] = (
+        int(optuna_trials_effective) if optuna_trials_effective is not None else None
+    )
+
     cv = PurgedWalkForwardSplit(n_splits=n_splits, embargo=effective_embargo)
-    step_idx, total = 0, max(1, len(all_param_sets))
+    step_idx, total = 0, max(
+        1,
+        int(optuna_trials_effective)
+        if search_backend_used == "optuna" and optuna_trials_effective is not None
+        else len(all_param_sets),
+    )
     best_score, best_params, best_estimator, best_oof = -1e18, None, None, None
     candidate_records: list[dict[str, Any]] = []
 
@@ -1981,8 +2112,11 @@ def train_and_evaluate_model(
         except TypeError:
             onp(f"[CV {idx}/{total}] score={mean:.4f} std={std:.4f} params={params}")
 
-    for params in all_param_sets:
-        step_idx += 1
+    def _evaluate_candidate(
+        params: dict[str, Any],
+        *,
+        trial=None,
+    ) -> tuple[float, float, dict[str, Any], np.ndarray]:
         fold_scores, fold_sizes = [], []
         metric_wsum = 0.0
         metric_acc: dict[str, float] = {}
@@ -2046,6 +2180,11 @@ def train_and_evaluate_model(
                     score = float((pred == y_te).mean())
             fold_scores.append(float(score))
             fold_sizes.append(len(te_idx))
+            if trial is not None:
+                trial.report(float(np.average(fold_scores, weights=fold_sizes)), step=int(fold_count))
+                if trial.should_prune():
+                    trial.set_user_attr("pruned_after_fold", int(fold_count))
+                    raise optuna.TrialPruned()
             if m_fold is not None:
                 w = float(len(te_idx))
                 metric_wsum += w
@@ -2096,12 +2235,15 @@ def train_and_evaluate_model(
 
         mean_score = float(np.average(fold_scores, weights=fold_sizes)) if fold_scores else -1e18
         std_score  = float(np.std(fold_scores)) if fold_scores else float("nan")
-        _emit(on_progress, step_idx, total, params, mean_score, std_score)
         row_rec: dict[str, Any] = {
             "params": dict(params),
             "cv_score": float(mean_score),
             "cv_std": float(std_score),
-            "source": str(candidate_source_by_key.get(_params_key(params), "grid")),
+            "source": (
+                "optuna"
+                if search_backend_used == "optuna"
+                else str(candidate_source_by_key.get(_params_key(params), "grid"))
+            ),
             "folds": int(len(fold_scores)),
             "n_short_pred_mean": (float(n_short_sum / max(1, fold_count))),
             "n_long_pred_mean": (float(n_long_sum / max(1, fold_count))),
@@ -2110,11 +2252,61 @@ def train_and_evaluate_model(
         if metric_wsum > 0.0:
             for mk, mv in metric_acc.items():
                 row_rec[mk] = float(mv / metric_wsum)
+        return mean_score, std_score, row_rec, tmp_oof.copy()
+
+    def _run_candidate(params: dict[str, Any], *, trial=None) -> float:
+        nonlocal step_idx, best_score, best_params, best_estimator, best_oof
+        step_idx += 1
+        mean_score, std_score, row_rec, tmp_oof = _evaluate_candidate(params, trial=trial)
+        _emit(on_progress, step_idx, total, params, mean_score, std_score)
         candidate_records.append(row_rec)
         if mean_score > best_score:
             best_score, best_params = mean_score, params
             best_estimator = _fit_with_params(base_estimator, params)
-            best_oof = tmp_oof.copy()
+            best_oof = tmp_oof
+        return float(mean_score)
+
+    if search_backend_used == "optuna":
+        assert optuna is not None
+        sampler = optuna.samplers.TPESampler(seed=int(param_sample_seed))
+        pruner = optuna.pruners.MedianPruner(n_startup_trials=max(1, min(5, total)), n_warmup_steps=1)
+        study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
+
+        def _objective(trial) -> float:
+            params = {
+                str(param_name): trial.suggest_categorical(str(param_name), list(choices))
+                for param_name, choices in optuna_param_space.items()
+            }
+            score = _run_candidate(params, trial=trial)
+            trial.set_user_attr("params", dict(params))
+            return score
+
+        study.optimize(
+            _objective,
+            n_trials=int(optuna_trials_effective or total),
+            timeout=float(optuna_timeout_seconds) if optuna_timeout_seconds is not None else None,
+            gc_after_trial=True,
+            show_progress_bar=False,
+        )
+        trial_states = optuna.trial.TrialState
+        completed_trials = [t for t in study.trials if t.state == trial_states.COMPLETE]
+        pruned_trials = [t for t in study.trials if t.state == trial_states.PRUNED]
+        search_plan["optuna_completed_trials"] = int(len(completed_trials))
+        search_plan["optuna_pruned_trials"] = int(len(pruned_trials))
+        search_plan["optuna_timeout_reached"] = bool(
+            optuna_timeout_seconds is not None and len(study.trials) < int(optuna_trials_effective or total)
+        )
+        if best_params is None:
+            fallback_params = dict(all_param_sets_full[0]) if all_param_sets_full else {}
+            _run_candidate(fallback_params)
+            search_plan["optuna_no_completed_trials"] = True
+        else:
+            search_plan["optuna_no_completed_trials"] = False
+        search_plan["optuna_best_score"] = float(best_score) if best_params is not None else None
+        search_plan["optuna_best_params"] = dict(best_params or {})
+    else:
+        for params in all_param_sets:
+            _run_candidate(dict(params))
 
     if best_estimator is None:
         best_estimator = base_estimator
@@ -3118,6 +3310,10 @@ def train_and_evaluate_model(
                 "created_at": rej_ts,
                 "status": "rejected_by_quality_gate",
                 "estimator_name": estimator_name,
+                "search_backend": str(search_backend_used),
+                "optuna_trials": (int(optuna_trials_effective) if search_backend_used == "optuna" and optuna_trials_effective is not None else None),
+                "optuna_best_score": (float(best_score) if search_backend_used == "optuna" and best_params is not None else None),
+                "optuna_best_params": (dict(best_params or {}) if search_backend_used == "optuna" else None),
                 "best_params": best_params or {},
                 "decision_threshold": float(decision_threshold),
                 "ternary_threshold_short": float(ternary_threshold_short),
@@ -3172,6 +3368,10 @@ def train_and_evaluate_model(
         "model": calibrated_estimator,
         "features": list(X_all.columns),
         "estimator_name": estimator_name,
+        "search_backend": str(search_backend_used),
+        "optuna_trials": (int(optuna_trials_effective) if search_backend_used == "optuna" and optuna_trials_effective is not None else None),
+        "optuna_best_score": (float(best_score) if search_backend_used == "optuna" and best_params is not None else None),
+        "optuna_best_params": (dict(best_params or {}) if search_backend_used == "optuna" else None),
         "best_params": best_params or {},
         "cv_results_full": [],
         "decision_threshold": float(decision_threshold),
@@ -3219,6 +3419,10 @@ def train_and_evaluate_model(
         "created_at": ts,
         "created_at_iso": datetime.now().isoformat(),
         "estimator_name": estimator_name,
+        "search_backend": str(search_backend_used),
+        "optuna_trials": (int(optuna_trials_effective) if search_backend_used == "optuna" and optuna_trials_effective is not None else None),
+        "optuna_best_score": (float(best_score) if search_backend_used == "optuna" and best_params is not None else None),
+        "optuna_best_params": (dict(best_params or {}) if search_backend_used == "optuna" else None),
         "sklearn_version": runtime_sklearn_version(),
         "python_version": runtime_python_version(),
         "best_params": best_params or {},
@@ -3312,9 +3516,13 @@ def train_and_evaluate_model(
         "output_path": str(fpath),
         "best_score": float(best_score),
         "best_params": best_params or {},
+        "search_backend": str(search_backend_used),
+        "optuna_trials": (int(optuna_trials_effective) if search_backend_used == "optuna" and optuna_trials_effective is not None else None),
+        "optuna_best_score": (float(best_score) if search_backend_used == "optuna" and best_params is not None else None),
+        "optuna_best_params": (dict(best_params or {}) if search_backend_used == "optuna" else None),
         "n_features": len(X_all.columns),
         "decision_threshold": float(decision_threshold),
-        "cv_records_len": 0,
+        "cv_records_len": int(len(candidate_records)),
         "n_total_bars": int(n_total),
         "n_train_bars": int(n_train_effective),
         "n_train_bars_pre_guard": int(n_train_pre_guard),

@@ -325,6 +325,38 @@ def _find_existing_raw_contract_csv(
     return candidates[0]
 
 
+def _resolve_contract_csv_candidate(
+    raw_root: str | Path,
+    *,
+    symbol: str,
+    expiry: str,
+    bar_size: str,
+    preferred_path: str | Path | None = None,
+) -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+    if preferred_path:
+        try:
+            candidates.append(_read_csv_time_bounds(preferred_path))
+        except Exception:
+            pass
+    existing = _find_existing_raw_contract_csv(
+        raw_root,
+        symbol=symbol,
+        expiry=expiry,
+        bar_size=bar_size,
+    )
+    if existing is not None:
+        candidates.append(existing)
+    if not candidates:
+        return None
+    deduped: dict[str, dict[str, Any]] = {}
+    for item in candidates:
+        deduped[str(item["path"])] = item
+    ranked = list(deduped.values())
+    ranked.sort(key=lambda item: (item["end"], -item["start"].timestamp(), item["mtime"]), reverse=True)
+    return ranked[0]
+
+
 def _write_contract_history_csv(
     df: pd.DataFrame,
     *,
@@ -357,6 +389,191 @@ def _merge_contract_csvs(existing_path: str | Path, incoming_path: str | Path) -
     merged = pd.concat([existing, incoming], ignore_index=True)
     merged = merged.sort_values("date").drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
     return merged
+
+
+def update_gc_roll_chain_latest_contract(
+    *,
+    start_date: datetime,
+    end_date: datetime | None,
+    expiries: list[str],
+    bar_size: str,
+    output_dir: str | Path | None = None,
+    raw_dir: str | Path | None = None,
+    preferred_contract_paths: dict[str, str] | None = None,
+    progress_cb=None,
+) -> dict[str, Any]:
+    from ibkr_trading_bot.utils.download_ibkr_data import download_ibkr_by_date_range
+
+    if len(expiries) < 2:
+        raise ValueError("Pro GC roll-chain update jsou potreba alespon 2 expirace.")
+
+    raw_root = Path(raw_dir or RAW_DIR).expanduser().resolve()
+    raw_root.mkdir(parents=True, exist_ok=True)
+    preferred = {str(k): str(v) for k, v in (preferred_contract_paths or {}).items() if str(k).strip()}
+    contract_paths: list[str] = []
+    download_summary = {
+        "requested_contracts": int(len(expiries)),
+        "fresh_downloads": 0,
+        "incremental_updates": 0,
+        "reused_existing": 0,
+        "no_new_data_reuse": 0,
+    }
+
+    latest_expiry = str(expiries[-1])
+    step_delta = timedelta(minutes=bar_size_to_minutes(bar_size))
+    overlap_delta = timedelta(minutes=bar_size_to_minutes(bar_size) * RAW_UPDATE_OVERLAP_BARS)
+
+    for expiry in expiries[:-1]:
+        expiry_text = str(expiry)
+        existing = _resolve_contract_csv_candidate(
+            raw_root,
+            symbol="GC",
+            expiry=expiry_text,
+            bar_size=bar_size,
+            preferred_path=preferred.get(expiry_text),
+        )
+        if existing is None:
+            raise ValueError(
+                f"Chybi historicky raw CSV pro expiraci {expiry_text}. "
+                "Pro tento dataset je potreba nejdriv plny rebuild."
+            )
+        if callable(progress_cb):
+            progress_cb(
+                f"[ROLL][UPDATE] Reuse historical {expiry_text}: {Path(existing['path']).name} | "
+                f"{pd.Timestamp(existing['start']).strftime('%Y-%m-%d')} -> "
+                f"{pd.Timestamp(existing['end']).strftime('%Y-%m-%d')}"
+            )
+        contract_paths.append(str(existing["path"]))
+        download_summary["reused_existing"] += 1
+
+    previous_expiry = str(expiries[-2])
+    latest_start = effective_download_start_for_expiry(
+        latest_expiry,
+        start_date,
+        previous_expiry,
+        overlap_days=ROLL_OVERLAP_DAYS,
+    )
+    latest_end = effective_download_end_for_expiry(latest_expiry, end_date)
+    fresh_enough_end = latest_end - step_delta
+    existing_latest = _resolve_contract_csv_candidate(
+        raw_root,
+        symbol="GC",
+        expiry=latest_expiry,
+        bar_size=bar_size,
+        preferred_path=preferred.get(latest_expiry),
+    )
+
+    if callable(progress_cb):
+        progress_cb(
+            f"[ROLL][UPDATE] Aktualizuji pouze posledni expiraci {latest_expiry}: "
+            f"{latest_start.strftime('%Y-%m-%d')} -> {latest_end.strftime('%Y-%m-%d')}"
+        )
+
+    if existing_latest and existing_latest["start"] <= latest_start + step_delta and existing_latest["end"] >= fresh_enough_end:
+        if callable(progress_cb):
+            progress_cb(
+                f"[ROLL][UPDATE] Latest reuse {latest_expiry}: {Path(existing_latest['path']).name} | "
+                f"{pd.Timestamp(existing_latest['start']).strftime('%Y-%m-%d')} -> "
+                f"{pd.Timestamp(existing_latest['end']).strftime('%Y-%m-%d')}"
+            )
+        contract_paths.append(str(existing_latest["path"]))
+        download_summary["reused_existing"] += 1
+    elif existing_latest and existing_latest["start"] <= latest_start + step_delta:
+        fetch_start = max(latest_start, existing_latest["end"] - overlap_delta)
+        if callable(progress_cb):
+            progress_cb(
+                f"[ROLL][UPDATE] Latest incremental {latest_expiry}: "
+                f"doplnuji od {fetch_start.strftime('%Y-%m-%d %H:%M')}"
+            )
+        try:
+            incremental_path = download_ibkr_by_date_range(
+                symbol="GC",
+                start_date=fetch_start,
+                end_date=latest_end,
+                bar_size=bar_size,
+                contract_mode="FUT",
+                expiry=latest_expiry,
+                output_dir=str(raw_root),
+                max_bars_per_batch=5000,
+                on_progress=(
+                    (lambda bn, _tb, rec, expiry_label=latest_expiry: progress_cb(
+                        f"[IBKR][{expiry_label}] Batch {bn}: {rec} baru"
+                    ))
+                    if callable(progress_cb)
+                    else None
+                ),
+            )
+        except RuntimeError as exc:
+            if existing_latest and "Ĺ˝ĂˇdnĂˇ data se nestĂˇhla" in str(exc):
+                if callable(progress_cb):
+                    progress_cb(
+                        f"[ROLL][UPDATE] Bez novych dat pro {latest_expiry}, "
+                        f"pouzivam {Path(existing_latest['path']).name}"
+                    )
+                contract_paths.append(str(existing_latest["path"]))
+                download_summary["reused_existing"] += 1
+                download_summary["no_new_data_reuse"] += 1
+            else:
+                raise
+        else:
+            merged_df = _merge_contract_csvs(existing_latest["path"], incremental_path)
+            merged_path = _write_contract_history_csv(
+                merged_df,
+                symbol="GC",
+                expiry=latest_expiry,
+                bar_size=bar_size,
+                requested_start=latest_start,
+                output_dir=raw_root,
+            )
+            contract_paths.append(merged_path)
+            download_summary["incremental_updates"] += 1
+    else:
+        if callable(progress_cb):
+            progress_cb(
+                f"[ROLL][UPDATE] Latest fresh {latest_expiry}: "
+                f"stahuji od {latest_start.strftime('%Y-%m-%d %H:%M')}"
+            )
+        latest_path = download_ibkr_by_date_range(
+            symbol="GC",
+            start_date=latest_start,
+            end_date=latest_end,
+            bar_size=bar_size,
+            contract_mode="FUT",
+            expiry=latest_expiry,
+            output_dir=str(raw_root),
+            max_bars_per_batch=5000,
+            on_progress=(
+                (lambda bn, _tb, rec, expiry_label=latest_expiry: progress_cb(
+                    f"[IBKR][{expiry_label}] Batch {bn}: {rec} baru"
+                ))
+                if callable(progress_cb)
+                else None
+            ),
+        )
+        contract_paths.append(str(latest_path))
+        download_summary["fresh_downloads"] += 1
+
+    result = build_gc_roll_chain_dataset(
+        contract_paths,
+        output_dir=output_dir,
+        symbol="GC",
+        exchange="COMEX",
+        bar_size=bar_size,
+        progress_cb=progress_cb,
+    )
+    summary_text = (
+        f"fresh={download_summary['fresh_downloads']} | "
+        f"update={download_summary['incremental_updates']} | "
+        f"reuse={download_summary['reused_existing']} | "
+        f"no_new={download_summary['no_new_data_reuse']}"
+    )
+    if callable(progress_cb):
+        progress_cb(f"[ROLL][UPDATE] Souhrn: {summary_text}")
+    result["download_summary"] = dict(download_summary)
+    result["status_text"] = f"{result['status_text']} | {summary_text}"
+    if isinstance(result.get("meta"), dict):
+        result["meta"]["download_summary"] = dict(download_summary)
+    return result
 
 
 def _first_active_ts(df: pd.DataFrame) -> pd.Timestamp:

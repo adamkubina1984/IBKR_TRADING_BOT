@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -36,6 +37,7 @@ from ibkr_trading_bot.core.services.model_training_service import (
     training_profile_for_mode,
 )
 from ibkr_trading_bot.model.train_models import (
+    HAS_OPTUNA,
     _model_dir,
     _select_feature_columns,
     _ternary_predict_mapped,
@@ -112,8 +114,6 @@ class TrainWorker(QThread):
 
     def run(self):
         try:
-            self.phase.emit("grid")
-
             def cb(idx, total, params, mean_f1, std_f1):
                 self.progress.emit(int(idx), int(total), dict(params), float(mean_f1), float(std_f1))
 
@@ -146,6 +146,10 @@ class TrainWorker(QThread):
                 max_param_candidates = None
             param_sample_seed = int(profile.get("param_sample_seed", 42))
             mc_block_len = int(profile.get("mc_block_len", self.meta_extra.get("mc_block_len", 100)))
+            search_backend = profile.get("search_backend", "grid")
+            optuna_trials = profile.get("optuna_trials")
+            optuna_timeout_seconds = profile.get("optuna_timeout_seconds")
+            self.phase.emit(str(search_backend))
 
             train_and_evaluate_model(
                 self.df_full,
@@ -175,6 +179,9 @@ class TrainWorker(QThread):
                 quality_min_holdout_sharpe=quality_min_holdout_sharpe,
                 max_param_candidates=max_param_candidates,
                 param_sample_seed=param_sample_seed,
+                search_backend=search_backend,
+                optuna_trials=optuna_trials,
+                optuna_timeout_seconds=optuna_timeout_seconds,
                 training_mode=training_mode,
                 candidate_chain_enabled=candidate_chain_enabled,
                 candidate_selection_criterion=candidate_selection_criterion,
@@ -591,6 +598,23 @@ class ModelTrainingTab(QWidget):
         self.cmb_candidate_fresh_pct.addItems(["20", "30", "40", "50"])
         self.cmb_candidate_fresh_pct.setCurrentText("30")
         row.addWidget(self.cmb_candidate_fresh_pct)
+        row.addWidget(QLabel("Backend:"))
+        self.cmb_search_backend = QComboBox()
+        self.cmb_search_backend.addItems(["grid", "optuna"])
+        self.cmb_search_backend.setCurrentText("grid")
+        self.cmb_search_backend.currentTextChanged.connect(self._on_search_backend_changed)
+        row.addWidget(self.cmb_search_backend)
+        std_profile = training_profile_for_mode("standard")
+        row.addWidget(QLabel("Trials:"))
+        self.spn_optuna_trials = QSpinBox()
+        self.spn_optuna_trials.setRange(1, 1000)
+        self.spn_optuna_trials.setValue(int(std_profile.get("optuna_trials", 24)))
+        row.addWidget(self.spn_optuna_trials)
+        row.addWidget(QLabel("Timeout [s]:"))
+        self.spn_optuna_timeout = QSpinBox()
+        self.spn_optuna_timeout.setRange(1, 86400)
+        self.spn_optuna_timeout.setValue(int(std_profile.get("optuna_timeout_seconds", 300)))
+        row.addWidget(self.spn_optuna_timeout)
         row.addWidget(QLabel("Auto profil:"))
         self.cmb_auto_search_profile = QComboBox()
         self.cmb_auto_search_profile.addItems(["fast", "full", "weekly"])
@@ -630,6 +654,7 @@ class ModelTrainingTab(QWidget):
         self.log.setPlaceholderText("Hlasky treninku a evaluace...")
         lay3.addWidget(self.log)
         root.addWidget(box3, 1)
+        self._on_search_backend_changed()
 
     def _current_training_mode(self) -> str:
         txt = (self.cmb_training_mode.currentText() or "").strip().lower()
@@ -637,6 +662,62 @@ class ModelTrainingTab(QWidget):
 
     def _training_profile_for_mode(self, mode: str) -> dict[str, Any]:
         return training_profile_for_mode(mode)
+
+    def _selected_search_backend(self) -> str:
+        txt = (self.cmb_search_backend.currentText() or "").strip().lower()
+        return txt if txt in {"grid", "optuna"} else "grid"
+
+    def _selected_optuna_trials(self) -> int:
+        try:
+            return int(self.spn_optuna_trials.value())
+        except Exception:
+            return 24
+
+    def _selected_optuna_timeout_seconds(self) -> int:
+        try:
+            return int(self.spn_optuna_timeout.value())
+        except Exception:
+            return 300
+
+    def _on_search_backend_changed(self, *_args):
+        optuna_enabled = self._selected_search_backend() == "optuna"
+        self.spn_optuna_trials.setEnabled(optuna_enabled)
+        self.spn_optuna_timeout.setEnabled(optuna_enabled)
+        self._refresh_train_button_text()
+
+    def _apply_search_backend_profile_overrides(self, profile: dict[str, Any] | None) -> dict[str, Any]:
+        out = dict(profile or {})
+        out["search_backend"] = self._selected_search_backend()
+        out["optuna_trials"] = int(self._selected_optuna_trials())
+        out["optuna_timeout_seconds"] = int(self._selected_optuna_timeout_seconds())
+        return out
+
+    def _log_search_backend_hint(self, *, estimators: list[str] | None = None):
+        backend = self._selected_search_backend()
+        if backend != "optuna":
+            return
+        if not HAS_OPTUNA:
+            self.log.appendPlainText(
+                "WARN Optuna backend byl zvolen, ale Optuna neni nainstalovana. Pipeline fallbackne na grid."
+            )
+            return
+        if estimators is None:
+            self.log.appendPlainText(
+                "INFO Optuna backend se pouzije pro hgbt/lgb; ostatni estimatory fallbacknou na grid."
+            )
+            return
+        unsupported = sorted(
+            {
+                str(est).strip().lower()
+                for est in (estimators or [])
+                if str(est).strip().lower() not in {"hgbt", "histgb", "histgradientboosting", "lgb", "lightgbm"}
+            }
+        )
+        if unsupported:
+            self.log.appendPlainText(
+                "INFO Optuna backend podporuje jen hgbt/lgb; "
+                f"estimator(y) {unsupported} fallbacknou na grid."
+            )
 
     def _refresh_train_button_text(self):
         mode = self._current_training_mode()
@@ -675,6 +756,9 @@ class ModelTrainingTab(QWidget):
         self.cmb_candidate_criterion.setEnabled(not running)
         self.cmb_candidate_top_n.setEnabled(not running)
         self.cmb_candidate_fresh_pct.setEnabled(not running)
+        self.cmb_search_backend.setEnabled(not running)
+        self.spn_optuna_trials.setEnabled((not running) and (self._selected_search_backend() == "optuna"))
+        self.spn_optuna_timeout.setEnabled((not running) and (self._selected_search_backend() == "optuna"))
         self.cmb_auto_search_profile.setEnabled(not running)
         self.btn_train.setEnabled((not running) and (self.dataset is not None))
         self.btn_auto_search.setEnabled((not running) and (self.dataset is not None))
@@ -774,7 +858,7 @@ class ModelTrainingTab(QWidget):
 
         est = self.cmb_model.currentText().strip().lower()
         mode = self._current_training_mode()
-        profile = self._training_profile_for_mode(mode)
+        profile = self._apply_search_backend_profile_overrides(self._training_profile_for_mode(mode))
         profile["training_mode"] = mode
         profile["candidate_chain_enabled"] = True
         profile["candidate_selection_criterion"] = self._current_candidate_criterion()
@@ -782,6 +866,7 @@ class ModelTrainingTab(QWidget):
         profile["candidate_fresh_ratio"] = float(
             np.clip(self._current_candidate_fresh_ratio(), 0.05, 0.80)
         )
+        self._log_search_backend_hint(estimators=[est])
         df = self.dataset.copy().sort_values("timestamp").reset_index(drop=True)
         n_total = len(df)
         n_hold = self._compute_holdout_bars(n_total)
@@ -829,6 +914,9 @@ class ModelTrainingTab(QWidget):
             "INFO Training mode: "
             f"{mode} | cv={int(profile.get('n_splits', 5))} "
             f"top_k={int(profile.get('top_k_features', 12))} "
+            f"search_backend={profile.get('search_backend', 'grid')} "
+            f"optuna_trials={profile.get('optuna_trials')} "
+            f"optuna_timeout={profile.get('optuna_timeout_seconds')}s "
             f"grid_used<={profile.get('max_param_candidates')} "
             f"mc_enabled={bool(profile.get('mc_enabled', True))} "
             f"mc_iters={int(profile.get('mc_iters', 200))} "
@@ -904,11 +992,12 @@ class ModelTrainingTab(QWidget):
         auto_profile = self._current_auto_search_profile()
         state_path = self._auto_search_state_path(auto_profile)
         profiles = {
-            "quick": self._training_profile_for_mode("quick"),
-            "standard": self._training_profile_for_mode("standard"),
+            "quick": self._apply_search_backend_profile_overrides(self._training_profile_for_mode("quick")),
+            "standard": self._apply_search_backend_profile_overrides(self._training_profile_for_mode("standard")),
         }
         top_n = int(max(1, self._current_candidate_top_n()))
         fresh_ratio = float(np.clip(self._current_candidate_fresh_ratio(), 0.05, 0.80))
+        self._log_search_backend_hint()
 
         self.auto_worker = AutoSearchWorker(
             csv_path=self.csv_path,
@@ -928,6 +1017,9 @@ class ModelTrainingTab(QWidget):
         self.auto_worker.finished.connect(self._on_auto_worker_finished)
         self.log.appendPlainText(
             f"INFO Auto-search start: profile={auto_profile} checkpoint={state_path.as_posix()} "
+            f"| backend={self._selected_search_backend()} "
+            f"optuna_trials={self._selected_optuna_trials()} "
+            f"optuna_timeout={self._selected_optuna_timeout_seconds()}s "
             f"| topN={top_n} fresh={fresh_ratio:.2f}"
         )
         self.auto_worker.start()
@@ -965,7 +1057,10 @@ class ModelTrainingTab(QWidget):
             f"h={horizon} tp={tp_bps} sl={sl_bps} "
             f"status={status} profit_net={_fmt(row.get('profit_net'), 2)} "
             f"sharpe={_fmt(row.get('sharpe'), 4)} pf={_fmt(row.get('pf'), 4)} "
-            f"trades={int(row.get('trades', 0) or 0)}"
+            f"trades={int(row.get('trades', 0) or 0)} "
+            f"backend={row.get('search_backend_used') or 'n/a'} "
+            f"requested={row.get('search_backend_requested') or 'n/a'} "
+            f"fallback={row.get('search_backend_fallback_reason') or 'none'}"
         )
         if status != "ok":
             reasons = row.get("qg_reasons") or []
@@ -1091,6 +1186,13 @@ class ModelTrainingTab(QWidget):
                     if isinstance(sp, dict) and sp:
                         self.log.appendPlainText(
                             "INFO Search plan: "
+                            f"backend={sp.get('search_backend_used')} "
+                            f"requested={sp.get('search_backend_requested')} "
+                            f"fallback={sp.get('search_backend_fallback_reason')} "
+                            f"optuna_trials={sp.get('optuna_trials_effective') or sp.get('optuna_trials_requested')} "
+                            f"optuna_timeout={sp.get('optuna_timeout_seconds')} "
+                            f"optuna_done={sp.get('optuna_completed_trials')} "
+                            f"optuna_pruned={sp.get('optuna_pruned_trials')} "
                             f"grid_total={sp.get('grid_total_candidates')} "
                             f"grid_used={sp.get('grid_used_candidates')} "
                             f"sampled={sp.get('sampled_candidates')} "

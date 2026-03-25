@@ -22,7 +22,7 @@ Requires-Dist: PySide6>=6.7.0
 Requires-Dist: matplotlib>=3.8.0
 Requires-Dist: plotly>=5.20.0
 Requires-Dist: seaborn>=0.13.0
-Requires-Dist: scikit-learn>=1.4.0
+Requires-Dist: scikit-learn==1.8.0
 Requires-Dist: xgboost>=2.0.0
 Requires-Dist: lightgbm>=4.3.0
 Requires-Dist: shap>=0.44.0
@@ -46,6 +46,8 @@ Requires-Dist: pre-commit>=3.5.0; extra == "dev"
 Provides-Extra: dl
 Requires-Dist: tensorflow>=2.16.0; extra == "dl"
 Requires-Dist: torch>=2.2.0; extra == "dl"
+Provides-Extra: optuna
+Requires-Dist: optuna>=3.6.0; extra == "optuna"
 
 \## Quickstart
 
@@ -71,6 +73,8 @@ python -m venv .venv
 
 pip install -r requirements.txt
 
+\# Po změně pinu scikit-learn obnov virtuální prostředí nebo proveď čistý reinstall závislostí.
+
 
 
 \# 3) Generování featur z historických dat (CSV se sloupci: timestamp, open/high/low/close/volume)
@@ -94,6 +98,5 @@ python -m ibkr\_trading\_bot.main evaluate --model model\_outputs/model.pkl --fe
 \# 6) Spuštění desktop GUI
 
 python -m ibkr\_trading\_bot.main gui
-
 
 
