@@ -183,12 +183,40 @@ def feature_names_for_model_eval(model: Any) -> list[str] | None:
     except Exception:
         pass
     try:
+        names = getattr(model, "feature_name_", None)
+        if names is not None:
+            out = [str(x) for x in list(names) if str(x)]
+            if out:
+                return out
+    except Exception:
+        pass
+    try:
+        booster = getattr(model, "booster_", None)
+        if booster is not None and hasattr(booster, "feature_name"):
+            names = booster.feature_name()
+            out = [str(x) for x in list(names) if str(x)]
+            if out:
+                return out
+    except Exception:
+        pass
+    try:
         steps = getattr(model, "steps", None)
         if steps:
             last = steps[-1][1]
             names = getattr(last, "feature_names_in_", None)
             if names is not None:
                 return [str(x) for x in list(names)]
+            names = getattr(last, "feature_name_", None)
+            if names is not None:
+                out = [str(x) for x in list(names) if str(x)]
+                if out:
+                    return out
+            booster = getattr(last, "booster_", None)
+            if booster is not None and hasattr(booster, "feature_name"):
+                names = booster.feature_name()
+                out = [str(x) for x in list(names) if str(x)]
+                if out:
+                    return out
     except Exception:
         pass
     return None
@@ -335,13 +363,24 @@ def coerce_features_for_model_eval(X: pd.DataFrame | np.ndarray, model: Any, met
 
 
 def align_X_for_model_eval(model: Any, X: pd.DataFrame | np.ndarray) -> pd.DataFrame:
-    Xdf = X.copy() if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+    if isinstance(X, pd.DataFrame):
+        Xdf = X.copy()
+    else:
+        arr = np.asarray(X)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        Xdf = pd.DataFrame(arr)
     names = feature_names_for_model_eval(model)
     if names:
-        for name in names:
-            if name not in Xdf.columns:
-                Xdf[name] = 0.0
-        Xdf = Xdf.reindex(columns=names, fill_value=0.0)
+        if all(name in Xdf.columns for name in names):
+            Xdf = Xdf.reindex(columns=names, fill_value=0.0)
+        elif len(Xdf.columns) == len(names):
+            Xdf.columns = list(names)
+        else:
+            for name in names:
+                if name not in Xdf.columns:
+                    Xdf[name] = 0.0
+            Xdf = Xdf.reindex(columns=names, fill_value=0.0)
     med = Xdf.median(numeric_only=True)
     Xdf = Xdf.fillna(med).fillna(0.0)
     for column in Xdf.columns:

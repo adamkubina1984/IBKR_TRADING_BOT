@@ -10,6 +10,8 @@ from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -32,6 +34,7 @@ from ibkr_trading_bot.core.services.model_training_service import (
     training_profile_for_mode,
 )
 from ibkr_trading_bot.gui.components.workers import TaskWorker
+from ibkr_trading_bot.model.feature_stability import compute_feature_stability_score
 
 DEFAULT_MODEL_DIR = Path(__file__).parent.parent / "model_outputs"
 RANKING_NOTE_META_KEY = "model_ranking_note"
@@ -45,8 +48,22 @@ COL_EXIT = 6
 COL_TRADES = 7
 COL_SHARPE = 8
 COL_FEATURES = 9
-COL_CREATED = 10
-COL_NOTE = 11
+COL_STABILITY = 10
+COL_CREATED = 11
+COL_NOTE = 12
+
+STABILITY_FILTER_ALL = "all"
+STABILITY_FILTER_GOOD = "good"
+STABILITY_FILTER_EXCELLENT = "excellent"
+STABILITY_FILTER_LABELS = {
+    STABILITY_FILTER_ALL: "All",
+    STABILITY_FILTER_GOOD: "Good (>0.4)",
+    STABILITY_FILTER_EXCELLENT: "Excellent (>0.5)",
+}
+STABILITY_FILTER_THRESHOLDS = {
+    STABILITY_FILTER_GOOD: 0.4,
+    STABILITY_FILTER_EXCELLENT: 0.5,
+}
 
 
 def _as_float(x: Any, default: float = float("-inf")) -> float:
@@ -102,12 +119,22 @@ def _ranking_note_from_meta(meta: dict[str, Any]) -> str:
     return raw.replace("\r", " ").replace("\n", " ").strip()
 
 
-def _table_item(text: str, *, editable: bool = False) -> QTableWidgetItem:
+def _table_item(
+    text: str,
+    *,
+    editable: bool = False,
+    alignment: int | None = None,
+    tooltip: str | None = None,
+) -> QTableWidgetItem:
     item = QTableWidgetItem(text)
     flags = item.flags()
     if not editable:
         flags &= ~Qt.ItemIsEditable
     item.setFlags(flags)
+    if alignment is not None:
+        item.setTextAlignment(int(alignment))
+    if tooltip:
+        item.setToolTip(tooltip)
     return item
 
 
@@ -222,6 +249,211 @@ class StrictRejection:
     reason: str
 
 
+@dataclass(frozen=True)
+class FeatureStabilityRow:
+    feature_name: str
+    mean: float | None
+    std: float | None
+    stability_score: float | None
+
+
+@dataclass(frozen=True)
+class FeatureStabilityDetail:
+    rows: list[FeatureStabilityRow]
+    average_score: float | None
+    original_feature_count: int
+    filtered_feature_count: int
+    filter_threshold: float | None
+    filter_applied: bool
+    fallback_reason: str | None
+
+    @property
+    def has_data(self) -> bool:
+        return bool(self.rows)
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value]
+
+
+def _finite_float_or_none(value: Any) -> float | None:
+    parsed = model_eval_runtime.safe_float(value)
+    if parsed is None or not np.isfinite(parsed):
+        return None
+    return float(parsed)
+
+
+def _feature_stability_scores_from_meta(meta: dict[str, Any]) -> dict[str, float]:
+    raw_scores = meta.get("feature_stability_score")
+    if not isinstance(raw_scores, dict) or not raw_scores:
+        raw_scores = compute_feature_stability_score(meta.get("feature_stability"))
+
+    scores: dict[str, float] = {}
+    if not isinstance(raw_scores, dict):
+        return scores
+
+    for feature_name, score_raw in raw_scores.items():
+        score = _finite_float_or_none(score_raw)
+        if score is None:
+            continue
+        scores[str(feature_name)] = float(np.clip(score, 0.0, 1.0))
+    return scores
+
+
+def _feature_stability_detail_from_meta(meta: dict[str, Any]) -> FeatureStabilityDetail:
+    stability_stats = meta.get("feature_stability")
+    if not isinstance(stability_stats, dict):
+        stability_stats = {}
+
+    score_map = _feature_stability_scores_from_meta(meta)
+    feature_names: set[str] = set(score_map)
+    feature_names.update(str(feature_name) for feature_name in stability_stats)
+    if not feature_names:
+        return FeatureStabilityDetail(
+            rows=[],
+            average_score=None,
+            original_feature_count=0,
+            filtered_feature_count=0,
+            filter_threshold=_finite_float_or_none(meta.get("feature_stability_threshold")),
+            filter_applied=bool(meta.get("feature_stability_filter_applied")),
+            fallback_reason=(str(meta.get("feature_stability_filter_fallback_reason") or "").strip() or None),
+        )
+
+    rows: list[FeatureStabilityRow] = []
+    for feature_name in feature_names:
+        stats = stability_stats.get(feature_name)
+        stats_map = stats if isinstance(stats, dict) else {}
+        rows.append(
+            FeatureStabilityRow(
+                feature_name=str(feature_name),
+                mean=_finite_float_or_none(stats_map.get("mean")),
+                std=_finite_float_or_none(stats_map.get("std")),
+                stability_score=score_map.get(str(feature_name)),
+            )
+        )
+
+    rows.sort(
+        key=lambda row: (
+            row.stability_score is None,
+            -(row.stability_score if row.stability_score is not None else 0.0),
+            row.feature_name.lower(),
+        )
+    )
+
+    scores = [score for score in score_map.values() if np.isfinite(score)]
+    trained_features = _string_list(meta.get("trained_features") or meta.get("features"))
+    kept_features = _string_list(meta.get("features_kept_by_stability"))
+    removed_features = _string_list(meta.get("features_removed_by_stability"))
+
+    if kept_features or removed_features:
+        original_count = len(set(kept_features + removed_features))
+        filtered_count = len(kept_features) if kept_features else len(trained_features)
+    else:
+        original_names = set(trained_features)
+        original_names.update(feature_names)
+        original_count = len(original_names)
+        filtered_count = len(trained_features) if trained_features else len(original_names)
+
+    return FeatureStabilityDetail(
+        rows=rows,
+        average_score=(float(np.mean(scores)) if scores else None),
+        original_feature_count=int(original_count),
+        filtered_feature_count=int(filtered_count),
+        filter_threshold=_finite_float_or_none(meta.get("feature_stability_threshold")),
+        filter_applied=bool(meta.get("feature_stability_filter_applied")),
+        fallback_reason=(str(meta.get("feature_stability_filter_fallback_reason") or "").strip() or None),
+    )
+
+
+def _feature_stability_tooltip(detail: FeatureStabilityDetail) -> str:
+    if not detail.has_data:
+        return "Top 5 stable features: N/A"
+
+    lines = ["Top 5 stable features:"]
+    top_rows = [row for row in detail.rows if row.stability_score is not None][:5]
+    if not top_rows:
+        lines.append("- N/A")
+    else:
+        for row in top_rows:
+            lines.append(f"- {row.feature_name}: {row.stability_score:.3f}")
+    lines.append("")
+    lines.append(f"Features: {detail.original_feature_count} -> {detail.filtered_feature_count}")
+    return "\n".join(lines)
+
+
+class FeatureStabilityDetailDialog(QDialog):
+    def __init__(self, parent: QWidget | None, *, model_name: str, detail: FeatureStabilityDetail):
+        super().__init__(parent)
+        self.setWindowTitle(f"Feature Stability - {model_name}")
+        self.setModal(True)
+        self.resize(760, 420)
+
+        summary_parts = [
+            f"Puvodni featury: {detail.original_feature_count}",
+            f"Po filtrovani: {detail.filtered_feature_count}",
+        ]
+        if detail.filter_threshold is not None:
+            summary_parts.append(f"Threshold: {detail.filter_threshold:.3f}")
+        if detail.filter_applied:
+            summary_parts.append("Filtr aplikovan")
+        elif detail.filter_threshold is not None:
+            summary_parts.append("Filtr neaplikovan")
+        if detail.fallback_reason:
+            summary_parts.append(f"Fallback: {detail.fallback_reason}")
+
+        summary = QLabel(" | ".join(summary_parts), self)
+        summary.setWordWrap(True)
+
+        table = QTableWidget(self)
+        table.setColumnCount(4)
+        table.setRowCount(len(detail.rows))
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setHorizontalHeaderLabels(["Feature", "Mean", "Std", "Stability"])
+        table.horizontalHeader().setStretchLastSection(True)
+        for row_idx, row in enumerate(detail.rows):
+            table.setItem(row_idx, 0, _table_item(row.feature_name))
+            table.setItem(
+                row_idx,
+                1,
+                _table_item(
+                    "-" if row.mean is None else f"{row.mean:.3f}",
+                    alignment=Qt.AlignRight | Qt.AlignVCenter,
+                ),
+            )
+            table.setItem(
+                row_idx,
+                2,
+                _table_item(
+                    "-" if row.std is None else f"{row.std:.3f}",
+                    alignment=Qt.AlignRight | Qt.AlignVCenter,
+                ),
+            )
+            table.setItem(
+                row_idx,
+                3,
+                _table_item(
+                    "-" if row.stability_score is None else f"{row.stability_score:.3f}",
+                    alignment=Qt.AlignCenter,
+                ),
+            )
+
+        btn_close = QPushButton("Zavrit", self)
+        btn_close.clicked.connect(self.accept)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_row.addWidget(btn_close)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(summary)
+        layout.addWidget(table)
+        layout.addLayout(btn_row)
+
+
 def discover_ranking_models(dir_path: Path) -> list[RankingRecord]:
     records: list[RankingRecord] = []
     if not dir_path.exists():
@@ -287,6 +519,13 @@ class ModelRankingTab(QWidget):
         self.btn_strict_top5 = QPushButton("Spustit strict Top 5", self)
         self.btn_delete = QPushButton("Smazat vybrane", self)
         self.btn_load = QPushButton("Nacist vybrany model", self)
+        self.cmb_stability_filter = QComboBox(self)
+        self.cmb_stability_filter.addItem(STABILITY_FILTER_LABELS[STABILITY_FILTER_ALL], STABILITY_FILTER_ALL)
+        self.cmb_stability_filter.addItem(STABILITY_FILTER_LABELS[STABILITY_FILTER_GOOD], STABILITY_FILTER_GOOD)
+        self.cmb_stability_filter.addItem(
+            STABILITY_FILTER_LABELS[STABILITY_FILTER_EXCELLENT],
+            STABILITY_FILTER_EXCELLENT,
+        )
         self.btn_delete.hide()
         self.btn_load.hide()
 
@@ -295,7 +534,7 @@ class ModelRankingTab(QWidget):
         self.lbl_selected = QLabel("Vybrano: -", self)
 
         self.tbl = QTableWidget(self)
-        self.tbl.setColumnCount(12)
+        self.tbl.setColumnCount(13)
         self.tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tbl.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.tbl.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
@@ -311,6 +550,7 @@ class ModelRankingTab(QWidget):
                 "Trades(H)",
                 "Sharpe(H)",
                 "#Feats",
+                "Stability",
                 "Vytvoren",
                 "Poznamka",
             ]
@@ -322,6 +562,8 @@ class ModelRankingTab(QWidget):
         top.addWidget(self.dir_edit)
         top.addWidget(self.btn_browse)
         top.addWidget(self.btn_refresh)
+        top.addWidget(QLabel("Stability:"))
+        top.addWidget(self.cmb_stability_filter)
 
         actions = QHBoxLayout()
         actions.addWidget(self.btn_recompute_all)
@@ -337,6 +579,7 @@ class ModelRankingTab(QWidget):
         layout.addWidget(self.lbl_status)
 
         self.records: list[RankingRecord] = []
+        self._visible_records: list[RankingRecord] = []
         self._last_snapshot: tuple[tuple[str, int, int], ...] = ()
         self._last_context_fingerprint: tuple[Any, ...] | None = None
         self._ranking_worker: TaskWorker | None = None
@@ -350,7 +593,9 @@ class ModelRankingTab(QWidget):
         self.btn_strict_top5.clicked.connect(self._on_strict_top5_clicked)
         self.btn_delete.clicked.connect(self._on_delete_selected)
         self.btn_load.clicked.connect(self._on_load_selected)
+        self.cmb_stability_filter.currentIndexChanged.connect(self._on_stability_filter_changed)
         self.tbl.itemSelectionChanged.connect(self._on_selection_changed)
+        self.tbl.cellClicked.connect(self._on_cell_clicked)
         self.tbl.cellDoubleClicked.connect(self._on_cell_double_clicked)
         self.tbl.itemChanged.connect(self._on_table_item_changed)
 
@@ -449,6 +694,41 @@ class ModelRankingTab(QWidget):
         self._update_context_label()
         return True
 
+    def set_stability_filter(self, mode: str | None) -> None:
+        normalized_mode = str(mode or STABILITY_FILTER_ALL).strip().lower()
+        available_modes = {
+            str(self.cmb_stability_filter.itemData(idx))
+            for idx in range(self.cmb_stability_filter.count())
+        }
+        if normalized_mode not in available_modes:
+            normalized_mode = STABILITY_FILTER_ALL
+        idx = self.cmb_stability_filter.findData(normalized_mode)
+        if idx >= 0 and idx != self.cmb_stability_filter.currentIndex():
+            self.cmb_stability_filter.setCurrentIndex(idx)
+        elif idx < 0 and self.cmb_stability_filter.currentIndex() != 0:
+            self.cmb_stability_filter.setCurrentIndex(0)
+
+    def _stability_filter_threshold(self) -> float | None:
+        mode = str(self.cmb_stability_filter.currentData() or STABILITY_FILTER_ALL)
+        return STABILITY_FILTER_THRESHOLDS.get(mode)
+
+    def _filtered_records(self) -> list[RankingRecord]:
+        threshold = self._stability_filter_threshold()
+        if threshold is None:
+            return list(self.records)
+        return [
+            record
+            for record in self.records
+            if (
+                (detail := _feature_stability_detail_from_meta(record.meta)).average_score is not None
+                and detail.average_score > threshold
+            )
+        ]
+
+    def _on_stability_filter_changed(self) -> None:
+        self._render_table()
+        self._on_selection_changed()
+
     def _render_table(self) -> None:
         selected = self._selected_record()
         selected_path = None
@@ -458,10 +738,13 @@ class ModelRankingTab(QWidget):
             except Exception:
                 selected_path = selected.model_path
 
+        visible_records = self._filtered_records()
+        self._visible_records = list(visible_records)
         self.tbl.blockSignals(True)
-        self.tbl.setRowCount(len(self.records))
-        for row, record in enumerate(self.records):
+        self.tbl.setRowCount(len(visible_records))
+        for row, record in enumerate(visible_records):
             ranking = record.ranking or {}
+            stability_detail = _feature_stability_detail_from_meta(record.meta)
             training_mode = _training_mode_label(record.meta)
             note = _ranking_note_from_meta(record.meta)
             status = str(ranking.get("status") or ("meta" if record.metrics else "-")).strip().lower()
@@ -492,12 +775,21 @@ class ModelRankingTab(QWidget):
             self.tbl.setItem(row, COL_TRADES, _table_item("-" if trades is None else f"{trades:.0f}"))
             self.tbl.setItem(row, COL_SHARPE, _table_item("-" if sharpe is None else f"{sharpe:.3f}"))
             self.tbl.setItem(row, COL_FEATURES, _table_item(str(record.features_n)))
+            self.tbl.setItem(
+                row,
+                COL_STABILITY,
+                _table_item(
+                    "-" if stability_detail.average_score is None else f"{stability_detail.average_score:.3f}",
+                    alignment=Qt.AlignCenter,
+                    tooltip=_feature_stability_tooltip(stability_detail),
+                ),
+            )
             self.tbl.setItem(row, COL_CREATED, _table_item(record.created or ""))
             self.tbl.setItem(row, COL_NOTE, _table_item(note, editable=True))
         self.tbl.blockSignals(False)
 
         if selected_path is not None:
-            for row, record in enumerate(self.records):
+            for row, record in enumerate(visible_records):
                 try:
                     record_path = record.model_path.resolve()
                 except Exception:
@@ -506,23 +798,58 @@ class ModelRankingTab(QWidget):
                     self.tbl.setCurrentCell(row, 0)
                     return
 
+    def _record_for_row(self, row: int) -> RankingRecord | None:
+        if row < 0 or row >= len(self._visible_records):
+            return None
+        return self._visible_records[row]
+
+    def _build_feature_stability_detail(self, record: RankingRecord) -> FeatureStabilityDetail:
+        return _feature_stability_detail_from_meta(record.meta)
+
+    def _show_feature_stability_detail(self, record: RankingRecord) -> None:
+        detail = self._build_feature_stability_detail(record)
+        if not detail.has_data:
+            QMessageBox.information(
+                self,
+                "Feature Stability",
+                f"Model {record.model_path.name} nema dostupna stability metadata.",
+            )
+            return
+
+        dialog = FeatureStabilityDetailDialog(
+            self,
+            model_name=record.model_path.name,
+            detail=detail,
+        )
+        dialog.exec()
+
+    def _on_cell_clicked(self, row: int, column: int) -> None:
+        if column != COL_STABILITY:
+            return
+        record = self._record_for_row(row)
+        if record is not None:
+            self._show_feature_stability_detail(record)
+
     def _on_cell_double_clicked(self, row: int, column: int) -> None:
         if column == COL_NOTE:
             item = self.tbl.item(row, column)
             if item is not None:
                 self.tbl.editItem(item)
             return
-        if 0 <= row < len(self.records):
-            self._load_record_into_tabs(self.records[row], activate_eval_tab=True, auto_evaluate=True)
+        if column == COL_STABILITY:
+            return
+        record = self._record_for_row(row)
+        if record is not None:
+            self._load_record_into_tabs(record, activate_eval_tab=True, auto_evaluate=True)
 
     def _on_table_item_changed(self, item: QTableWidgetItem) -> None:
         if item.column() != COL_NOTE:
             return
         row = item.row()
-        if row < 0 or row >= len(self.records):
+        if row < 0 or row >= len(self._visible_records):
             return
 
-        record = self.records[row]
+        record = self._visible_records[row]
         new_note = str(item.text() or "").replace("\r", " ").replace("\n", " ").strip()
         old_note = _ranking_note_from_meta(record.meta)
         if new_note == old_note:
@@ -558,9 +885,9 @@ class ModelRankingTab(QWidget):
 
     def _selected_record(self) -> RankingRecord | None:
         row = self.tbl.currentRow()
-        if row < 0 or row >= len(self.records):
+        if row < 0 or row >= len(self._visible_records):
             return None
-        return self.records[row]
+        return self._visible_records[row]
 
     def _selected_rows(self) -> list[int]:
         rows: list[int] = []
@@ -570,10 +897,10 @@ class ModelRankingTab(QWidget):
         current_row = self.tbl.currentRow()
         if not rows and current_row >= 0:
             rows = [current_row]
-        return [row for row in rows if 0 <= row < len(self.records)]
+        return [row for row in rows if 0 <= row < len(self._visible_records)]
 
     def _selected_records(self) -> list[RankingRecord]:
-        return [self.records[row] for row in self._selected_rows()]
+        return [self._visible_records[row] for row in self._selected_rows()]
 
     def _on_selection_changed(self) -> None:
         records = self._selected_records()

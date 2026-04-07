@@ -24,6 +24,16 @@ from sklearn.preprocessing import RobustScaler
 from sklearn.svm import SVC
 
 from ibkr_trading_bot.core.services.model_service import runtime_python_version, runtime_sklearn_version
+try:
+    from ibkr_trading_bot.model.feature_stability import (
+        compute_feature_stability_score,
+        evaluate_feature_stability_filter,
+    )
+except Exception:
+    from model.feature_stability import (  # type: ignore
+        compute_feature_stability_score,
+        evaluate_feature_stability_filter,
+    )
 
 # --- volitelné knihovny
 try:
@@ -480,6 +490,44 @@ def _feature_names_for_estimator(estimator) -> list[str] | None:
                 return [str(c) for c in list(names)]
     except Exception:
         pass
+    try:
+        names = getattr(estimator, "feature_name_", None)
+        if names is not None:
+            names_list = [str(c) for c in list(names) if str(c)]
+            if names_list:
+                return names_list
+    except Exception:
+        pass
+    try:
+        booster = getattr(estimator, "booster_", None)
+        if booster is not None and hasattr(booster, "feature_name"):
+            names = booster.feature_name()
+            names_list = [str(c) for c in list(names) if str(c)]
+            if names_list:
+                return names_list
+    except Exception:
+        pass
+    try:
+        if isinstance(estimator, Pipeline):
+            last = estimator.steps[-1][1]
+            names = getattr(last, "feature_name_", None)
+            if names is not None:
+                names_list = [str(c) for c in list(names) if str(c)]
+                if names_list:
+                    return names_list
+    except Exception:
+        pass
+    try:
+        if isinstance(estimator, Pipeline):
+            last = estimator.steps[-1][1]
+            booster = getattr(last, "booster_", None)
+            if booster is not None and hasattr(booster, "feature_name"):
+                names = booster.feature_name()
+                names_list = [str(c) for c in list(names) if str(c)]
+                if names_list:
+                    return names_list
+    except Exception:
+        pass
     return None
 
 
@@ -490,8 +538,23 @@ def _align_X_for_estimator(estimator, X):
         if names:
             if isinstance(X, pd.DataFrame):
                 Xdf = X.copy()
-            else:
-                Xdf = pd.DataFrame(X)
+                if all(col in Xdf.columns for col in names):
+                    return Xdf.reindex(columns=names, fill_value=0.0)
+                if len(Xdf.columns) == len(names):
+                    Xdf.columns = names
+                    return Xdf
+                for col in names:
+                    if col not in Xdf.columns:
+                        Xdf[col] = 0.0
+                return Xdf.reindex(columns=names, fill_value=0.0)
+
+            arr = np.asarray(X)
+            if arr.ndim == 1:
+                arr = arr.reshape(-1, 1)
+            if arr.ndim == 2 and arr.shape[1] == len(names):
+                return pd.DataFrame(arr, columns=names)
+
+            Xdf = pd.DataFrame(arr)
             for col in names:
                 if col not in Xdf.columns:
                     Xdf[col] = 0.0
@@ -523,6 +586,137 @@ def _predict_proba(estimator, X: pd.DataFrame, class_idx: int = 1) -> np.ndarray
     except Exception:
         pass
     return None
+
+
+def _unwrap_final_estimator(estimator):
+    if isinstance(estimator, Pipeline):
+        return estimator.steps[-1][1]
+    return estimator
+
+
+def _extract_feature_importance_values(estimator, n_features: int) -> np.ndarray | None:
+    est = _unwrap_final_estimator(estimator)
+    try:
+        if hasattr(est, "feature_importances_"):
+            values = np.asarray(getattr(est, "feature_importances_"), dtype=float).ravel()
+            if values.size == int(n_features):
+                return values
+        coef = getattr(est, "coef_", None)
+        if coef is not None:
+            coef_arr = np.asarray(coef, dtype=float)
+            if coef_arr.ndim <= 1:
+                values = np.abs(coef_arr).ravel()
+            else:
+                values = np.mean(np.abs(coef_arr), axis=0).ravel()
+            if values.size == int(n_features):
+                return values
+    except Exception:
+        pass
+    return None
+
+
+def _normalize_feature_importance_values(values: np.ndarray) -> np.ndarray | None:
+    arr = np.asarray(values, dtype=float).ravel()
+    if arr.size == 0:
+        return None
+    if not np.all(np.isfinite(arr)):
+        return None
+    norm = float(np.sum(np.abs(arr)))
+    if not np.isfinite(norm) or norm <= 0.0:
+        return None
+    return arr / norm
+
+
+def _extract_normalized_feature_importance_map(
+    estimator,
+    feature_names: list[str],
+) -> dict[str, float] | None:
+    values = _extract_feature_importance_values(estimator, len(feature_names))
+    if values is None:
+        return {}
+    normalized = _normalize_feature_importance_values(values)
+    if normalized is None:
+        return None
+    return {
+        str(feature_names[i]): float(normalized[i])
+        for i in range(min(len(feature_names), normalized.size))
+    }
+
+
+def _aggregate_feature_stability(
+    fold_feature_importances: list[dict[str, float]],
+    feature_names: list[str],
+) -> dict[str, dict[str, float]]:
+    valid_folds = [
+        fi for fi in fold_feature_importances
+        if isinstance(fi, dict) and len(fi) > 0
+    ]
+    if not valid_folds or not feature_names:
+        return {}
+
+    matrix = np.asarray(
+        [
+            [float(fi.get(name, 0.0)) for name in feature_names]
+            for fi in valid_folds
+        ],
+        dtype=float,
+    )
+    if matrix.ndim != 2 or matrix.shape[0] == 0 or matrix.shape[1] != len(feature_names):
+        return {}
+
+    mean_vals = np.mean(matrix, axis=0)
+    std_vals = np.std(matrix, axis=0)
+    min_vals = np.min(matrix, axis=0)
+    max_vals = np.max(matrix, axis=0)
+    folds_present_vals = np.asarray(
+        [sum(1 for fi in valid_folds if name in fi) for name in feature_names],
+        dtype=int,
+    )
+    order = np.argsort(mean_vals)[::-1]
+
+    return {
+        str(feature_names[idx]): {
+            "mean": float(mean_vals[idx]),
+            "std": float(std_vals[idx]),
+            "min": float(min_vals[idx]),
+            "max": float(max_vals[idx]),
+            "folds_present": int(folds_present_vals[idx]),
+        }
+        for idx in order
+    }
+
+
+def _collect_fold_feature_importances_for_params(
+    *,
+    cv,
+    base_estimator,
+    params: dict[str, Any],
+    X_all: pd.DataFrame,
+    y_all: np.ndarray,
+    feature_names: list[str],
+    balance_classes: bool,
+    class_balance_power: float,
+    class_balance_max_ratio: float,
+) -> list[dict[str, float]]:
+    fold_feature_importances: list[dict[str, float]] = []
+    for tr_idx, _ in cv.split(X_all):
+        X_tr, y_tr = X_all.iloc[tr_idx], y_all[tr_idx]
+        est = _fit_with_params(base_estimator, params)
+        sw_tr = (
+            _balanced_sample_weight(
+                y_tr,
+                power=class_balance_power,
+                max_ratio=class_balance_max_ratio,
+            )
+            if balance_classes
+            else None
+        )
+        _fit_estimator(est, X_tr, y_tr, sample_weight=sw_tr)
+        fold_imp = _extract_normalized_feature_importance_map(est, feature_names)
+        if fold_imp is None:
+            continue
+        fold_feature_importances.append(dict(fold_imp))
+    return fold_feature_importances
 
 
 def _ternary_predict_mapped(
@@ -1595,6 +1789,7 @@ def train_and_evaluate_model(
     slippage_bps: float = 0.0,
     calibrate: bool = False,
     on_progress=None,
+    feature_stability_threshold: float | None = None,
     **kwargs,
 ) -> dict:
     """
@@ -1665,6 +1860,20 @@ def train_and_evaluate_model(
     except Exception:
         candidate_fresh_ratio = 0.30
     candidate_fresh_ratio = float(np.clip(candidate_fresh_ratio, 0.05, 0.80))
+
+    if feature_stability_threshold is not None:
+        try:
+            threshold_val = float(feature_stability_threshold)
+            if np.isfinite(threshold_val):
+                feature_stability_threshold = float(np.clip(threshold_val, 0.0, 1.0))
+            else:
+                feature_stability_threshold = None
+        except Exception:
+            LOGGER.warning(
+                "Ignoring invalid feature_stability_threshold=%r",
+                feature_stability_threshold,
+            )
+            feature_stability_threshold = None
 
     _ = kwargs
 
@@ -1898,6 +2107,7 @@ def train_and_evaluate_model(
             pass
     X_all = df_train_core[feats].replace([np.inf, -np.inf], np.nan)
     y_all = df_train_core["target"].astype(int).to_numpy()
+    feature_names_all = [str(col) for col in list(X_all.columns)]
 
     base_estimator, default_grid = _build_estimator(estimator_name)
     base_estimator = _ensure_pipeline(base_estimator)
@@ -2170,13 +2380,13 @@ def train_and_evaluate_model(
                     )
                     score = _ternary_composite_score(m_fold, n_short=n_short, n_long=n_long)
                 except Exception:
-                    pred = est.predict(X_te)
+                    pred = est.predict(_align_X_for_estimator(est, X_te))
                     score = float((pred == y_te).mean())
             else:
                 try:
                     score = pnl_scorer(est, X_te, y_te, df_te, fee=fee_per_trade, slippage=slippage_bps)
                 except Exception:
-                    pred = est.predict(X_te)
+                    pred = est.predict(_align_X_for_estimator(est, X_te))
                     score = float((pred == y_te).mean())
             fold_scores.append(float(score))
             fold_sizes.append(len(te_idx))
@@ -2307,6 +2517,42 @@ def train_and_evaluate_model(
     else:
         for params in all_param_sets:
             _run_candidate(dict(params))
+
+    best_fold_feature_importances: list[dict[str, float]] = []
+    if best_params is not None:
+        try:
+            best_fold_feature_importances = _collect_fold_feature_importances_for_params(
+                cv=cv,
+                base_estimator=base_estimator,
+                params=dict(best_params),
+                X_all=X_all,
+                y_all=y_all,
+                feature_names=feature_names_all,
+                balance_classes=bool(balance_classes),
+                class_balance_power=float(class_balance_power),
+                class_balance_max_ratio=float(class_balance_max_ratio),
+            )
+        except Exception:
+            best_fold_feature_importances = []
+
+    try:
+        feature_stability = _aggregate_feature_stability(
+            best_fold_feature_importances,
+            feature_names_all,
+        )
+    except Exception:
+        feature_stability = {}
+    raw_trained_features = list(feature_names_all)
+    feature_stability_score_raw = compute_feature_stability_score(feature_stability)
+    feature_stability_score = {
+        str(feature_name): float(feature_stability_score_raw.get(feature_name, 0.0))
+        for feature_name in raw_trained_features
+    }
+    trained_features = list(raw_trained_features)
+    features_removed_by_stability: list[str] = []
+    features_kept_by_stability: list[str] = list(raw_trained_features)
+    feature_stability_filter_applied = False
+    feature_stability_filter_fallback_reason: str | None = None
 
     if best_estimator is None:
         best_estimator = base_estimator
@@ -2970,11 +3216,32 @@ def train_and_evaluate_model(
                 fee_per_trade=fee_per_trade, slippage_bps=slippage_bps
             )
 
+    if feature_stability_threshold is not None:
+        filter_result = evaluate_feature_stability_filter(
+            feature_stability,
+            raw_trained_features,
+            float(feature_stability_threshold),
+            logger=LOGGER,
+        )
+        trained_features = list(filter_result.kept_features)
+        features_removed_by_stability = list(filter_result.removed_features)
+        features_kept_by_stability = list(filter_result.kept_features)
+        feature_stability_filter_applied = bool(filter_result.filter_applied)
+        feature_stability_filter_fallback_reason = filter_result.fallback_reason
+
     # Refit final model on full pre-holdout train once thresholds are tuned on train_core/calibration.
-    if is_ternary and df_threshold_calib is not None and len(df_threshold_calib) > 0:
+    if (
+        feature_stability_filter_applied
+        or (is_ternary and df_threshold_calib is not None and len(df_threshold_calib) > 0)
+    ):
         try:
-            X_refit = df_train[feats].replace([np.inf, -np.inf], np.nan)
-            y_refit = df_train["target"].astype(int).to_numpy()
+            refit_df = (
+                df_train
+                if (is_ternary and df_threshold_calib is not None and len(df_threshold_calib) > 0)
+                else df_train_core
+            )
+            X_refit = refit_df[trained_features].replace([np.inf, -np.inf], np.nan)
+            y_refit = refit_df["target"].astype(int).to_numpy()
             sw_refit = (
                 _balanced_sample_weight(
                     y_refit,
@@ -2998,11 +3265,28 @@ def train_and_evaluate_model(
                     calibrated_estimator = cal_refit
                 except Exception:
                     calibrated_estimator = best_estimator
-            threshold_tuning["refit_on_train_plus_calib"] = True
-            threshold_tuning["refit_train_bars"] = int(len(df_train))
+            threshold_tuning["refit_on_train_plus_calib"] = bool(
+                is_ternary and df_threshold_calib is not None and len(df_threshold_calib) > 0
+            )
+            threshold_tuning["refit_train_bars"] = int(len(refit_df))
             threshold_tuning["refit_core_bars"] = int(len(df_train_core))
-            threshold_tuning["refit_calibration_bars"] = int(len(df_threshold_calib))
+            threshold_tuning["refit_calibration_bars"] = int(
+                len(df_threshold_calib) if df_threshold_calib is not None else 0
+            )
+            threshold_tuning["refit_feature_count"] = int(len(trained_features))
+            threshold_tuning["refit_feature_stability_filtered"] = bool(
+                feature_stability_filter_applied
+            )
         except Exception as e_refit:
+            if feature_stability_filter_applied:
+                trained_features = list(raw_trained_features)
+                features_removed_by_stability = []
+                features_kept_by_stability = list(raw_trained_features)
+                feature_stability_filter_applied = False
+                if feature_stability_filter_fallback_reason is None:
+                    feature_stability_filter_fallback_reason = (
+                        "stability_filter_refit_failed_reverted_to_original_features"
+                    )
             threshold_tuning["refit_on_train_plus_calib"] = False
             threshold_tuning["refit_error"] = str(e_refit)
 
@@ -3062,7 +3346,7 @@ def train_and_evaluate_model(
         else:
             # Fallback only if OOF is unavailable.
             try:
-                X_train_eval = df_train_core[feats].replace([np.inf, -np.inf], np.nan)
+                X_train_eval = df_train_core[trained_features].replace([np.inf, -np.inf], np.nan)
                 y_train = df_train_core["target"].astype(int).to_numpy()
                 y_train_pred, n_signals_train, _ = _predict_labels_for_metrics(
                     calibrated_estimator,
@@ -3108,7 +3392,7 @@ def train_and_evaluate_model(
                 pass
 
     if df_hold is not None and len(df_hold) >= 10:
-        used_feats = list(X_all.columns)
+        used_feats = list(trained_features)
         Xh = df_hold[used_feats].replace([np.inf, -np.inf], np.nan)
         yh = df_hold["target"].astype(int).to_numpy()
         proba = None
@@ -3366,7 +3650,7 @@ def train_and_evaluate_model(
 
     payload = {
         "model": calibrated_estimator,
-        "features": list(X_all.columns),
+        "features": list(trained_features),
         "estimator_name": estimator_name,
         "search_backend": str(search_backend_used),
         "optuna_trials": (int(optuna_trials_effective) if search_backend_used == "optuna" and optuna_trials_effective is not None else None),
@@ -3429,8 +3713,8 @@ def train_and_evaluate_model(
         "decision_threshold": float(decision_threshold),
         "ternary_threshold_short": float(ternary_threshold_short),
         "ternary_threshold_long": float(ternary_threshold_long),
-        "trained_features": list(X_all.columns),
-        "n_features": len(X_all.columns),
+        "trained_features": list(trained_features),
+        "n_features": len(trained_features),
         "n_total_bars": int(n_total),
         "n_train_bars": int(n_train_effective),
         "n_train_bars_pre_guard": int(n_train_pre_guard),
@@ -3466,6 +3750,22 @@ def train_and_evaluate_model(
         "feature_importance": {},  # bude naplněno níže
     }
     
+    meta["feature_stability"] = dict(feature_stability)
+    meta["feature_stability_threshold"] = (
+        float(feature_stability_threshold)
+        if feature_stability_threshold is not None
+        else None
+    )
+    meta["feature_stability_score"] = dict(feature_stability_score)
+    meta["features_removed_by_stability"] = list(features_removed_by_stability)
+    meta["features_kept_by_stability"] = list(features_kept_by_stability)
+    meta["feature_stability_filter_applied"] = bool(feature_stability_filter_applied)
+    meta["feature_stability_filter_fallback_reason"] = (
+        str(feature_stability_filter_fallback_reason)
+        if feature_stability_filter_fallback_reason is not None
+        else None
+    )
+
     # Feature importance
     try:
         est_for_imp = calibrated_estimator
@@ -3475,7 +3775,7 @@ def train_and_evaluate_model(
             imp = np.asarray(est_for_imp.feature_importances_)
             imp_sorted_idx = np.argsort(imp)[::-1]
             meta["feature_importance"] = {
-                str(X_all.columns[i]): float(imp[i])
+                str(trained_features[i]): float(imp[i])
                 for i in imp_sorted_idx[:min(20, len(imp))]  # top 20 featur
             }
         elif hasattr(est_for_imp, "coef_"):
@@ -3483,7 +3783,7 @@ def train_and_evaluate_model(
             coef_abs = np.abs(coef)
             coef_sorted_idx = np.argsort(coef_abs)[::-1]
             meta["feature_importance"] = {
-                str(X_all.columns[i]): float(coef[i])
+                str(trained_features[i]): float(coef[i])
                 for i in coef_sorted_idx[:min(20, len(coef))]
             }
     except Exception:

@@ -39,6 +39,24 @@ def _single_candidate_grid() -> dict[str, list]:
     }
 
 
+def _single_candidate_rf_grid() -> dict[str, list]:
+    return {
+        "clf__n_estimators": [40],
+        "clf__max_depth": [4],
+        "clf__min_samples_leaf": [1],
+        "clf__n_jobs": [1],
+    }
+
+
+def _multi_candidate_rf_grid() -> dict[str, list]:
+    return {
+        "clf__n_estimators": [40],
+        "clf__max_depth": [2, 4],
+        "clf__min_samples_leaf": [1, 2],
+        "clf__n_jobs": [1],
+    }
+
+
 def _workspace_tmp_dir(prefix: str) -> Path:
     path = Path(".codex_test_tmp") / f"{prefix}_{uuid.uuid4().hex}"
     path.mkdir(parents=True, exist_ok=True)
@@ -131,6 +149,98 @@ def test_train_and_evaluate_defaults_to_grid_search_backend(monkeypatch):
     assert meta["search_plan"]["search_backend_used"] == "grid"
     assert meta["search_backend"] == "grid"
     assert meta["optuna_best_params"] is None
+
+
+def test_train_and_evaluate_writes_feature_stability(monkeypatch):
+    out_dir = _workspace_tmp_dir("feature_stability")
+    monkeypatch.setattr(train_models, "_model_dir", lambda: out_dir)
+
+    result = train_and_evaluate_model(
+        df=_small_training_frame(n_rows=120),
+        estimator_name="rf",
+        param_grid=_single_candidate_rf_grid(),
+        n_splits=3,
+        embargo=2,
+        holdout_bars=12,
+        mc_enabled=False,
+        annualize_sharpe=True,
+    )
+
+    _, meta, _ = _load_result_meta(result)
+
+    assert meta["feature_importance"]
+    assert "feature_stability" in meta
+    assert set(meta["feature_stability"]) == set(meta["trained_features"])
+
+    for feature_name in meta["trained_features"]:
+        stats = meta["feature_stability"][feature_name]
+        assert set(stats) == {"mean", "std", "min", "max", "folds_present"}
+        assert all(isinstance(stats[key], float) for key in ("mean", "std", "min", "max"))
+        assert isinstance(stats["folds_present"], int)
+        assert stats["min"] <= stats["mean"] <= stats["max"]
+        assert stats["std"] >= 0.0
+        assert 1 <= stats["folds_present"] <= 3
+
+
+def test_train_and_evaluate_collects_feature_stability_only_for_best_params(monkeypatch):
+    out_dir = _workspace_tmp_dir("feature_stability_best_params")
+    monkeypatch.setattr(train_models, "_model_dir", lambda: out_dir)
+
+    calls: list[dict[str, object]] = []
+
+    def _fake_collect_fold_feature_importances_for_params(**kwargs):
+        params = dict(kwargs["params"])
+        feature_names = list(kwargs["feature_names"])
+        calls.append(params)
+        if not feature_names:
+            return []
+        weight = 1.0 / float(len(feature_names))
+        return [{str(name): float(weight) for name in feature_names}]
+
+    monkeypatch.setattr(
+        train_models,
+        "_collect_fold_feature_importances_for_params",
+        _fake_collect_fold_feature_importances_for_params,
+    )
+
+    result = train_and_evaluate_model(
+        df=_small_training_frame(n_rows=132),
+        estimator_name="rf",
+        param_grid=_multi_candidate_rf_grid(),
+        n_splits=3,
+        embargo=2,
+        holdout_bars=12,
+        mc_enabled=False,
+        annualize_sharpe=True,
+    )
+
+    _, meta, _ = _load_result_meta(result)
+
+    assert len(calls) == 1
+    assert calls[0] == result["best_params"]
+    assert meta["feature_stability"]
+    assert set(meta["feature_stability"]) == set(meta["trained_features"])
+
+
+def test_train_and_evaluate_unsupported_estimator_writes_empty_feature_stability(monkeypatch):
+    out_dir = _workspace_tmp_dir("feature_stability_unsupported")
+    monkeypatch.setattr(train_models, "_model_dir", lambda: out_dir)
+
+    result = train_and_evaluate_model(
+        df=_small_training_frame(n_rows=120),
+        estimator_name="svm",
+        param_grid=_single_candidate_grid(),
+        n_splits=3,
+        embargo=2,
+        holdout_bars=12,
+        mc_enabled=False,
+        annualize_sharpe=True,
+    )
+
+    _, meta, _ = _load_result_meta(result)
+
+    assert "feature_stability" in meta
+    assert meta["feature_stability"] == {}
 
 
 def test_train_and_evaluate_falls_back_to_grid_when_optuna_missing(monkeypatch, caplog):

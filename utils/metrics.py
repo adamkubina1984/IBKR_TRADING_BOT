@@ -5,10 +5,16 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import numpy as np
 import pandas as pd
+
+try:
+    from sklearn.pipeline import Pipeline
+except Exception:  # pragma: no cover
+    Pipeline = None  # type: ignore[assignment]
 
 # volitelně sklearn
 try:
@@ -27,6 +33,79 @@ except Exception:  # pragma: no cover
 
 # ---------------- Pomocné ----------------
 _PRICE_CANDS = ("close", "Close", "price", "Price", "average", "Average", "close_price")
+
+
+def _feature_names_for_estimator(estimator) -> list[str] | None:
+    try:
+        names = getattr(estimator, "feature_names_in_", None)
+        if names is not None:
+            return [str(c) for c in list(names)]
+    except Exception:
+        pass
+    try:
+        names = getattr(estimator, "feature_name_", None)
+        if names is not None:
+            names_list = [str(c) for c in list(names) if str(c)]
+            if names_list:
+                return names_list
+    except Exception:
+        pass
+    try:
+        if Pipeline is not None and isinstance(estimator, Pipeline):
+            last = estimator.steps[-1][1]
+            names = getattr(last, "feature_names_in_", None)
+            if names is not None:
+                return [str(c) for c in list(names)]
+            names = getattr(last, "feature_name_", None)
+            if names is not None:
+                names_list = [str(c) for c in list(names) if str(c)]
+                if names_list:
+                    return names_list
+    except Exception:
+        pass
+    return None
+
+
+def _align_X_for_estimator(estimator, X):
+    try:
+        names = _feature_names_for_estimator(estimator)
+        if not names:
+            return X
+        if isinstance(X, pd.DataFrame):
+            Xdf = X.copy()
+            if all(col in Xdf.columns for col in names):
+                return Xdf.reindex(columns=names, fill_value=0.0)
+            if len(Xdf.columns) == len(names):
+                Xdf.columns = names
+                return Xdf
+            for col in names:
+                if col not in Xdf.columns:
+                    Xdf[col] = 0.0
+            return Xdf.reindex(columns=names, fill_value=0.0)
+        arr = np.asarray(X)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        if arr.ndim == 2 and arr.shape[1] == len(names):
+            return pd.DataFrame(arr, columns=names)
+        Xdf = pd.DataFrame(arr)
+        for col in names:
+            if col not in Xdf.columns:
+                Xdf[col] = 0.0
+        return Xdf.reindex(columns=names, fill_value=0.0)
+    except Exception:
+        return X
+
+
+def _safe_model_call(estimator, method_name: str, X):
+    X_use = _align_X_for_estimator(estimator, X)
+    method = getattr(estimator, method_name)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"X does not have valid feature names, but LGBMClassifier was fitted with feature names",
+            category=UserWarning,
+        )
+        return method(X_use)
 
 def _pick_price_series(df: pd.DataFrame | None) -> pd.Series | None:
     if df is None:
@@ -412,7 +491,7 @@ def pnl_scorer(
     """
     try:
         if hasattr(estimator, "predict_proba"):
-            pr = estimator.predict_proba(X_val)
+            pr = _safe_model_call(estimator, "predict_proba", X_val)
             if isinstance(pr, np.ndarray) and pr.ndim == 2 and pr.shape[1] >= 3:
                 prob_short = pr[:, 0]
                 prob_long = pr[:, 2]
@@ -422,10 +501,10 @@ def pnl_scorer(
                 p1 = pr[:, 1] if isinstance(pr, np.ndarray) and pr.ndim == 2 and pr.shape[1] >= 2 else np.asarray(pr).ravel()
                 y_pred = (p1 >= 0.5).astype(int)
         elif hasattr(estimator, "decision_function"):
-            z = np.asarray(estimator.decision_function(X_val)).ravel()
+            z = np.asarray(_safe_model_call(estimator, "decision_function", X_val)).ravel()
             y_pred = (1.0 / (1.0 + np.exp(-z)) >= 0.5).astype(int)
         else:
-            y_pred = estimator.predict(X_val)
+            y_pred = _safe_model_call(estimator, "predict", X_val)
 
         m = calculate_metrics(
             y_true=np.asarray(y_val).astype(int),
@@ -441,7 +520,7 @@ def pnl_scorer(
         return float(m.get("accuracy", 0.0))
     except Exception:
         try:
-            pred = estimator.predict(X_val)
+            pred = _safe_model_call(estimator, "predict", X_val)
             return float((pred == np.asarray(y_val).astype(int)).mean())
         except Exception:
             return 0.0

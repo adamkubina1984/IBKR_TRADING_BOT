@@ -38,6 +38,7 @@ from ibkr_trading_bot.core.services.model_training_service import (
 )
 from ibkr_trading_bot.model.train_models import (
     HAS_OPTUNA,
+    _align_X_for_estimator,
     _model_dir,
     _select_feature_columns,
     _ternary_predict_mapped,
@@ -168,6 +169,7 @@ class TrainWorker(QThread):
                 mc_block_len=mc_block_len,
                 annualize_sharpe=True,
                 top_k_features=top_k_features,
+                feature_stability_threshold=profile.get("feature_stability_threshold"),
                 label_lookahead_bars=int(self.meta_extra.get("label_lookahead_bars", 0)),
                 quality_gate_enabled=quality_gate_enabled,
                 quality_gate_hard_reject=quality_gate_hard_reject,
@@ -1252,8 +1254,9 @@ class ModelTrainingTab(QWidget):
 
             if mdl is not None and self.X_test is not None and self.y_test is not None:
                 X_eval = self.X_test.reindex(columns=feats, fill_value=0.0) if feats else self.X_test
+                X_eval_use = _align_X_for_estimator(mdl, X_eval)
                 if hasattr(mdl, "predict_proba"):
-                    pr = mdl.predict_proba(X_eval)
+                    pr = mdl.predict_proba(X_eval_use)
                     if isinstance(pr, np.ndarray) and pr.ndim == 2 and pr.shape[1] >= 3:
                         p_short = pr[:, 0]
                         p_long = pr[:, 2]
@@ -1266,11 +1269,11 @@ class ModelTrainingTab(QWidget):
                         )
                         y_pred = (p1 >= thr).astype(int)
                 elif hasattr(mdl, "decision_function"):
-                    z = np.asarray(mdl.decision_function(X_eval)).ravel()
+                    z = np.asarray(mdl.decision_function(X_eval_use)).ravel()
                     p1 = 1.0 / (1.0 + np.exp(-z))
                     y_pred = (p1 >= thr).astype(int)
                 else:
-                    y_pred = mdl.predict(X_eval)
+                    y_pred = mdl.predict(X_eval_use)
 
                 acc = accuracy_score(self.y_test, y_pred)
                 if len(np.unique(np.asarray(self.y_test))) >= 3:
