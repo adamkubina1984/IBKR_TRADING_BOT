@@ -17,6 +17,12 @@ venv/
 # Runtime logs
 *.log
 
+# Test / build temp directories
+.codex_test_tmp/
+.pytest_tmp/
+_pytest_tmp/
+tmp*/
+
 # Generated market data
 data/raw/**/*.csv
 data/processed/**/*.csv
