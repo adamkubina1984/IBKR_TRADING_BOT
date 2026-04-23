@@ -2,10 +2,14 @@
 # 🟦 Modul pro walk-forward validaci a export datasetů
 
 import os
+import logging
 from pathlib import Path
 import json
 
 import pandas as pd
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def walk_forward_split(df, window_size, test_size, step_size, expanding=False):
@@ -126,7 +130,7 @@ def train_and_evaluate_model(X, y, model_name: str, param_grid: dict, window: st
     pos = int((y_tmp == 1).sum())
     neg = int((y_tmp == 0).sum())
     spw = (neg / max(pos, 1)) if (pos > 0 and neg > 0) else 1.0
-    print(f"ℹ️  Třídy v y: neg={neg}, pos={pos} | scale_pos_weight={spw:.3f}")
+    LOGGER.info("Classes in y: neg=%s, pos=%s | scale_pos_weight=%.3f", neg, pos, spw)
 
     # --- Výběr modelu s robustními defaulty ---
     if model_name == "xgb":
@@ -191,9 +195,11 @@ def train_and_evaluate_model(X, y, model_name: str, param_grid: dict, window: st
     # 1) drop konstantních sloupců
     const_cols = [c for c in X.columns if X[c].nunique(dropna=False) <= 1]
     if const_cols:
-        print(
-            f"⚠️  Odstraňuji {len(const_cols)} konstantních featur: "
-            f"{const_cols[:10]}{'...' if len(const_cols) > 10 else ''}"
+        LOGGER.warning(
+            "Removing %s constant features: %s%s",
+            len(const_cols),
+            const_cols[:10],
+            "..." if len(const_cols) > 10 else "",
         )
         X = X.drop(columns=const_cols)
 
@@ -202,9 +208,10 @@ def train_and_evaluate_model(X, y, model_name: str, param_grid: dict, window: st
         unique_cols = X.T.drop_duplicates().T.columns
         if len(unique_cols) < X.shape[1]:
             removed = [c for c in X.columns if c not in unique_cols]
-            print(
-                f"⚠️  Odstraňuji duplicitní featury: "
-                f"{removed[:10]}{'...' if len(removed) > 10 else ''}"
+            LOGGER.warning(
+                "Removing duplicate features: %s%s",
+                removed[:10],
+                "..." if len(removed) > 10 else "",
             )
             X = X.loc[:, unique_cols]
     except Exception:
@@ -258,9 +265,9 @@ def train_and_evaluate_model(X, y, model_name: str, param_grid: dict, window: st
             best_threshold = 0.5
             best_f1 = best_score
 
-        print(f"🎯 Optimalizovaný práh rozhodnutí: {best_threshold:.3f} | F1@threshold≈{best_f1:.4f}")
+        LOGGER.info("Optimized decision threshold: %.3f | F1@threshold~=%.4f", best_threshold, best_f1)
     except Exception as e:
-        print(f"⚠️ Optimalizace prahu selhala: {e}")
+        LOGGER.warning("Decision threshold optimization failed: %s", e)
         best_threshold = 0.5
 
     # --- Uložení modelu ---
@@ -275,7 +282,7 @@ def train_and_evaluate_model(X, y, model_name: str, param_grid: dict, window: st
     }
     joblib.dump(payload, output_path)
 
-    print(f"✅ Model {model_name} uložen do {output_path} | F1 (CV): {best_score:.4f}")
+    LOGGER.info("Model %s saved to %s | F1 (CV): %.4f", model_name, output_path, best_score)
 
     return best_model, best_score
 
@@ -316,8 +323,10 @@ def _select_feature_columns(df: pd.DataFrame) -> list:
             corr = df[feat_cols].corrwith(df[target_col]).abs().sort_values(ascending=False)
             leaky = corr[corr >= 0.999].index.tolist()
             if leaky:
-                print(
-                    f"❗️ Odstraňuji potenciálně leakující featury (|corr|≥0.999 s targetem): {leaky[:10]}{'...' if len(leaky) > 10 else ''}"
+                LOGGER.warning(
+                    "Removing potentially leaky features (|corr|>=0.999 with target): %s%s",
+                    leaky[:10],
+                    "..." if len(leaky) > 10 else "",
                 )
                 feat_cols = [c for c in feat_cols if c not in leaky]
                 if not feat_cols:
@@ -386,10 +395,7 @@ def train_simple_model(features_csv: str, model_out: str) -> str:
         "schema_version": 1,
     }
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Model ulozen: {model_out} | n_features={X.shape[1]}")
-    return model_out
-
-    print(f"✅ Model uložen: {model_out} | n_features={X.shape[1]}")
+    LOGGER.info("Model saved: %s | n_features=%s", model_out, X.shape[1])
     return model_out
 
 
@@ -424,7 +430,7 @@ if __name__ == "__main__":
         splits = walk_forward_split(df, window_size, test_size, step_size, expanding)
         export_datasets(splits, output_dir=output_dir, format=export_format)
 
-        print(f"✅ Walk-forward split dokončen. Exportováno {len(splits)} sad do: {output_dir}")
+        LOGGER.info("Walk-forward split completed. Exported %s sets to: %s", len(splits), output_dir)
 
     if args.train_model:
         df = load_dataframe("data/processed/features.csv")
@@ -507,10 +513,10 @@ def split_by_calendar_days(
     df_train = dfx[dfx["_date"].isin(train_days_list)].copy()
     df_test  = dfx[dfx["_date"].isin(test_days_list)].copy()
 
-    print("🗓️ Výběr podle dnů:")
-    print(f"  • Train [{len(train_days_list)}]: {train_days_list[0]} → {train_days_list[-1]}")
-    print(f"  • Test  [{len(test_days_list)}]: {test_days_list[0]} → {test_days_list[-1]}")
-    print(f"  • Počty řádků: train={len(df_train)}, test={len(df_test)}")
+    LOGGER.info("Day-based split selected")
+    LOGGER.info("Train [%s]: %s -> %s", len(train_days_list), train_days_list[0], train_days_list[-1])
+    LOGGER.info("Test [%s]: %s -> %s", len(test_days_list), test_days_list[0], test_days_list[-1])
+    LOGGER.info("Row counts: train=%s, test=%s", len(df_train), len(df_test))
 
     # výběr numerických featur mimo blacklist (a preferenčně mimo syrové OHLC)
     hard_blacklist = set(feature_blacklist + ["_date"])

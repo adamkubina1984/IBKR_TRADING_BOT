@@ -2,7 +2,7 @@ import sys
 
 from dotenv import load_dotenv
 from PySide6.QtGui import QCloseEvent
-from PySide6.QtWidgets import QApplication, QMainWindow, QTabWidget, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QMainWindow, QMessageBox, QTabWidget, QVBoxLayout, QWidget
 
 load_dotenv()
 
@@ -63,7 +63,7 @@ class MainWindow(QMainWindow):
         return LiveBotTab()
 
     def _create_model_manager_tab(self):
-        from ibkr_trading_bot.gui.tab_model_manager_legacy import ModelManagerTab
+        from ibkr_trading_bot.gui.tab_model_manager import ModelManagerTab
 
         return ModelManagerTab(self)
 
@@ -104,6 +104,7 @@ class MainWindow(QMainWindow):
         return self.get_live_features_df()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        blocking_tabs: list[str] = []
         for attr_name, _, _ in self._tab_specs:
             widget = getattr(self, attr_name, None)
             if widget is None:
@@ -111,9 +112,21 @@ class MainWindow(QMainWindow):
             shutdown = getattr(widget, "shutdown", None)
             if callable(shutdown):
                 try:
-                    shutdown()
+                    shutdown_ok = shutdown()
+                    if shutdown_ok is False:
+                        blocking_tabs.append(str(attr_name))
                 except Exception:
                     pass
+        if blocking_tabs:
+            QMessageBox.warning(
+                self,
+                "Aplikace je zaneprazdnena",
+                "Nelze bezpecne zavrit aplikaci, protoze stale bezi nektere ulohy.\n\n"
+                f"Bezi: {', '.join(blocking_tabs)}\n\n"
+                "Pockej na dokonceni nebo nejprve zastav bezici operace.",
+            )
+            event.ignore()
+            return
         super().closeEvent(event)
 
 

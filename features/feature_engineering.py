@@ -56,32 +56,13 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 
 # === compute_all_features: hlavní výpočet featur podle features_config.yaml ===
 
-# Bezpečný import indikátorů – preferuj balíčkové importy, ale buď tolerantní
-try:
-    from ibkr_trading_bot.features.indicators import (
-        calculate_atr,
-        calculate_macd,
-        calculate_rsi,
-        calculate_stochastic,
-        calculate_williams_r,
-    )
-except Exception:
-    # Pokud by někdo spouštěl mimo balíček, zkusíme lokální importy
-    try:
-        from features.indicators import (
-            calculate_atr,
-            calculate_macd,
-            calculate_rsi,
-            calculate_stochastic,
-            calculate_williams_r,
-        )
-    except Exception:
-        # Jako poslední pojistka si jednoduché verze spočteme sami
-        calculate_rsi = None
-        calculate_macd = None
-        calculate_atr = None
-        calculate_williams_r = None
-        calculate_stochastic = None
+from ibkr_trading_bot.features.indicators import (
+    calculate_atr,
+    calculate_macd,
+    calculate_rsi,
+    calculate_stochastic,
+    calculate_williams_r,
+)
 
 def _safe_feature_config():
     """Načti features_config.yaml relativně k tomuto souboru."""

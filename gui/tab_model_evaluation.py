@@ -40,8 +40,16 @@ from PySide6.QtWidgets import (
 )
 
 from ibkr_trading_bot.core.services import model_eval_service as model_eval_runtime
+from ibkr_trading_bot.core.services.signal_policy import (
+    DEFAULT_EXIT_POLICY,
+    apply_confidence_entry_threshold,
+    apply_exit_confidence_threshold,
+    normalize_signal_array,
+    resolve_exit_policy_setting,
+)
 from ibkr_trading_bot.core.services.auto_threshold_search import run_auto_threshold_search
 from ibkr_trading_bot.core.services.evaluation_service import EvaluationService
+from ibkr_trading_bot.core.services.trade_executor import replay_signals_over_market_data
 from ibkr_trading_bot.core.services.model_service import (
     build_sklearn_version_warning,
     merge_model_metadata,
@@ -330,37 +338,15 @@ def _resolve_ternary_thresholds_eval(metadata: dict) -> tuple[float, float, str]
 
 
 def _apply_confidence_threshold_eval(raw_pred, confidence, threshold):
-    arr = np.asarray(raw_pred).copy()
-    conf = np.asarray(confidence).reshape(-1)
-    thr = float(threshold)
-    mask_low = conf < thr
-    try:
-        arr[mask_low] = 0
-    except Exception:
-        tmp = np.array(arr, dtype=object)
-        tmp[mask_low] = 0
-        arr = tmp
-    return arr
+    return apply_confidence_entry_threshold(raw_pred, confidence, threshold)
 
 
 def _apply_exit_threshold_eval(y_pred: np.ndarray, confidence: np.ndarray, exit_thr: float) -> np.ndarray:
-    arr = np.asarray(y_pred).copy()
-    conf = np.asarray(confidence).reshape(-1)
-    mask_low = conf < float(exit_thr)
-    open_pos = np.abs(arr) > 0.5
-    arr[mask_low & open_pos] = 0
-    return arr
+    return apply_exit_confidence_threshold(y_pred, confidence, exit_thr)
 
 
 def _normalize_pred_eval(arr):
-    a = np.asarray(arr, dtype=object)
-    out = np.zeros(a.shape, dtype=float)
-    num_mask = np.array([isinstance(x, (int, float, np.number)) for x in a], dtype=bool)
-    out[num_mask] = np.sign(a[num_mask].astype(float))
-    txt = np.char.lower(a.astype(str))
-    out[(txt == "long") | (txt == "buy") | (txt == "up") | (txt == "1") | (txt == "+1")] = 1.0
-    out[(txt == "short") | (txt == "sell") | (txt == "down") | (txt == "-1")] = -1.0
-    return out
+    return normalize_signal_array(arr)
 
 
 def _safe_close_series_eval(df: pd.DataFrame | None):
@@ -421,9 +407,11 @@ class ModelEvaluationTab(QWidget):
         self.last_metrics = None       # poslední metriky (po filtru a nákladech)
         self.eval_scope_info = {"mode": "holdout", "applied_rows": 0, "total_rows": 0}
         self._last_ternary_threshold_source = "model"
+        self._selected_exit_policy = DEFAULT_EXIT_POLICY
         self._eval_worker: TaskWorker | None = None
         self._params_worker: TaskWorker | None = None
         self._auto_threshold_worker: TaskWorker | None = None
+        self._retired_workers: list[TaskWorker] = []
         self._eval_request_id = 0
         self._params_request_id = 0
         self._auto_request_id = 0
@@ -545,6 +533,14 @@ class ModelEvaluationTab(QWidget):
         self.ext_spin.setToolTip("Minimální confidence pro zavření pozice (0=vypnuto). Pokud confidence klesne pod tuto hodnotu, pozice se zavře.")
         self.ext_spin.valueChanged.connect(self._on_model_settings_changed)
 
+        # Exit policy
+        exit_policy_label = QLabel("Exit Policy:")
+        self.exit_policy_combo = QComboBox()
+        self.exit_policy_combo.addItem("Stateful (hold until opposite)", userData="hold_until_opposite")
+        self.exit_policy_combo.addItem("Legacy flat exit", userData="legacy_flat_exit")
+        self.exit_policy_combo.setCurrentIndex(0)
+        self.exit_policy_combo.currentIndexChanged.connect(self._on_exit_policy_changed)
+
         self.lbl_threshold_preview = QLabel("T(model): short=— long=— | T(active): short=— long=— src=model | Entry=0.600 Exit=0.700")
         self.lbl_threshold_preview.setToolTip(
             "T(model) = prahy ulozene v metadatech modelu.\n"
@@ -567,6 +563,9 @@ class ModelEvaluationTab(QWidget):
         model_settings_layout.addSpacing(12)
         model_settings_layout.addWidget(ext_label)
         model_settings_layout.addWidget(self.ext_spin)
+        model_settings_layout.addSpacing(12)
+        model_settings_layout.addWidget(exit_policy_label)
+        model_settings_layout.addWidget(self.exit_policy_combo)
         model_settings_layout.addSpacing(12)
         model_settings_layout.addWidget(self.lbl_threshold_preview, 1)
         model_settings_layout.addSpacing(12)
@@ -653,12 +652,9 @@ class ModelEvaluationTab(QWidget):
         except Exception:
             project_root = Path(os.getcwd())
         model_dir_dyn = project_root / "model_outputs"
-        model_dir_abs = Path(r"C:\Users\adamk\Můj disk\Trader\ibkr_trading_bot\model_outputs")
 
         if model_dir_dyn.is_dir():
             start_dir = str(model_dir_dyn)
-        elif model_dir_abs.is_dir():
-            start_dir = str(model_dir_abs)
         else:
             start_dir = str(project_root)
 
@@ -736,13 +732,39 @@ class ModelEvaluationTab(QWidget):
             return f"{float(value):.3f}"
 
         src = getattr(self, "_last_ternary_threshold_source", "model")
+        exit_policy = self._current_exit_policy()
         entry = self._safe_float(self.et_spin.value()) if hasattr(self, "et_spin") else None
         exit_thr = self._safe_float(self.ext_spin.value()) if hasattr(self, "ext_spin") else None
         self.lbl_threshold_preview.setText(
             f"T(model): short={_fmt(tshort_model)} long={_fmt(tlong_model)} | "
             f"T(active): short={_fmt(thr_short)} long={_fmt(thr_long)} src={src} | "
-            f"Entry={_fmt(entry)} Exit={_fmt(exit_thr)}"
+            f"Entry={_fmt(entry)} Exit={_fmt(exit_thr)} | exit_policy={exit_policy}"
         )
+
+    def _current_exit_policy(self) -> str:
+        if hasattr(self, "exit_policy_combo"):
+            data = self.exit_policy_combo.currentData()
+            if data:
+                return resolve_exit_policy_setting(data, default=DEFAULT_EXIT_POLICY)
+        return resolve_exit_policy_setting(getattr(self, "_selected_exit_policy", None), default=DEFAULT_EXIT_POLICY)
+
+    def _set_exit_policy_combo(self, policy: str) -> None:
+        resolved = resolve_exit_policy_setting(policy, default=DEFAULT_EXIT_POLICY)
+        if not hasattr(self, "exit_policy_combo"):
+            self._selected_exit_policy = resolved
+            return
+        idx = self.exit_policy_combo.findData(resolved)
+        if idx < 0:
+            idx = self.exit_policy_combo.findData(DEFAULT_EXIT_POLICY)
+        self.exit_policy_combo.blockSignals(True)
+        self.exit_policy_combo.setCurrentIndex(max(0, idx))
+        self.exit_policy_combo.blockSignals(False)
+        self._selected_exit_policy = self._current_exit_policy()
+
+    def _on_exit_policy_changed(self, *_):
+        self._selected_exit_policy = self._current_exit_policy()
+        self._refresh_threshold_preview()
+        self.on_params_changed()
 
     def on_open_data_clicked(self):
         # Dynamický a záložní start dir (po změně kořene projektu)
@@ -751,12 +773,9 @@ class ModelEvaluationTab(QWidget):
         except Exception:
             project_root = Path(os.getcwd())
         processed_dir_dyn = project_root / "data" / "processed"
-        processed_dir_abs = Path(r"C:\Users\adamk\Můj disk\Trader\ibkr_trading_bot\data\processed")
 
         if processed_dir_dyn.is_dir():
             start_dir = str(processed_dir_dyn)
-        elif processed_dir_abs.is_dir():
-            start_dir = str(processed_dir_abs)
         else:
             start_dir = str(project_root)
 
@@ -1149,8 +1168,6 @@ class ModelEvaluationTab(QWidget):
         trade_pnls_plot = None
         if isinstance(results, dict):
             trade_pnls_plot = results.get("trade_pnls_net") or results.get("trade_pnls")
-        if not trade_pnls_plot:
-            trade_pnls_plot = self._compute_trade_pnls_from_signals()
         return trade_pnls_plot
 
     def _resolve_ternary_thresholds(self) -> tuple[float, float]:
@@ -1354,37 +1371,14 @@ class ModelEvaluationTab(QWidget):
 
     def _apply_confidence_threshold(self, raw_pred, confidence, threshold):
         """Pod prahem confidence nastaví predikci na 0 (flat)."""
-        arr = np.asarray(raw_pred).copy()
-        conf = np.asarray(confidence).reshape(-1)
-        thr = float(threshold)
-        mask_low = conf < thr
-        try:
-            arr[mask_low] = 0
-        except Exception:
-            # kdyby byl typ objektový, uděláme bezpečný převod
-            tmp = np.array(arr, dtype=object)
-            tmp[mask_low] = 0
-            arr = tmp
-        return arr
+        return apply_confidence_entry_threshold(raw_pred, confidence, threshold)
 
     def _apply_exit_threshold(self, y_pred: np.ndarray, confidence: np.ndarray, exit_thr: float) -> np.ndarray:
         """
         Aplikuj exit threshold: pokud máme otevřenou pozici (LONG/SHORT) 
         a confidence klesne pod exit_thr, zavři ji (vrátí FLAT=0).
         """
-        arr = np.asarray(y_pred).copy()
-        conf = np.asarray(confidence).reshape(-1)
-        eth = float(exit_thr)
-        
-        # Vezmi nízkou confidence
-        mask_low = conf < eth
-        
-        # Nastav na FLAT pouze když máme otevřenou pozici
-        open_pos = np.abs(arr) > 0.5
-        close_mask = mask_low & open_pos
-        
-        arr[close_mask] = 0
-        return arr
+        return apply_exit_confidence_threshold(y_pred, confidence, exit_thr)
 
     # --- NEW: normalizace predikcí po prahování na {-1,0,+1} ---
     def _normalize_pred(self, arr):
@@ -1392,16 +1386,7 @@ class ModelEvaluationTab(QWidget):
         Převede libovolné predikce na {-1, 0, +1}.
         Podporuje čísla, booly i texty ('long'/'short'/...).
         """
-        a = np.asarray(arr, dtype=object)
-        out = np.zeros(a.shape, dtype=float)
-        # číselné typy
-        num_mask = np.array([isinstance(x, (int, float, np.number)) for x in a], dtype=bool)
-        out[num_mask] = np.sign(a[num_mask].astype(float))
-        # texty
-        txt = np.char.lower(a.astype(str))
-        out[(txt == "long") | (txt == "buy") | (txt == "up") | (txt == "1") | (txt == "+1")] = 1.0
-        out[(txt == "short") | (txt == "sell") | (txt == "down") | (txt == "-1")] = -1.0
-        return out
+        return normalize_signal_array(arr)
 
     # ---------------- Helpery: PnL a breakdown ----------------
     def _build_positions(self, y_pred):
@@ -1412,56 +1397,20 @@ class ModelEvaluationTab(QWidget):
         return pos
 
     def _compute_trade_pnls_from_signals(self, fee_per_trade: float = None):
-        """
-        Rekonstruuje seznam PnL po obchodech z y_pred_used a close.
-        LONG: vstup při přechodu -> +1, výstup při změně na 0/−1
-        SHORT: vstup při přechodu -> −1, výstup při změně na 0/+1
-        fee_per_trade = náklad za *každou* změnu pozice (open nebo close).
-        Vrací list netto PnL (po nákladech).
-        """
         if self.close_series is None or self.y_pred_used is None:
             return []
 
         close = np.asarray(self.close_series, dtype=float)
-        pos   = self._build_positions(self.y_pred_used)  # −1/0/+1
-        n = min(len(close), len(pos))
+        sig = self._build_positions(self.y_pred_used)
+        n = min(len(close), len(sig))
         if n < 2:
             return []
 
         if fee_per_trade is None and hasattr(self, "cost_spin"):
             fee_per_trade = float(self.cost_spin.value() or 0.0)
         fee = float(fee_per_trade or 0.0)
-
-        trade_pnls = []
-        cur_pos = 0
-        entry_px = None
-
-        for i in range(1, n):
-            p_prev, p_now = pos[i-1], pos[i]
-            # otevření?
-            if cur_pos == 0 and p_prev == 0 and p_now != 0:
-                cur_pos = p_now
-                entry_px = close[i]
-                # náklad za open
-                if fee:
-                    trade_pnls.append(-fee)  # evidujeme náklad (můžeme i odložit; varianta: odečíst až v nettě)
-                    trade_pnls.pop()         # ne, raději započítáme až do PnL obchodu níže
-            # uzavření (přechod do 0 nebo flip)
-            if cur_pos != 0 and (p_now == 0 or np.sign(p_now) != np.sign(cur_pos)):
-                exit_px = close[i]
-                if cur_pos == +1:
-                    gross = exit_px - entry_px
-                else:
-                    gross = entry_px - exit_px
-                net = gross - 2*fee  # open + close
-                trade_pnls.append(net)
-                cur_pos = 0
-                entry_px = None
-            # flip → současně otevřeme novou v opačném směru
-            if cur_pos == 0 and p_now != 0 and (p_prev != p_now):
-                cur_pos = p_now
-                entry_px = close[i]
-        return trade_pnls
+        replay = replay_signals_over_market_data(sig[:n], close[:n], force_close=True)
+        return [float(p) - fee for p in (replay.get("trade_pnls") or [])]
 
     # ---------------- Helpery: grafy ----------------
     def _draw_equity_chart(self, results: dict):
@@ -1470,7 +1419,7 @@ class ModelEvaluationTab(QWidget):
         ax.grid(True, linestyle=":", alpha=0.4)
         ax.set_title("Equity křivka")
 
-        # 1) Načti křivky z výsledků (pokud existují)
+        # 1) Načti křivky z výsledků ze společného executoru
         eq = results.get("equity_curve")
         eq_net = results.get("equity_curve_net")
 
@@ -1480,50 +1429,13 @@ class ModelEvaluationTab(QWidget):
         if eq_net is None and results.get("trade_pnls_net") is not None:
             eq_net = np.cumsum(np.asarray(results["trade_pnls_net"], dtype=float))
 
-        # 3) Odhad, zda přepočítat per-BAR křivky (per-trade bývá krátké)
-        n_bars = None
-        if self.close_series is not None:
-            n_bars = len(self.close_series)
-        elif self.X_current is not None:
-            try:
-                n_bars = len(self.X_current)
-            except Exception:
-                n_bars = None
-
         def _len(x):
             try:
                 return len(x)
             except Exception:
                 return None
 
-        need_bar_equity = False
-        if eq is None or eq_net is None:
-            need_bar_equity = True
-        else:
-            Le, Ln = _len(eq), _len(eq_net)
-            if Le is None or Ln is None:
-                need_bar_equity = True
-            elif Le != Ln:
-                need_bar_equity = True
-            elif n_bars is not None and (Le < 0.7 * n_bars or Ln < 0.7 * n_bars):
-                need_bar_equity = True
-
-        # 4) Per-bar výpočet z close & signálů (stejná délka pro gross i net)
-        if need_bar_equity and self.close_series is not None and self.y_pred_used is not None:
-            n = min(len(self.close_series), len(self.y_pred_used))
-            if n > 1:
-                close = self.close_series.iloc[:n].to_numpy(dtype=float)
-                pos = self._build_positions(self.y_pred_used)[:n]
-                pos_prev = np.concatenate(([0], pos[:-1]))
-                close_prev = np.concatenate(([close[0]], close[:-1]))
-                gross = (close - close_prev) * pos_prev
-                trades = np.abs(pos - pos_prev)
-                fee = float(self.cost_spin.value()) if hasattr(self, 'cost_spin') else 0.0
-                net = gross - fee * trades
-                eq = np.cumsum(gross)
-                eq_net = np.cumsum(net)
-
-        # 5) vykreslení
+        # 3) vykreslení
         plotted = False
         if eq is not None and _len(eq):
             ax.plot(np.arange(_len(eq)), np.asarray(eq, dtype=float), label="Equity (gross)")
@@ -1813,7 +1725,10 @@ class ModelEvaluationTab(QWidget):
 
         lines = [
             "Metrika\tHodnota",
+            "# Ternarni semantika: -1=SHORT, 0=FLAT, 1=LONG.",
             f"scope\t{scope_mode} ({scope_rows}/{scope_total})",
+            f"label_mode\t{_fmt(_pick('label_mode'))}",
+            f"classification_mode\t{_fmt(_pick('classification_mode'))}",
             f"profit_net\t{_fmt(_pick('profit_net', 'profit_gross', 'profit'))}",
             f"sharpe\t{_fmt(_pick('sharpe_ann', 'sharpe_net_ann', 'sharpe', 'sharpe_net', 'sharpe_ratio'))}",
             f"profit_factor\t{_fmt(_pick('pf', 'profit_factor', 'profit_factor_net'))}",
@@ -1826,6 +1741,62 @@ class ModelEvaluationTab(QWidget):
         ]
         QApplication.clipboard().setText("\n".join(lines))
         self._set_status("Zkopirovany klicove metriky do schranky.")
+
+    def _evaluation_exports_dir(self) -> Path:
+        out_dir = Path(__file__).resolve().parents[1] / "model_outputs" / "evals"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir
+
+    def _write_evaluation_report_files(self, out_dir: Path | str | None = None) -> tuple[Path, Path]:
+        if out_dir is None:
+            base_dir = self._evaluation_exports_dir()
+        else:
+            base_dir = Path(out_dir)
+            base_dir.mkdir(parents=True, exist_ok=True)
+
+        model_name = "model"
+        if self.model_path:
+            try:
+                model_name = Path(self.model_path).stem
+            except Exception:
+                model_name = str(self.model_path)
+
+        ts = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+        txt_path = base_dir / f"{model_name}__evaluation_{ts}.txt"
+        html_path = base_dir / f"{model_name}__evaluation_{ts}.html"
+
+        metrics = self.last_metrics if isinstance(self.last_metrics, dict) else {}
+        text_lines = [
+            f"Evaluation report: {model_name}",
+            "Ternarni semantika: -1=SHORT, 0=FLAT, 1=LONG.",
+            "",
+            "Key metrics:",
+        ]
+        for key, value in metrics.items():
+            if isinstance(value, (int, float, np.number)) and np.isfinite(float(value)):
+                text_lines.append(f"{key}: {float(value):.4f}")
+            else:
+                text_lines.append(f"{key}: {value}")
+        txt_path.write_text("\n".join(text_lines) + "\n", encoding="utf-8")
+
+        html_lines = [
+            "<html>",
+            "<head><meta charset=\"utf-8\"><title>Evaluation report</title></head>",
+            "<body>",
+            f"<h1>Evaluation report: {model_name}</h1>",
+            "<p>Ternarni semantika: -1=SHORT, 0=FLAT, 1=LONG.</p>",
+            "<ul>",
+        ]
+        for key, value in metrics.items():
+            if isinstance(value, (int, float, np.number)) and np.isfinite(float(value)):
+                rendered = f"{float(value):.4f}"
+            else:
+                rendered = str(value)
+            html_lines.append(f"<li><strong>{key}</strong>: {rendered}</li>")
+        html_lines.extend(["</ul>", "</body>", "</html>"])
+        html_path.write_text("\n".join(html_lines) + "\n", encoding="utf-8")
+
+        return txt_path, html_path
 
     @staticmethod
     def _pretty_metric_name(key: str) -> str:
@@ -1906,7 +1877,12 @@ class ModelEvaluationTab(QWidget):
 
             lst = results.get("trades") or results.get("trades_list")
             if isinstance(lst, (list, tuple)) and lst and isinstance(lst[0], dict):
-                return pd.DataFrame(lst)
+                out = pd.DataFrame(lst)
+                preferred = [
+                    "entry_time", "exit_time", "direction", "entry_price", "exit_price", "pnl", "pnl_net", "exit_reason",
+                ]
+                cols = [c for c in preferred if c in out.columns] + [c for c in out.columns if c not in preferred]
+                return out[cols]
 
             pnls = results.get("trade_pnls_net") or results.get("trade_pnls")
             if pnls is not None:
@@ -2288,15 +2264,61 @@ class ModelEvaluationTab(QWidget):
             f"trades: {best_trades}",
         )
 
-    def _stop_worker_attr(self, attr_name: str) -> None:
+    def _track_retired_worker(self, worker: TaskWorker) -> None:
+        if worker in self._retired_workers:
+            return
+        self._retired_workers.append(worker)
+
+        def _cleanup_retired_worker() -> None:
+            try:
+                self._retired_workers.remove(worker)
+            except ValueError:
+                pass
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+
+        worker.finished.connect(_cleanup_retired_worker)
+
+    def _stop_worker_attr(self, attr_name: str, *, wait_ms: int = 250, allow_background: bool = True) -> bool:
         worker = getattr(self, attr_name, None)
         if worker is None:
-            return
+            return True
+        setattr(self, attr_name, None)
+        for signal_name in ("progress_text", "result", "error", "finished"):
+            try:
+                getattr(worker, signal_name).disconnect()
+            except Exception:
+                pass
         try:
             worker.stop()
         except Exception:
             pass
-        setattr(self, attr_name, None)
+        if worker.isRunning() and not worker.wait(wait_ms):
+            if allow_background:
+                self._track_retired_worker(worker)
+                return False
+            setattr(self, attr_name, worker)
+            return False
+        try:
+            worker.deleteLater()
+        except Exception:
+            pass
+        return True
+
+    def shutdown(self) -> bool:
+        self._pending_auto_threshold_search = False
+        self._pending_auto_threshold_dialog = None
+        try:
+            self._params_timer.stop()
+        except Exception:
+            pass
+        ok = True
+        ok = self._stop_worker_attr("_auto_threshold_worker", wait_ms=2000, allow_background=False) and ok
+        ok = self._stop_worker_attr("_params_worker", wait_ms=2000, allow_background=False) and ok
+        ok = self._stop_worker_attr("_eval_worker", wait_ms=2000, allow_background=False) and ok
+        return ok
 
     def _apply_results_to_ui(self, results: dict) -> None:
         self.last_metrics = results
@@ -2343,6 +2365,7 @@ class ModelEvaluationTab(QWidget):
             fee_per_trade=float(self.cost_spin.value()),
             entry_threshold=float(self.et_spin.value()),
             exit_threshold=float(self.ext_spin.value()),
+            exit_policy=self._current_exit_policy(),
         )
         self._eval_worker = worker
         worker.progress_text.connect(self._set_status)
@@ -2361,6 +2384,7 @@ class ModelEvaluationTab(QWidget):
         fee_per_trade: float,
         entry_threshold: float,
         exit_threshold: float,
+        exit_policy: str,
         progress_cb=None,
     ) -> EvaluationPayload:
         return model_eval_runtime.run_model_evaluation(
@@ -2371,6 +2395,7 @@ class ModelEvaluationTab(QWidget):
             fee_per_trade=float(fee_per_trade),
             entry_threshold=float(entry_threshold),
             exit_threshold=float(exit_threshold),
+            exit_policy=resolve_exit_policy_setting(exit_policy, default=DEFAULT_EXIT_POLICY),
             progress_cb=progress_cb,
         )
 
@@ -2425,6 +2450,7 @@ class ModelEvaluationTab(QWidget):
         fee_per_trade: float,
         entry_threshold: float,
         exit_threshold: float,
+        exit_policy: str,
         progress_cb=None,
     ) -> tuple[np.ndarray, dict]:
         return model_eval_runtime.recalculate_metrics_from_predictions(
@@ -2435,6 +2461,7 @@ class ModelEvaluationTab(QWidget):
             fee_per_trade=float(fee_per_trade),
             entry_threshold=float(entry_threshold),
             exit_threshold=float(exit_threshold),
+            exit_policy=resolve_exit_policy_setting(exit_policy, default=DEFAULT_EXIT_POLICY),
             progress_cb=progress_cb,
         )
 
@@ -2454,6 +2481,7 @@ class ModelEvaluationTab(QWidget):
             fee_per_trade=float(self.cost_spin.value()),
             entry_threshold=float(self.et_spin.value()),
             exit_threshold=float(self.ext_spin.value()),
+            exit_policy=self._current_exit_policy(),
         )
         self._params_worker = worker
         worker.progress_text.connect(self._set_status)
@@ -2524,6 +2552,7 @@ class ModelEvaluationTab(QWidget):
         fee_per_trade: float,
         current_entry: float,
         current_exit: float,
+        exit_policy: str,
         progress_cb=None,
         should_run=None,
     ) -> AutoThresholdPayload:
@@ -2535,6 +2564,7 @@ class ModelEvaluationTab(QWidget):
             fee_per_trade=float(fee_per_trade),
             current_entry=float(current_entry),
             current_exit=float(current_exit),
+            exit_policy=resolve_exit_policy_setting(exit_policy, default=DEFAULT_EXIT_POLICY),
             progress_cb=progress_cb,
             should_run=should_run,
         )
@@ -2554,6 +2584,7 @@ class ModelEvaluationTab(QWidget):
             fee_per_trade=float(self.cost_spin.value()),
             current_entry=float(self.et_spin.value()),
             current_exit=float(self.ext_spin.value()),
+            exit_policy=self._current_exit_policy(),
         )
         self._auto_threshold_worker = worker
         worker.progress_text.connect(self._set_status)
@@ -2615,6 +2646,7 @@ class ModelEvaluationTab(QWidget):
             loaded = model_eval_runtime.load_predictor_with_merged_meta(normalized_path)
             self.loaded_model = loaded.predictor
             self.model_metadata = loaded.metadata
+            self._set_exit_policy_combo(resolve_exit_policy_setting(self.model_metadata or {}, default=DEFAULT_EXIT_POLICY))
             if isinstance(self.model_metadata, dict):
                 _, tshort, tlong = self._meta_threshold_values()
                 if not isinstance(tshort, (int, float)) or not isinstance(tlong, (int, float)):
@@ -2622,6 +2654,29 @@ class ModelEvaluationTab(QWidget):
                         "Model neobsahuje ternarni prahy (ternary_threshold_short/long). "
                         "Tab 3 je nyni pouze pro ternarni modely."
                     )
+
+                if self.data_path:
+                    try:
+                        stale = model_eval_runtime.is_tab5_holdout_ranking_stale(
+                            self.model_metadata,
+                            data_path=self.data_path,
+                            fee_per_trade=float(self.cost_spin.value()),
+                            exit_policy=self._current_exit_policy(),
+                        )
+                    except Exception:
+                        stale = True
+                    if not stale:
+                        ranking = model_eval_runtime.get_tab5_holdout_ranking(
+                            self.model_metadata,
+                            exit_policy=self._current_exit_policy(),
+                        )
+                        if isinstance(ranking, dict):
+                            entry_threshold = self._safe_float(ranking.get("entry_threshold"))
+                            exit_threshold = self._safe_float(ranking.get("exit_threshold"))
+                            if entry_threshold is not None:
+                                self.et_spin.setValue(float(entry_threshold))
+                            if exit_threshold is not None:
+                                self.ext_spin.setValue(float(exit_threshold))
             self.model_path = normalized_path
             self.model_label.setText(f"Model: {normalized_path}")
             self._refresh_threshold_preview()

@@ -71,51 +71,17 @@ except Exception as e:
     raise ImportError(f"Nelze importovat LiveWarmupService: {e}")
 
 
-# TradingView klient (různé fallback importy)
-try:
-    from ibkr_trading_bot.core.datasource.tradingview_client import (
-        TradingViewClient,
-        load_saved_tv_credentials,
-        save_tv_credentials,
-    )
-except ModuleNotFoundError:
-    try:
-        from ibkr_trading_bot.core.data_sources.tradingview_client import (
-            TradingViewClient,
-            load_saved_tv_credentials,
-            save_tv_credentials,
-        )
-    except ModuleNotFoundError:
-        try:
-            from core.datasource.tradingview_client import (
-                TradingViewClient,
-                load_saved_tv_credentials,
-                save_tv_credentials,
-            )
-        except ModuleNotFoundError:
-            from core.data_sources.tradingview_client import (
-                TradingViewClient,
-                load_saved_tv_credentials,
-                save_tv_credentials,
-            )
+# TradingView klient
+from ibkr_trading_bot.core.datasource.tradingview_client import (
+    TradingViewClient,
+    load_saved_tv_credentials,
+    save_tv_credentials,
+)
 
 # Logger
-try:
-    from ibkr_trading_bot.core.utils.logging_setup import get_logger
-except Exception:
-    def get_logger(name: str):
-        import logging
-        logger = logging.getLogger(name)
-        if not logger.handlers:
-            handler = logging.StreamHandler()
-            handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
-            logger.addHandler(handler)
-        if logger.level == logging.NOTSET:
-            logger.setLevel(logging.INFO)
-        logger.propagate = False
-        return logger
+from ibkr_trading_bot.core.utils.logging_setup import get_logger
 
-DEFAULT_MODEL_DIR = r"C:\Users\adamk\Můj disk\Trader\ibkr_trading_bot\model_outputs"
+DEFAULT_MODEL_DIR = str(Path(__file__).resolve().parent.parent / "model_outputs")
 
 def _make_proxy_target_from_df(df):
     """
@@ -421,7 +387,7 @@ class LiveConfig:
     use_ma_only: bool = False
     use_and_ensemble: bool = False  # default VOTE (AND vypnuto)
     alert_on_flip: bool = True
-    alert_sound: str | None = r"C:\Users\adamk\Můj disk\Trader\ibkr_trading_bot\gui\assets\alert.wav"
+    alert_sound: str | None = str(Path(__file__).resolve().parent / "assets" / "alert.wav")
     alert_cooldown_s: int = 5
 
     # E-mail

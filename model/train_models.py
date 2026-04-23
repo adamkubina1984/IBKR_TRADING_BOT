@@ -5,6 +5,7 @@ import hashlib
 import json as jsonlib
 import logging
 import pathlib
+import warnings
 from datetime import datetime
 from typing import Any
 
@@ -24,16 +25,10 @@ from sklearn.preprocessing import RobustScaler
 from sklearn.svm import SVC
 
 from ibkr_trading_bot.core.services.model_service import runtime_python_version, runtime_sklearn_version
-try:
-    from ibkr_trading_bot.model.feature_stability import (
-        compute_feature_stability_score,
-        evaluate_feature_stability_filter,
-    )
-except Exception:
-    from model.feature_stability import (  # type: ignore
-        compute_feature_stability_score,
-        evaluate_feature_stability_filter,
-    )
+from ibkr_trading_bot.model.feature_stability import (
+    compute_feature_stability_score,
+    evaluate_feature_stability_filter,
+)
 
 # --- volitelné knihovny
 try:
@@ -59,49 +54,17 @@ except Exception:
 LOGGER = logging.getLogger(__name__)
 
 # --- purged walk-forward split
-try:
-    from ibkr_trading_bot.model.tscv import PurgedWalkForwardSplit
-except Exception:
-    try:
-        from model.tscv import PurgedWalkForwardSplit
-    except Exception:
-        class PurgedWalkForwardSplit:  # type: ignore
-            def __init__(self, n_splits=5, embargo=0):
-                self.n_splits = n_splits
-                self.embargo = embargo
-
-            def split(self, X):
-                n = len(X)
-                fold = n // (self.n_splits + 1)
-                for k in range(self.n_splits):
-                    train_end = fold * (k + 1)
-                    test_start = min(train_end + self.embargo, n - 1)
-                    test_end = min(test_start + fold, n)
-                    tr = np.arange(0, train_end)
-                    te = np.arange(test_start, test_end)
-                    yield tr, te
+from ibkr_trading_bot.model.tscv import PurgedWalkForwardSplit
 
 # --- metriky / scorer
 try:
     from ibkr_trading_bot.utils.metrics import calculate_metrics, pnl_scorer  # type: ignore
     HAS_CALC_METRICS = True
-except Exception:
-    try:
-        from utils.metrics import calculate_metrics, pnl_scorer  # type: ignore
-        HAS_CALC_METRICS = True
-    except Exception:
-        try:
-            from ibkr_trading_bot.utils.metrics import pnl_scorer  # type: ignore
-            HAS_CALC_METRICS = False
-        except Exception:
-            try:
-                from utils.metrics import pnl_scorer  # type: ignore
-                HAS_CALC_METRICS = False
-            except Exception:
-                def pnl_scorer(estimator, X_val, y_val, df_val=None, fee=0.0, slippage=0.0):
-                    pred = estimator.predict(X_val)
-                    return float((pred == y_val).mean())
-                HAS_CALC_METRICS = False
+except ImportError:
+    def pnl_scorer(estimator, X_val, y_val, df_val=None, fee=0.0, slippage=0.0):
+        pred = _call_with_feature_name_warning_suppressed(estimator.predict, X_val)
+        return float((pred == y_val).mean())
+    HAS_CALC_METRICS = False
 
 # ------------------- Pomocné -------------------
 def _now_str() -> str:
@@ -291,7 +254,7 @@ def _candidate_priority_score(row: dict[str, Any], criterion: str) -> float:
     profit_c = float(np.clip(profit / 250.0, -2.0, 2.0))
     sharpe_c = float(np.clip(sharpe / 2.0, -1.5, 1.5))
     pf_c = float(np.clip(pf - 1.0, -1.0, 2.0))
-    trades_c = float(np.clip(n_dir / 80.0, 0.0, 1.0))
+    trades_c = _trade_count_preference_score(n_dir)
 
     rec_min = 0.0
     rec_bal = 0.5
@@ -340,6 +303,61 @@ def _candidate_priority_score(row: dict[str, Any], criterion: str) -> float:
     if n_short <= 0.0 or n_long <= 0.0:
         score -= 0.50
     return float(score)
+
+
+def _trade_count_preference_score(
+    n_trades: float,
+    *,
+    hard_min: float = 60.0,
+    preferred_low: float = 150.0,
+    preferred_high: float = 300.0,
+    soft_max: float = 450.0,
+) -> float:
+    try:
+        value = float(n_trades)
+    except Exception:
+        return 0.0
+    if not np.isfinite(value) or value < hard_min:
+        return 0.0
+    if value <= preferred_low:
+        span = max(preferred_low - hard_min, 1.0)
+        return float(np.clip((value - hard_min) / span, 0.0, 1.0))
+    if value <= preferred_high:
+        return 1.0
+    if value <= soft_max:
+        span = max(soft_max - preferred_high, 1.0)
+        return float(np.clip(1.0 - ((value - preferred_high) / span), 0.0, 1.0))
+    return 0.0
+
+
+def _fallback_candidate_sort_key(row: dict[str, Any]) -> tuple[float, float, float, float]:
+    def _finite_side_recall(key: str) -> float:
+        try:
+            value = float(row.get(key, np.nan))
+        except Exception:
+            return -1.0
+        return float(value) if np.isfinite(value) else -1.0
+
+    rec_short = _finite_side_recall("rec_short")
+    rec_long = _finite_side_recall("rec_long")
+    available = [value for value in (rec_short, rec_long) if value >= 0.0]
+    if not available:
+        rec_min = -1.0
+        rec_mean = -1.0
+        rec_bal = -1.0
+    elif len(available) == 1:
+        rec_min = available[0]
+        rec_mean = available[0]
+        rec_bal = available[0]
+    else:
+        rec_min = min(available)
+        rec_mean = float(sum(available) / len(available))
+        rec_bal = float(np.clip(1.0 - abs(rec_short - rec_long), 0.0, 1.0))
+    try:
+        cheap_score = float(row.get("cheap_score", -1e18))
+    except Exception:
+        cheap_score = -1e18
+    return float(rec_min), float(rec_bal), float(rec_mean), float(cheap_score)
 
 
 def _rank_candidates_for_chain(
@@ -563,6 +581,16 @@ def _align_X_for_estimator(estimator, X):
         pass
     return X
 
+
+def _call_with_feature_name_warning_suppressed(func, *args, **kwargs):
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"X does not have valid feature names, but .* was fitted with feature names",
+            category=UserWarning,
+        )
+        return func(*args, **kwargs)
+
 def _predict_proba(estimator, X: pd.DataFrame, class_idx: int = 1) -> np.ndarray | None:
     """
     Return predicted probability for class at given index (1 for binary class 1, or for multiclass).
@@ -571,7 +599,7 @@ def _predict_proba(estimator, X: pd.DataFrame, class_idx: int = 1) -> np.ndarray
     try:
         X_use = _align_X_for_estimator(estimator, X)
         if hasattr(estimator, "predict_proba"):
-            proba = estimator.predict_proba(X_use)
+            proba = _call_with_feature_name_warning_suppressed(estimator.predict_proba, X_use)
             if isinstance(proba, np.ndarray) and proba.ndim == 2:
                 # if more than 2 classes, return proba for class_idx; else return class 1
                 return proba[:, min(class_idx, proba.shape[1] - 1)]
@@ -579,7 +607,7 @@ def _predict_proba(estimator, X: pd.DataFrame, class_idx: int = 1) -> np.ndarray
         if isinstance(estimator, Pipeline):
             last = estimator.steps[-1][1]
             if hasattr(last, "predict_proba"):
-                proba = estimator.predict_proba(X_use)
+                proba = _call_with_feature_name_warning_suppressed(estimator.predict_proba, X_use)
                 if isinstance(proba, np.ndarray) and proba.ndim == 2:
                     return proba[:, min(class_idx, proba.shape[1] - 1)]
                 return np.asarray(proba).ravel()
@@ -781,7 +809,7 @@ def _predict_labels_for_metrics(
     try:
         X_use = _align_X_for_estimator(estimator, X)
         if hasattr(estimator, "predict_proba"):
-            proba = estimator.predict_proba(X_use)
+            proba = _call_with_feature_name_warning_suppressed(estimator.predict_proba, X_use)
     except Exception:
         proba = None
         X_use = X
@@ -805,7 +833,7 @@ def _predict_labels_for_metrics(
             n_signals = int((y_pred == 1).sum())
             return y_pred, n_signals, p1
 
-    y_pred = np.asarray(estimator.predict(X_use)).astype(int)
+    y_pred = np.asarray(_call_with_feature_name_warning_suppressed(estimator.predict, X_use)).astype(int)
     if is_ternary:
         n_signals = int((y_pred != 1).sum())
     else:
@@ -1105,6 +1133,10 @@ def _choose_thresholds_from_oof_ternary(
     best_balanced_score = -1e18
     best_relaxed = (0.5, 0.5)
     best_relaxed_score = -1e18
+    cheap_recall_reward = 1.35
+    cheap_recall_penalty = 1.50
+    shortlist_recall_penalty = 0.95
+    balanced_recall_penalty = 0.60
     min_side_floor = max(4, min(int(min_side_signals), 30))
     max_side_dominance_relaxed = min(0.90, float(max_side_dominance) + 0.10)
     short_share_tolerance_relaxed = float(short_share_tolerance) + 0.08
@@ -1184,11 +1216,11 @@ def _choose_thresholds_from_oof_ternary(
 
             cheap = 0.0
             if np.isfinite(rec_short):
-                cheap += 1.8 * float(rec_short)
-                cheap -= 2.2 * max(0.0, float(min_side_recall_target) - float(rec_short))
+                cheap += cheap_recall_reward * float(rec_short)
+                cheap -= cheap_recall_penalty * max(0.0, float(min_side_recall_target) - float(rec_short))
             if np.isfinite(rec_long):
-                cheap += 0.9 * float(rec_long)
-                cheap -= 0.8 * max(0.0, float(min_side_recall_target) - float(rec_long))
+                cheap += cheap_recall_reward * float(rec_long)
+                cheap -= cheap_recall_penalty * max(0.0, float(min_side_recall_target) - float(rec_long))
             cheap += 0.15 * min(2.0, float(n_total) / max(1.0, float(min_signals)))
             cheap -= 1.8 * max(0.0, float(dominance) - float(max_side_dominance_relaxed))
             if share_dev > 0.0:
@@ -1278,9 +1310,9 @@ def _choose_thresholds_from_oof_ternary(
             if dir_dev > 0.0:
                 score -= float(balance_penalty_weight) * 0.75 * float(dir_dev)
             if np.isfinite(rec_short):
-                score -= 1.20 * max(0.0, float(min_side_recall_target) - float(rec_short))
+                score -= shortlist_recall_penalty * max(0.0, float(min_side_recall_target) - float(rec_short))
             if np.isfinite(rec_long):
-                score -= 0.70 * max(0.0, float(min_side_recall_target) - float(rec_long))
+                score -= shortlist_recall_penalty * max(0.0, float(min_side_recall_target) - float(rec_long))
         except Exception:
             score = -1e18
 
@@ -1306,9 +1338,9 @@ def _choose_thresholds_from_oof_ternary(
                 if target_dir_rate is not None and np.isfinite(target_dir_rate):
                     bal_score -= max(0.0, dir_dev - float(dir_rate_tolerance)) * 2.0
                 if np.isfinite(rec_short):
-                    bal_score -= 0.80 * max(0.0, float(min_side_recall_target) - float(rec_short))
+                    bal_score -= balanced_recall_penalty * max(0.0, float(min_side_recall_target) - float(rec_short))
                 if np.isfinite(rec_long):
-                    bal_score -= 0.40 * max(0.0, float(min_side_recall_target) - float(rec_long))
+                    bal_score -= balanced_recall_penalty * max(0.0, float(min_side_recall_target) - float(rec_long))
                 if bal_score > best_balanced_score:
                     best_balanced_score = float(bal_score)
                     best_balanced = (float(thr_s), float(thr_l))
@@ -1346,16 +1378,9 @@ def _choose_thresholds_from_oof_ternary(
         return best_balanced
     if best_relaxed_score > -1e17:
         return best_relaxed
-    # Last fallback (when metric eval fails): prefer the candidate with the best short-side recall.
+    # Last fallback (when metric eval fails): prefer the most balanced side-recall candidate.
     try:
-        side_row = max(
-            candidate_rows,
-            key=lambda r: (
-                float(r.get("rec_short", np.nan)) if np.isfinite(float(r.get("rec_short", np.nan))) else -1.0,
-                float(r.get("rec_long", np.nan)) if np.isfinite(float(r.get("rec_long", np.nan))) else -1.0,
-                float(r.get("cheap_score", -1e18)),
-            ),
-        )
+        side_row = max(candidate_rows, key=_fallback_candidate_sort_key)
         return float(side_row["thr_s"]), float(side_row["thr_l"])
     except Exception:
         ts_fb, tl_fb = _fallback_ternary_thresholds_from_oof(
@@ -1679,7 +1704,7 @@ def _mc_eval_holdout_adaptive(
     try:
         Xh_use = _align_X_for_estimator(estimator, Xh)
         if hasattr(estimator, "predict_proba"):
-            pr = estimator.predict_proba(Xh_use)
+            pr = _call_with_feature_name_warning_suppressed(estimator.predict_proba, Xh_use)
             if isinstance(pr, np.ndarray) and pr.ndim == 2 and pr.shape[1] >= 3:
                 proba_short_all = pr[:, 0]
                 proba_long_all = pr[:, 2]
@@ -1742,7 +1767,7 @@ def _mc_eval_holdout_adaptive(
                     yp = (pb >= thr_used).astype(int)
         else:
             X_pred = _align_X_for_estimator(estimator, dfb[features])
-            yp = estimator.predict(X_pred)
+            yp = _call_with_feature_name_warning_suppressed(estimator.predict, X_pred)
 
         try:
             yt_eval = _mapped_ternary_to_signed(yt) if is_ternary_proba else yt
@@ -1887,12 +1912,12 @@ def train_and_evaluate_model(
     unique_targets = sorted(df["target"].unique())
     is_ternary = set(unique_targets) == {-1, 0, 1} or (set(unique_targets).issubset({-1, 0, 1}) and len(unique_targets) == 3)
     if is_ternary:
-        print(f"[INFO] Ternary target detected: {unique_targets}")
+        LOGGER.info("Ternary target detected: %s", unique_targets)
         # For ternary, convert to 3-class: map -1->0, 0->1, 1->2 for sklearn
         y_map = {-1: 0, 0: 1, 1: 2}
         df["target"] = df["target"].map(y_map).astype(int)
     else:
-        print(f"[INFO] Binary target detected: {sorted(df['target'].unique())}")
+        LOGGER.info("Binary target detected: %s", sorted(df["target"].unique()))
         df["target"] = df["target"].astype(int)
 
     if class_balance_power_kw is None:
@@ -2362,13 +2387,13 @@ def train_and_evaluate_model(
                 try:
                     X_te_use = _align_X_for_estimator(est, X_te)
                     if hasattr(est, "predict_proba"):
-                        pr = est.predict_proba(X_te_use)
+                        pr = _call_with_feature_name_warning_suppressed(est.predict_proba, X_te_use)
                         if isinstance(pr, np.ndarray) and pr.ndim == 2 and pr.shape[1] >= 3:
                             y_pred_fold = _ternary_predict_mapped(pr[:, 0], pr[:, 2], 0.5, 0.5)
                         else:
-                            y_pred_fold = np.asarray(est.predict(X_te_use)).astype(int)
+                            y_pred_fold = np.asarray(_call_with_feature_name_warning_suppressed(est.predict, X_te_use)).astype(int)
                     else:
-                        y_pred_fold = np.asarray(est.predict(X_te_use)).astype(int)
+                        y_pred_fold = np.asarray(_call_with_feature_name_warning_suppressed(est.predict, X_te_use)).astype(int)
                     n_short = int((y_pred_fold == 0).sum())
                     n_long = int((y_pred_fold == 2).sum())
                     y_te_eval = _mapped_ternary_to_signed(y_te)
@@ -2380,13 +2405,13 @@ def train_and_evaluate_model(
                     )
                     score = _ternary_composite_score(m_fold, n_short=n_short, n_long=n_long)
                 except Exception:
-                    pred = est.predict(_align_X_for_estimator(est, X_te))
+                    pred = _call_with_feature_name_warning_suppressed(est.predict, _align_X_for_estimator(est, X_te))
                     score = float((pred == y_te).mean())
             else:
                 try:
                     score = pnl_scorer(est, X_te, y_te, df_te, fee=fee_per_trade, slippage=slippage_bps)
                 except Exception:
-                    pred = est.predict(_align_X_for_estimator(est, X_te))
+                    pred = _call_with_feature_name_warning_suppressed(est.predict, _align_X_for_estimator(est, X_te))
                     score = float((pred == y_te).mean())
             fold_scores.append(float(score))
             fold_sizes.append(len(te_idx))
@@ -2432,7 +2457,7 @@ def train_and_evaluate_model(
             if is_ternary:
                 try:
                     X_te_use = _align_X_for_estimator(est, X_te)
-                    pr = est.predict_proba(X_te_use) if hasattr(est, "predict_proba") else None
+                    pr = _call_with_feature_name_warning_suppressed(est.predict_proba, X_te_use) if hasattr(est, "predict_proba") else None
                     if isinstance(pr, np.ndarray) and pr.ndim == 2 and pr.shape[1] >= 3:
                         tmp_oof[te_idx, 0] = pr[:, 0]
                         tmp_oof[te_idx, 1] = pr[:, 2]
@@ -2596,7 +2621,7 @@ def train_and_evaluate_model(
                     try:
                         X_cal = df_threshold_calib[feats].replace([np.inf, -np.inf], np.nan)
                         X_cal_use = _align_X_for_estimator(best_estimator, X_cal)
-                        pr_cal = best_estimator.predict_proba(X_cal_use) if hasattr(best_estimator, "predict_proba") else None
+                        pr_cal = _call_with_feature_name_warning_suppressed(best_estimator.predict_proba, X_cal_use) if hasattr(best_estimator, "predict_proba") else None
                         if isinstance(pr_cal, np.ndarray) and pr_cal.ndim == 2 and pr_cal.shape[1] >= 3:
                             df_oof = df_threshold_calib.reset_index(drop=True)
                             y_oof = df_oof["target"].astype(int).to_numpy()
@@ -3456,7 +3481,9 @@ def train_and_evaluate_model(
                     )
             else:
                 Xh_pred = _align_X_for_estimator(calibrated_estimator, Xh)
-                acc = float((calibrated_estimator.predict(Xh_pred) == yh).mean())
+                acc = float((
+                    _call_with_feature_name_warning_suppressed(calibrated_estimator.predict, Xh_pred) == yh
+                ).mean())
                 holdout_metrics = {"accuracy": acc}
         except Exception:
             pass
@@ -3840,8 +3867,4 @@ def train_and_evaluate_model(
 
 # Backwards compatibility: some tests / CLI expect `train_simple_model`
 # to be importable from `ibkr_trading_bot.model.train_models`.
-try:
-    from ibkr_trading_bot.model.data_split import train_simple_model as train_simple_model  # type: ignore
-except Exception:
-    # If import fails, leave it to callers to import from the canonical module.
-    train_simple_model = None
+from ibkr_trading_bot.model.data_split import train_simple_model as train_simple_model  # type: ignore

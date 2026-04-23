@@ -88,8 +88,7 @@ def resolve_tv_credentials(
 
 class TradingViewClient:
     def __init__(self, username: str | None = None, password: str | None = None):
-        load_dotenv(r"C:\Users\adamk\Můj disk\Trader\.env")
-        load_dotenv()
+        load_dotenv()  # searches .env in cwd and parent directories
 
         user, pwd, source = resolve_tv_credentials(username=username, password=password)
 

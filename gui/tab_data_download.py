@@ -8,13 +8,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import pandas as pd
 
-try:
-    from ibkr_trading_bot.core.datasource.tradingview_client import TradingViewClient
-except ModuleNotFoundError:
-    try:
-        from core.datasource.tradingview_client import TradingViewClient
-    except ModuleNotFoundError:
-        from core.data_sources.tradingview_client import TradingViewClient
+from ibkr_trading_bot.core.datasource.tradingview_client import TradingViewClient
 from dotenv import load_dotenv
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -29,6 +23,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QVBoxLayout,
@@ -99,6 +94,7 @@ class DataDownloadTab(QWidget):
         self._log_timer.setInterval(100)
         self._log_timer.timeout.connect(self._flush_log_queue)
         self._task_worker: TaskWorker | None = None
+        self._retired_task_workers: list[TaskWorker] = []
         self.tv_client: TradingViewClient | None = None
 
         root = QVBoxLayout(self)
@@ -284,11 +280,28 @@ class DataDownloadTab(QWidget):
     def _new_tv_client(self) -> TradingViewClient:
         return TradingViewClient(username=os.getenv("TV_USERNAME"), password=os.getenv("TV_PASSWORD"))
 
-    def _stop_task_worker(self, *, wait_ms: int = 1500) -> None:
-        worker = self._task_worker
-        self._task_worker = None
-        if worker is None:
+    def _track_retired_task_worker(self, worker: TaskWorker) -> None:
+        if worker in self._retired_task_workers:
             return
+        self._retired_task_workers.append(worker)
+
+        def _cleanup_retired_worker() -> None:
+            try:
+                self._retired_task_workers.remove(worker)
+            except ValueError:
+                pass
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+
+        worker.finished.connect(_cleanup_retired_worker)
+
+    def _stop_task_worker(self, *, wait_ms: int = 1500, allow_background: bool = False) -> bool:
+        worker = self._task_worker
+        if worker is None:
+            return True
+        self._task_worker = None
         try:
             worker.progress_text.disconnect(self.log_msg)
         except Exception:
@@ -302,18 +315,19 @@ class DataDownloadTab(QWidget):
         except Exception:
             pass
         if worker.isRunning() and not worker.wait(wait_ms):
-            # App shutdown should not leave a live QThread behind.
-            try:
-                worker.terminate()
-            except Exception:
-                pass
-            try:
-                worker.wait(wait_ms)
-            except Exception:
-                pass
+            if allow_background:
+                self._track_retired_task_worker(worker)
+                return False
+            self._task_worker = worker
+            return False
+        try:
+            worker.deleteLater()
+        except Exception:
+            pass
+        return True
 
     def _start_task(self, worker: TaskWorker) -> None:
-        self._stop_task_worker(wait_ms=250)
+        self._stop_task_worker(wait_ms=250, allow_background=True)
         self._task_worker = worker
         worker.progress_text.connect(self.log_msg)
         worker.finished.connect(self._on_task_finished)
@@ -1070,7 +1084,7 @@ class DataDownloadTab(QWidget):
     def _plot_candles(self, df: pd.DataFrame) -> None:
         return plot_candles(self.fig, self.ax, self.canvas, df)
 
-    def shutdown(self) -> None:
+    def shutdown(self) -> bool:
         if self._log_timer.isActive():
             self._log_timer.stop()
         if self._proc is not None:
@@ -1080,8 +1094,15 @@ class DataDownloadTab(QWidget):
             except Exception:
                 pass
             self._proc = None
-        self._stop_task_worker(wait_ms=2000)
+        return self._stop_task_worker(wait_ms=2000, allow_background=False)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        self.shutdown()
+        if not self.shutdown():
+            QMessageBox.warning(
+                self,
+                "Stahovani dat",
+                "Probihajici operace se jeste neukoncila. Pockej na dokonceni nebo ji zastav a zkus zavreni znovu.",
+            )
+            event.ignore()
+            return
         super().closeEvent(event)
