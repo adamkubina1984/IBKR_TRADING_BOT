@@ -1,16 +1,10 @@
 # tests/test_data_split.py
 
-import os
-import sys
-
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
-
 import numpy as np
 import pandas as pd
 import pytest
 
-from model.data_split import export_datasets, walk_forward_split
+from ibkr_trading_bot.model.data_split import export_datasets, walk_forward_split
 
 
 @pytest.fixture

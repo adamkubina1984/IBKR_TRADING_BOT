@@ -13,13 +13,9 @@ load_dotenv()
 # --- volitelně vezmeme TradingView pro živá data ---
 def fetch_tv(symbol, exchange, tf_label, limit):
     try:
-        # drž se stejných import fallbacků jako v GUI podle toho, kde to spouštíš
         from ibkr_trading_bot.core.datasource.tradingview_client import TradingViewClient
     except Exception:
-        try:
-            from core.datasource.tradingview_client import TradingViewClient
-        except Exception:
-            return None
+        return None
     tv = TradingViewClient(username=os.getenv("TV_USERNAME"), password=os.getenv("TV_PASSWORD"))
     df = tv.get_history(symbol, exchange, tf_label, limit=limit)
     if df is None or df.empty:
@@ -131,6 +127,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-#C:\Users\adamk\Můj disk\Trader\ibkr_trading_bot\model_outputs
-#python tests/test_model_pkl.py --pkl "C:\Users\adamk\Můj disk\Trader\ibkr_trading_bot\model_outputs\rf_20251003_132426.pkl" --symbol GC1! --exchange COMEX --tf "15 min" --bars 200
