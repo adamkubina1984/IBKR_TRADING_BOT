@@ -519,6 +519,9 @@ def _build_live_bootstrap_payload_from_history_df(
         .drop_duplicates(subset=["time"], keep="last")
         .reset_index(drop=True)
     )
+    if len(work) > 1:
+        # Last row from history can be currently-open bar; bootstrap only with closed bars.
+        work = work.iloc[:-1].reset_index(drop=True)
     if work.empty:
         return _empty_live_bootstrap_payload(len(models))
 
@@ -734,7 +737,7 @@ class TVWorker(QThread):
         super().__init__(parent)
         self.cfg = cfg
         self._stop = False
-        self._last_ns: int | None = None
+        self._last_closed_ns: int | None = None
         self.tv = TradingViewClient(
             username=os.getenv("TV_USERNAME"),
             password=os.getenv("TV_PASSWORD")
@@ -760,23 +763,25 @@ class TVWorker(QThread):
                 tf_label = (self.cfg.bar_size or "1 hour").replace("mins", "min")
                 exchange = (getattr(self.cfg, "exchange", None) or "COMEX")
                 df = self.tv.get_history(self.cfg.symbol, exchange, tf_label, limit=2)
-                if df is not None and not df.empty:
-                    last = df.iloc[-1]
-                    ts = pd.to_datetime(last["time"], utc=True, errors="coerce")
-                    if pd.isna(ts):
+                if df is not None and len(df.index) >= 2:
+                    # TradingView typically returns [closed_bar, currently_open_bar] for limit=2.
+                    # Emit only the closed bar to avoid rendering malformed/incomplete candles.
+                    closed_bar = df.iloc[-2]
+                    closed_ts = pd.to_datetime(closed_bar["time"], utc=True, errors="coerce")
+                    if pd.isna(closed_ts):
                         self.msleep(self._poll_interval_s() * 1000); continue
-                    ts_ns = int(ts.value)
-                    if ts_ns != self._last_ns:
-                        self._last_ns = ts_ns
+                    closed_ns = int(closed_ts.value)
+                    if closed_ns != self._last_closed_ns:
+                        self._last_closed_ns = closed_ns
                         stale_count = 0
                         self.statusChanged.emit("Connected")
                         self.barClosed.emit({
-                            "time": str(ts),
-                            "open": float(last.get("open", 0)),
-                            "high": float(last.get("high", 0)),
-                            "low":  float(last.get("low",  0)),
-                            "close":float(last.get("close",0)),
-                            "volume": float(last.get("volume", 0) or 0),
+                            "time": str(closed_ts),
+                            "open": float(closed_bar.get("open", 0)),
+                            "high": float(closed_bar.get("high", 0)),
+                            "low":  float(closed_bar.get("low",  0)),
+                            "close":float(closed_bar.get("close",0)),
+                            "volume": float(closed_bar.get("volume", 0) or 0),
                         })
                     else:
                         stale_count += 1
@@ -797,7 +802,7 @@ class TVWorker(QThread):
                     except Exception:
                         pass
                     stale_count = 0
-                    self._last_ns = None
+                    self._last_closed_ns = None
 
                 self.msleep(self._poll_interval_s() * 1000)
         except Exception as e:
@@ -1263,7 +1268,8 @@ class LiveBotWidget(QWidget):
         deg_layout = QVBoxLayout()
         self.degradation_console = QPlainTextEdit()
         self.degradation_console.setReadOnly(True)
-        self.degradation_console.setMaximumHeight(120)
+        self.degradation_console.setMinimumHeight(210)
+        self.degradation_console.setStyleSheet("font-family: Consolas, 'Courier New', monospace;")
         self.degradation_console.setPlainText("(Žádný model načten)")
         deg_layout.addWidget(self.degradation_console)
         degradation_box.setLayout(deg_layout)
@@ -1272,6 +1278,7 @@ class LiveBotWidget(QWidget):
         log_box = QGroupBox("Log")
         lv = QVBoxLayout()
         self.console = QPlainTextEdit(); self.console.setReadOnly(True)
+        self.console.setMinimumHeight(120)
         lv.addWidget(self.console)
         log_box.setLayout(lv)
 
@@ -1282,6 +1289,7 @@ class LiveBotWidget(QWidget):
         self.tbl_trades.setColumnCount(5)
         self.tbl_trades.setHorizontalHeaderLabels(["Čas", "Směr", "Vstup", "Výstup", "PnL"])
         self.tbl_trades.horizontalHeader().setStretchLastSection(True)
+        self.tbl_trades.setMinimumHeight(120)
         tv.addWidget(self.tbl_trades)
         trades_box.setLayout(tv)
 
@@ -1294,7 +1302,7 @@ class LiveBotWidget(QWidget):
         left.addWidget(session_box)
         left.addWidget(tv_auth_box)
         left.addWidget(model_box)
-        left.addWidget(degradation_box)
+        left.addWidget(degradation_box, 3)
         left.addWidget(log_box, 1)
         left.addWidget(trades_box, 1)
 
@@ -1671,6 +1679,26 @@ class LiveBotWidget(QWidget):
                 t_long = _sf(user.get("ternary_threshold_long_eval"))
         return t_short, t_long
 
+    @staticmethod
+    def _format_diag_value(value: Any, *, decimals: int = 4, percent: bool = False) -> str:
+        if isinstance(value, (int, float)):
+            num = float(value)
+            if np.isfinite(num):
+                if percent:
+                    return f"{num * 100:.1f}%"
+                return f"{num:.{decimals}f}"
+        return "n/a"
+
+    @staticmethod
+    def _format_diag_delta(value: Any, *, decimals: int = 4, percent: bool = False) -> str:
+        if isinstance(value, (int, float)):
+            num = float(value)
+            if np.isfinite(num):
+                if percent:
+                    return f"{num * 100:+.1f}%"
+                return f"{num:+.{decimals}f}"
+        return "n/a"
+
     def _load_user_settings_from_first_model(self) -> None:
         """Načte user_settings z metadat prvního modelu a zobrazí je jako read-only info panel."""
         if not self.models or not self.models[0]:
@@ -1796,21 +1824,25 @@ class LiveBotWidget(QWidget):
         ref_acc = self.reference_metrics.get("accuracy", "?")
         ref_sharpe = self.reference_metrics.get("sharpe", "?")
         ref_profit = self.reference_metrics.get("profit_net", "?")
+        ref_max_dd = self.reference_metrics.get("max_drawdown_net") or self.reference_metrics.get("max_drawdown")
+        ref_trades = self.reference_metrics.get("num_trades")
+        ref_stability = self.reference_metrics.get("signal_stability")
         
-        # Formátuj hodnoty (nelze použít podmínky přímo v format specifieru)
-        acc_str = f"{ref_acc:.4f}" if isinstance(ref_acc, (int, float)) else str(ref_acc)
-        f1_str = f"{ref_f1:.4f}" if isinstance(ref_f1, (int, float)) else str(ref_f1)
-        sharpe_str = f"{ref_sharpe:.4f}" if isinstance(ref_sharpe, (int, float)) else str(ref_sharpe)
-        profit_str = f"{ref_profit:.2f}" if isinstance(ref_profit, (int, float)) else str(ref_profit)
+        sharpe_str = self._format_diag_value(ref_sharpe)
+        profit_str = self._format_diag_value(ref_profit, decimals=2)
+        max_dd_str = self._format_diag_value(abs(float(ref_max_dd)) if isinstance(ref_max_dd, (int, float)) else ref_max_dd, decimals=2)
+        trades_str = self._format_diag_value(ref_trades, decimals=0)
+        stability_str = self._format_diag_value(ref_stability, percent=True)
         
         info_text = (
-            f"📌 Referenční metriky ({ref_source}):\n"
-            f"   Accuracy: {acc_str}\n"
-            f"   F1: {f1_str}\n"
-            f"   Sharpe: {sharpe_str}\n"
-            f"   Profit Net: {profit_str}\n"
-            f"   Fee/Trade: {self._reference_fee_per_trade:.4f}\n"
-            f"\n⏳ Čekám na {self.degradation_window_size} barů pro live diagnostiku..."
+            f"Referencni metriky ({ref_source})\n"
+            f"{'Sharpe net':<18} {sharpe_str}\n"
+            f"{'Profit net':<18} {profit_str}\n"
+            f"{'Max drawdown':<18} {max_dd_str}\n"
+            f"{'Pocet obchodu':<18} {trades_str}\n"
+            f"{'Signal stability':<18} {stability_str}\n"
+            f"{'Fee / trade':<18} {self._reference_fee_per_trade:.4f}\n"
+            f"\nCekam na {self.degradation_window_size} baru pro live diagnostiku..."
         )
         self.degradation_console.setPlainText(info_text)
     
@@ -2603,53 +2635,56 @@ class LiveBotWidget(QWidget):
         ref_profit = ref.get("profit_net", 0.0)
         live_profit = live.get("profit_net", 0.0)
 
+        ref_max_dd_raw = ref.get("max_drawdown_net")
+        if not isinstance(ref_max_dd_raw, (int, float)):
+            ref_max_dd_raw = ref.get("max_drawdown")
+        live_max_dd_raw = live.get("max_drawdown_net")
+        if not isinstance(live_max_dd_raw, (int, float)):
+            live_max_dd_raw = live.get("max_drawdown")
+
+        ref_max_dd = abs(float(ref_max_dd_raw)) if isinstance(ref_max_dd_raw, (int, float)) else None
+        live_max_dd = abs(float(live_max_dd_raw)) if isinstance(live_max_dd_raw, (int, float)) else None
+
+        ref_trades = ref.get("num_trades")
+        live_trades = live.get("num_trades")
+
+        ref_stability = ref.get("signal_stability")
+        live_stability = live.get("signal_stability")
+
         classification_valid = bool(live.get("_classification_metrics_valid", False))
-        
         ref_acc = ref.get("accuracy") if classification_valid else None
-        live_acc = live.get("accuracy") if classification_valid else None
-        
         ref_f1 = ref.get("f1") if classification_valid else None
-        live_f1 = live.get("f1") if classification_valid else None
         
         # Vypočítej rozdíly
         diff_sharpe = float(live_sharpe) - float(ref_sharpe) if isinstance(live_sharpe, (int, float)) and isinstance(ref_sharpe, (int, float)) else 0.0
         diff_profit = float(live_profit) - float(ref_profit) if isinstance(live_profit, (int, float)) and isinstance(ref_profit, (int, float)) else 0.0
-        diff_acc = float(live_acc) - float(ref_acc) if isinstance(live_acc, (int, float)) and isinstance(ref_acc, (int, float)) else None
-        diff_f1 = float(live_f1) - float(ref_f1) if isinstance(live_f1, (int, float)) and isinstance(ref_f1, (int, float)) else None
-        
-        # Formátuj hodnoty pro zobrazení (podmínky nelze dát přímo do f-string specifieru)
-        ref_sharpe_str = f"{ref_sharpe:7.4f}" if isinstance(ref_sharpe, (int, float)) else f"{str(ref_sharpe):>7}"
-        live_sharpe_str = f"{live_sharpe:7.4f}" if isinstance(live_sharpe, (int, float)) else f"{str(live_sharpe):>7}"
-        ref_profit_str = f"{ref_profit:7.2f}" if isinstance(ref_profit, (int, float)) else f"{str(ref_profit):>7}"
-        live_profit_str = f"{live_profit:7.2f}" if isinstance(live_profit, (int, float)) else f"{str(live_profit):>7}"
-        ref_acc_str = f"{ref_acc:7.4f}" if isinstance(ref_acc, (int, float)) else "   n/a"
-        live_acc_str = f"{live_acc:7.4f}" if isinstance(live_acc, (int, float)) else "   n/a"
-        ref_f1_str = f"{ref_f1:7.4f}" if isinstance(ref_f1, (int, float)) else "   n/a"
-        live_f1_str = f"{live_f1:7.4f}" if isinstance(live_f1, (int, float)) else "   n/a"
-        
-        # Formátuj zobrazení
+        diff_f1 = None
+        if classification_valid:
+            live_f1 = live.get("f1")
+            if isinstance(live_f1, (int, float)) and isinstance(ref_f1, (int, float)):
+                diff_f1 = float(live_f1) - float(ref_f1)
+
+        diff_max_dd = live_max_dd - ref_max_dd if isinstance(live_max_dd, (int, float)) and isinstance(ref_max_dd, (int, float)) else None
+        diff_trades = int(live_trades) - int(ref_trades) if isinstance(live_trades, (int, float)) and isinstance(ref_trades, (int, float)) else None
+        diff_stability = float(live_stability) - float(ref_stability) if isinstance(live_stability, (int, float)) and isinstance(ref_stability, (int, float)) else None
+
+        table_header = f"{'Metrika':<18} {'Ref':>10} {'Live':>10} {'Delta':>10}"
         lines = [
-            "╔════════════════════════════════════════════════════════╗",
-            "║      DIAGNOSTIKA DEGRADACE MODELU                      ║",
-            "╠════════════════════════════════════════════════════════╣",
-            f"║ Sharpe (Ref):     {ref_sharpe_str}                        ║",
-            f"║ Sharpe (Live):    {live_sharpe_str}                        ║",
-            f"║ Rozdíl:           {diff_sharpe:+7.4f}                        ║",
-            "║ ─────────────────────────────────────────────────────  ║",
-            f"║ Profit (Ref):     {ref_profit_str}                        ║",
-            f"║ Profit (Live):    {live_profit_str}                        ║",
-            f"║ Rozdíl:           {diff_profit:+7.2f}                        ║",
-            "║ ─────────────────────────────────────────────────────  ║",
-            f"║ Accuracy (Ref):   {ref_acc_str}                        ║",
-            f"║ Accuracy (Live):  {live_acc_str}                        ║",
-            f"║ F1 (Ref):         {ref_f1_str}                        ║",
-            f"║ F1 (Live):        {live_f1_str}                        ║",
-            "╠════════════════════════════════════════════════════════╣",
+            "DIAGNOSTIKA DEGRADACE MODELU",
+            "",
+            table_header,
+            "-" * len(table_header),
+            f"{'Sharpe net':<18} {self._format_diag_value(ref_sharpe):>10} {self._format_diag_value(live_sharpe):>10} {self._format_diag_delta(diff_sharpe):>10}",
+            f"{'Profit net':<18} {self._format_diag_value(ref_profit, decimals=2):>10} {self._format_diag_value(live_profit, decimals=2):>10} {self._format_diag_delta(diff_profit, decimals=2):>10}",
+            f"{'Max drawdown':<18} {self._format_diag_value(ref_max_dd, decimals=2):>10} {self._format_diag_value(live_max_dd, decimals=2):>10} {self._format_diag_delta(diff_max_dd, decimals=2):>10}",
+            f"{'Pocet obchodu':<18} {self._format_diag_value(ref_trades, decimals=0):>10} {self._format_diag_value(live_trades, decimals=0):>10} {self._format_diag_delta(diff_trades, decimals=0):>10}",
+            f"{'Signal stability':<18} {self._format_diag_value(ref_stability, percent=True):>10} {self._format_diag_value(live_stability, percent=True):>10} {self._format_diag_delta(diff_stability, percent=True):>10}",
+            "",
         ]
 
         if not classification_valid:
-            lines.append("║ ℹ️  Accuracy/F1 v live jsou vypnuté (chybí ground truth) ║")
-            lines.append("║    Porovnání je jen přes trading metriky.               ║")
+            lines.append("Poznamka: Accuracy/F1 v live nezobrazuji, protoze chybi ground truth.")
+            lines.append("")
         
         # Diagnóza degradace - OPRAVENÁ LOGIKA
         # Nejprve zkontroluj, zda reference nejsou podezřelé (špatný training)
@@ -2668,16 +2703,9 @@ class LiveBotWidget(QWidget):
         )
         
         if ref_is_suspicious:
-            # Reference jsou špatné - diagnostika se nedá provádět
-            lines.append("║ ⚠️  UPOZORNĚNÍ: Referenční metriky nejsou spolehlivé   ║")
-            lines.append("║    Model měl špatný výkon v tréninku (F1≈0, Acc=100%)  ║")
-            lines.append("║    Live metriky nelze interpretovat jako degradaci!    ║")
-            lines.append("║    → Přetrénujte model s lepšíma daty                  ║")
+            lines.append("Stav: referencni metriky nejsou spolehlive.")
+            lines.append("Doporuceni: model mel uz v treninku slaby signal; live nelze cist jako degradaci.")
         else:
-            # Reference jsou OK - normální diagnóza
-            # Logika: Porovnávej změny v Sharpe a Profitu
-            
-            # Změny v klíčových metrikách
             sharpe_improved = diff_sharpe > 0.1  # Zlepšení > 0.1
             sharpe_degraded = diff_sharpe < -0.1  # Zhoršení > 0.1
             
@@ -2686,25 +2714,57 @@ class LiveBotWidget(QWidget):
             
             f1_improved = isinstance(diff_f1, (int, float)) and diff_f1 > 0.1
             f1_degraded = isinstance(diff_f1, (int, float)) and diff_f1 < -0.1
-            
-            # Diagnóza na základě trend
-            if sharpe_degraded or profit_degraded or f1_degraded:
-                if sharpe_degraded and profit_degraded and f1_degraded:
-                    lines.append("║ ❌ DEGRADACE: Model zhoršil výkon v TŘECH metrikách  ║")
-                    lines.append("║    → Zvažte přetrénování modelu                        ║")
-                elif sharpe_degraded or profit_degraded:
-                    lines.append("║ ⚠️  MÍRNÉ ZHORŠENÍ: Live výkon pod referenční úrovní   ║")
-                    lines.append("║    → Sledujte další vývoj, zvažte retraining          ║")
-                else:
-                    lines.append("║ ⚠️  F1 POKLES: Model dává méně signálů než v tréninku  ║")
-            elif sharpe_improved or profit_improved or f1_improved:
-                lines.append("║ ✅ ZLEPŠENÍ: Live výkon je lepší než reference!         ║")
-                lines.append("║    Model se chová lépe než v tréninku                   ║")
+
+            drawdown_improved = isinstance(diff_max_dd, (int, float)) and diff_max_dd < -10
+            drawdown_degraded = isinstance(diff_max_dd, (int, float)) and diff_max_dd > 10
+            stability_improved = isinstance(diff_stability, (int, float)) and diff_stability > 0.15
+            stability_degraded = isinstance(diff_stability, (int, float)) and diff_stability < -0.15
+            trade_regime_shift = isinstance(diff_trades, (int, float)) and abs(diff_trades) >= max(5, int(0.3 * float(ref_trades))) if isinstance(ref_trades, (int, float)) else False
+
+            degradations: list[str] = []
+            improvements: list[str] = []
+
+            if sharpe_degraded:
+                degradations.append("Sharpe je pod referenci")
+            elif sharpe_improved:
+                improvements.append("Sharpe je lepsi nez reference")
+
+            if profit_degraded:
+                degradations.append("profit je slabsi")
+            elif profit_improved:
+                improvements.append("profit je vyssi")
+
+            if drawdown_degraded:
+                degradations.append("drawdown narostl")
+            elif drawdown_improved:
+                improvements.append("drawdown klesl")
+
+            if stability_degraded:
+                degradations.append("signal je mene stabilni")
+            elif stability_improved:
+                improvements.append("signal je stabilnejsi")
+
+            if trade_regime_shift:
+                degradations.append("vyrazne se zmenila frekvence obchodu")
+
+            if len(degradations) >= 2:
+                lines.append("Stav: degradace modelu je pravdepodobna.")
+                lines.append("Duvody: " + "; ".join(degradations[:3]) + ".")
+                lines.append("Doporuceni: sledujte dalsi window a zvažte retraining.")
+            elif degradations:
+                lines.append("Stav: mirne zhorseni proti referenci.")
+                lines.append("Signal: " + "; ".join(degradations[:3]) + ".")
+            elif sharpe_improved or profit_improved or f1_improved or drawdown_improved or stability_improved:
+                lines.append("Stav: live vykon je lepsi nebo stabilnejsi nez reference.")
+                if improvements:
+                    lines.append("Pozitiva: " + "; ".join(improvements[:3]) + ".")
             else:
-                lines.append("║ ✅ STABILNÍ: Live výkon je srovnatelný s referencí      ║")
+                lines.append("Stav: model je zatim stabilni vuci referenci.")
         
-        lines.append("╚════════════════════════════════════════════════════════╝")
-        lines.append(f"📊 Recent window: {self.degradation_window_size} barů | Last check: {len(self._prediction_buffer)} barů total")
+        lines.append("")
+        lines.append(
+            f"Recent window: {self.degradation_window_size} baru | Celkem nasbirano: {len(self._prediction_buffer)} baru"
+        )
         
         self.degradation_console.setPlainText("\n".join(lines))
     
@@ -2871,9 +2931,6 @@ class LiveBotWidget(QWidget):
         df = pd.DataFrame(self._bars).reset_index(drop=True)
         if len(df) > display_n:
             df = df.tail(display_n).reset_index(drop=True)
-        # Renderuj jen uzavřené bary (odfiltruj poslední neuzavřený bar)
-        if len(df) > 1:
-            df = df.iloc[:-1].reset_index(drop=True)
 
         # MACD 12-26-9
         ema12 = df['close'].ewm(span=12, adjust=False).mean()

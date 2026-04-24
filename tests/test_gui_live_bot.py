@@ -89,9 +89,9 @@ def test_live_bootstrap_payload_survives_auto_detect_failure(monkeypatch):
 
     payload = tab_live_bot_module._build_live_bootstrap_payload_from_history_df(df, models, max_bars_buffer=300)
 
-    assert payload.snapshot_bars == 3
-    assert len(payload.bars) == 3
-    assert list(payload.live_df["close"]) == [1.2, 2.2, 3.2]
+    assert payload.snapshot_bars == 2
+    assert len(payload.bars) == 2
+    assert list(payload.live_df["close"]) == [1.2, 2.2]
 
 
 def test_live_compute_snapshot_features_accepts_timestamp_column():
@@ -142,3 +142,42 @@ def test_live_market_context_from_model_meta_maps_gc_comex_5m():
             "bar_size": "5 min",
         }
     )
+
+
+def test_live_bot_restores_last_model_paths(monkeypatch, qapp, tmp_path):
+    from ibkr_trading_bot.gui import tab_live_bot as tab_live_bot_module
+
+    class _DummySettings:
+        _store: dict[str, str] = {}
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def value(self, key, default=None):
+            return self._store.get(str(key), default)
+
+        def setValue(self, key, value):
+            self._store[str(key)] = str(value)
+
+        def sync(self):
+            return None
+
+    _DummySettings._store = {}
+    monkeypatch.setattr(tab_live_bot_module, "QSettings", _DummySettings)
+    monkeypatch.setattr(tab_live_bot_module, "FigureCanvas", StubCanvas)
+
+    model_file = tmp_path / "model_a.pkl"
+    model_file.write_bytes(b"dummy")
+
+    first = tab_live_bot_module.LiveBotWidget()
+    try:
+        first.set_model_paths([str(model_file)])
+        first._save_ui_settings()
+    finally:
+        first.close()
+
+    second = tab_live_bot_module.LiveBotWidget()
+    try:
+        assert str(model_file) in second.le_model_path.text()
+    finally:
+        second.close()
