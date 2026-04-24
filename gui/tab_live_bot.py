@@ -513,7 +513,12 @@ def _build_live_bootstrap_payload_from_history_df(
     work["time"] = pd.to_datetime(work["time"], utc=True, errors="coerce")
     for col in ("open", "high", "low", "close", "volume"):
         work[col] = pd.to_numeric(work[col], errors="coerce")
-    work = work.dropna(subset=["time", "open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
+    work = (
+        work.dropna(subset=["time", "open", "high", "low", "close"])
+        .sort_values("time")
+        .drop_duplicates(subset=["time"], keep="last")
+        .reset_index(drop=True)
+    )
     if work.empty:
         return _empty_live_bootstrap_payload(len(models))
 
@@ -3166,7 +3171,10 @@ class LiveBotWidget(QWidget):
 
         if len(self._bars) > self.config.max_bars_buffer:
             self._bars = self._bars[-self.config.max_bars_buffer:]
-            self._bar_index = {int(pd.to_datetime(x["time"]).value): i for i, x in enumerate(self._bars)}
+            self._bar_index = {
+                int(pd.to_datetime(x["time"], utc=True, errors="coerce").value): i
+                for i, x in enumerate(self._bars)
+            }
 
         row = {
             "timestamp": ts,
@@ -3238,11 +3246,17 @@ class LiveBotWidget(QWidget):
             self._schedule_bar_refresh()
 
     def _apply_bootstrap_payload(self, payload: LiveBootstrapPayload, *, source_label: str) -> None:
-        self._bars = list(payload.bars or [])
+        raw_bars = list(payload.bars or [])
+        # Deduplicate by timestamp (keep last), consistent UTC key with _on_bar_closed
+        seen: dict[int, int] = {}
+        for idx, bar in enumerate(raw_bars):
+            ts_key = pd.to_datetime(bar.get("time"), utc=True, errors="coerce")
+            if pd.notna(ts_key):
+                seen[int(ts_key.value)] = idx
+        self._bars = [raw_bars[i] for i in sorted(seen.values())]
         self._bar_index = {
-            int(pd.to_datetime(bar["time"]).value): idx
+            int(pd.to_datetime(bar["time"], utc=True, errors="coerce").value): idx
             for idx, bar in enumerate(self._bars)
-            if pd.notna(pd.to_datetime(bar.get("time"), utc=True, errors="coerce"))
         }
         if isinstance(payload.live_df, pd.DataFrame):
             self.live_df = payload.live_df.copy()
