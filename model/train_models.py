@@ -629,6 +629,29 @@ def _extract_feature_importance_values(estimator, n_features: int) -> np.ndarray
             values = np.asarray(getattr(est, "feature_importances_"), dtype=float).ravel()
             if values.size == int(n_features):
                 return values
+        predictors = getattr(est, "_predictors", None)
+        if predictors is not None:
+            gains = np.zeros(int(n_features), dtype=float)
+            for stage in list(predictors):
+                for tree in list(stage or []):
+                    nodes = getattr(tree, "nodes", None)
+                    if nodes is None:
+                        continue
+                    feature_idx = np.asarray(nodes["feature_idx"], dtype=int)
+                    split_gain = np.asarray(nodes["gain"], dtype=float)
+                    is_leaf = np.asarray(nodes["is_leaf"], dtype=bool)
+                    valid = (
+                        ~is_leaf
+                        & np.isfinite(split_gain)
+                        & (split_gain > 0.0)
+                        & (feature_idx >= 0)
+                        & (feature_idx < int(n_features))
+                    )
+                    if not np.any(valid):
+                        continue
+                    np.add.at(gains, feature_idx[valid], split_gain[valid])
+            if np.any(gains > 0.0):
+                return gains
         coef = getattr(est, "coef_", None)
         if coef is not None:
             coef_arr = np.asarray(coef, dtype=float)
@@ -658,6 +681,8 @@ def _normalize_feature_importance_values(values: np.ndarray) -> np.ndarray | Non
 def _extract_normalized_feature_importance_map(
     estimator,
     feature_names: list[str],
+    X: pd.DataFrame | None = None,
+    y: np.ndarray | None = None,
 ) -> dict[str, float] | None:
     values = _extract_feature_importance_values(estimator, len(feature_names))
     if values is None:
@@ -740,7 +765,7 @@ def _collect_fold_feature_importances_for_params(
             else None
         )
         _fit_estimator(est, X_tr, y_tr, sample_weight=sw_tr)
-        fold_imp = _extract_normalized_feature_importance_map(est, feature_names)
+        fold_imp = _extract_normalized_feature_importance_map(est, feature_names, X_tr, y_tr)
         if fold_imp is None:
             continue
         fold_feature_importances.append(dict(fold_imp))
@@ -3678,6 +3703,21 @@ def train_and_evaluate_model(
     payload = {
         "model": calibrated_estimator,
         "features": list(trained_features),
+        "feature_stability": dict(feature_stability),
+        "feature_stability_threshold": (
+            float(feature_stability_threshold)
+            if feature_stability_threshold is not None
+            else None
+        ),
+        "feature_stability_score": dict(feature_stability_score),
+        "features_removed_by_stability": list(features_removed_by_stability),
+        "features_kept_by_stability": list(features_kept_by_stability),
+        "feature_stability_filter_applied": bool(feature_stability_filter_applied),
+        "feature_stability_filter_fallback_reason": (
+            str(feature_stability_filter_fallback_reason)
+            if feature_stability_filter_fallback_reason is not None
+            else None
+        ),
         "estimator_name": estimator_name,
         "search_backend": str(search_backend_used),
         "optuna_trials": (int(optuna_trials_effective) if search_backend_used == "optuna" and optuna_trials_effective is not None else None),
@@ -3795,23 +3835,19 @@ def train_and_evaluate_model(
 
     # Feature importance
     try:
-        est_for_imp = calibrated_estimator
-        if isinstance(calibrated_estimator, Pipeline):
-            est_for_imp = calibrated_estimator.steps[-1][1]
-        if hasattr(est_for_imp, "feature_importances_"):
-            imp = np.asarray(est_for_imp.feature_importances_)
-            imp_sorted_idx = np.argsort(imp)[::-1]
+        X_feature_importance = df_train[trained_features].replace([np.inf, -np.inf], np.nan)
+        y_feature_importance = df_train["target"].astype(int).to_numpy()
+        imp_map = _extract_normalized_feature_importance_map(
+            calibrated_estimator,
+            list(trained_features),
+            X_feature_importance,
+            y_feature_importance,
+        )
+        if imp_map:
+            sorted_imp = sorted(imp_map.items(), key=lambda item: item[1], reverse=True)
             meta["feature_importance"] = {
-                str(trained_features[i]): float(imp[i])
-                for i in imp_sorted_idx[:min(20, len(imp))]  # top 20 featur
-            }
-        elif hasattr(est_for_imp, "coef_"):
-            coef = np.asarray(est_for_imp.coef_).ravel()
-            coef_abs = np.abs(coef)
-            coef_sorted_idx = np.argsort(coef_abs)[::-1]
-            meta["feature_importance"] = {
-                str(trained_features[i]): float(coef[i])
-                for i in coef_sorted_idx[:min(20, len(coef))]
+                str(feature_name): float(score)
+                for feature_name, score in sorted_imp[:20]
             }
     except Exception:
         meta["feature_importance"] = {}
@@ -3825,8 +3861,23 @@ def train_and_evaluate_model(
         meta["classes"] = None
 
     meta_path = fpath.with_name(f"{fpath.stem}_meta.json")
+
+    def _json_default_for_meta(value: Any):
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, pd.Timestamp):
+            return value.isoformat()
+        if isinstance(value, datetime):
+            return value.isoformat()
+        return str(value)
+
     try:
-        meta_path.write_text(jsonlib.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        meta_path.write_text(
+            jsonlib.dumps(meta, ensure_ascii=False, indent=2, default=_json_default_for_meta),
+            encoding="utf-8",
+        )
     except Exception:
         pass
 
