@@ -1938,6 +1938,8 @@ class LiveBotWidget(QWidget):
     def _on_start(self):
         if not self._load_models():
             return
+        # New Start session should not inherit stale bars/snapshot from previous runs.
+        self._reset_runtime_state(full_reset=False)
         self._set_session_running_ui(True)
         self._apply_tf_presets()
         self._start_worker()
