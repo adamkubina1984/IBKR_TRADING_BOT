@@ -643,44 +643,80 @@ def _task_preload_degradation(
         return DegradationPreloadPayload(predictions=[], prices=[], timestamps=[])
 
     df_recent = df_feats.tail(int(degradation_window_size)).copy().reset_index(drop=True)
-    model_info = models[0]
-    model = model_info["predictor"]
-    exp_feats = model_info.get("exp_feats")
-    X_prepared = df_recent
-    if exp_feats:
-        X_prepared = _prepare_X_for_model_static(df_recent, exp_feats)
 
-    try:
-        label_map = model_info.get("label_map") or _infer_label_map_from_classes(getattr(model, "classes_", None))
-        X_pred = _align_X_for_model(model, X_prepared)
-        proba_all = _predict_proba_safely(model, X_pred)
-        t_short = float(model_info.get("t_short", 0.5))
-        t_long = float(model_info.get("t_long", 0.5))
-        classes = getattr(model, "classes_", None)
-        if classes is not None:
-            if any(isinstance(c, str) for c in classes):
-                lut = {str(c).upper(): i for i, c in enumerate(classes)}
-                idx_long = lut.get("LONG")
-                idx_short = lut.get("SHORT")
+    model_predictions: list[list[int]] = []
+    for model_info in models:
+        try:
+            model = model_info.get("predictor")
+            if model is None:
+                continue
+            exp_feats = model_info.get("exp_feats")
+            X_prepared = df_recent
+            if exp_feats:
+                X_prepared = _prepare_X_for_model_static(df_recent, exp_feats)
+
+            label_map = model_info.get("label_map") or _infer_label_map_from_classes(getattr(model, "classes_", None))
+            X_pred = _align_X_for_model(model, X_prepared)
+            proba_all = _predict_proba_safely(model, X_pred)
+            t_short = float(model_info.get("t_short", 0.5))
+            t_long = float(model_info.get("t_long", 0.5))
+            classes = getattr(model, "classes_", None)
+            if classes is not None:
+                if any(isinstance(c, str) for c in classes):
+                    lut = {str(c).upper(): i for i, c in enumerate(classes)}
+                    idx_long = lut.get("LONG")
+                    idx_short = lut.get("SHORT")
+                else:
+                    idx_long = next(
+                        (i for i, c in enumerate(classes) if str(label_map.get(int(c), "")).upper() == "LONG"),
+                        None,
+                    )
+                    idx_short = next(
+                        (i for i, c in enumerate(classes) if str(label_map.get(int(c), "")).upper() == "SHORT"),
+                        None,
+                    )
             else:
-                idx_long = next((i for i, c in enumerate(classes) if str(label_map.get(int(c), "")).upper() == "LONG"), None)
-                idx_short = next((i for i, c in enumerate(classes) if str(label_map.get(int(c), "")).upper() == "SHORT"), None)
-        else:
-            idx_long = 1
-            idx_short = 0
+                idx_long = 1
+                idx_short = 0
 
-        predictions: list[int] = []
-        for proba_row in proba_all:
-            pL = float(proba_row[idx_long]) if idx_long is not None else 0.5
-            pS = float(proba_row[idx_short]) if idx_short is not None else 0.5
-            if pL >= t_long and pL >= pS:
+            preds_i: list[int] = []
+            for proba_row in proba_all:
+                pL = float(proba_row[idx_long]) if idx_long is not None else 0.5
+                pS = float(proba_row[idx_short]) if idx_short is not None else 0.5
+                if pL >= t_long and pL >= pS:
+                    preds_i.append(1)
+                elif pS >= t_short and pS > pL:
+                    preds_i.append(-1)
+                else:
+                    preds_i.append(0)
+            model_predictions.append(preds_i)
+        except Exception:
+            continue
+
+    if not model_predictions:
+        predictions = [0] * len(df_recent)
+    elif len(model_predictions) == 1:
+        predictions = model_predictions[0]
+    else:
+        predictions = []
+        n_rows = len(df_recent)
+        for row_idx in range(n_rows):
+            longs = 0
+            shorts = 0
+            for preds_i in model_predictions:
+                if row_idx >= len(preds_i):
+                    continue
+                val = int(preds_i[row_idx])
+                if val > 0:
+                    longs += 1
+                elif val < 0:
+                    shorts += 1
+            if longs > shorts:
                 predictions.append(1)
-            elif pS >= t_short and pS > pL:
+            elif shorts > longs:
                 predictions.append(-1)
             else:
                 predictions.append(0)
-    except Exception:
-        predictions = [0] * len(df_recent)
 
     prices = df_recent["close"].astype(float).tolist()
     timestamps = df_recent["time"].tolist()
@@ -978,6 +1014,7 @@ class LiveBotWidget(QWidget):
         self._log_queue = deque()
 
         self._build_ui()
+        self._restore_model_path_setting()
         self._load_tv_credentials_into_ui()
         self._wire_basic_logic()
         self._last_alert_sig: str | None = None
@@ -1007,6 +1044,7 @@ class LiveBotWidget(QWidget):
         self.degradation_window_size = 500  # Počet barů pro recent window
         self._last_degradation_check = 0  # Index posledního checku
         self.live_metrics_recent = {}  # Aktuální metriky na recent window
+        self._reference_fee_per_trade = 0.0
 
         # Sledování obchodů
         self._trades: list[dict[str, Any]] = []  # seznam obchodů pro tabulku
@@ -1039,9 +1077,23 @@ class LiveBotWidget(QWidget):
         except Exception:
             self.config.display_bars = max(30, min(2000, int(self.config.display_bars)))
 
+    def _restore_model_path_setting(self) -> None:
+        """Restore last saved model path(s) from QSettings. Call after _build_ui."""
+        try:
+            saved_paths = str(self._ui_settings.value("model_paths", "") or "").strip()
+            if saved_paths and saved_paths != DEFAULT_MODEL_DIR:
+                valid = [p for p in saved_paths.split(";") if p.strip() and os.path.isfile(p.strip())]
+                if valid:
+                    self.le_model_path.setText(";".join(valid))
+        except Exception:
+            pass
+
     def _save_ui_settings(self) -> None:
         try:
             self._ui_settings.setValue("display_bars", int(self.config.display_bars))
+            model_text = (self.le_model_path.text() or "").strip()
+            if model_text and model_text != DEFAULT_MODEL_DIR:
+                self._ui_settings.setValue("model_paths", model_text)
             self._ui_settings.sync()
         except Exception:
             pass
@@ -1667,6 +1719,7 @@ class LiveBotWidget(QWidget):
     
     def _load_reference_metrics(self, metadata: dict) -> None:
         """Extrahuje referenční metriky z metadata modelu (holdout preferovaně, jinak train)."""
+        self._reference_fee_per_trade = 0.0
         if not metadata:
             msg = "❌ PRÁZDNÁ METADATA\n\nModel neobsahuje žádná metadata.\nOvěřte, že existuje soubor *_meta.json vedle .pkl souboru."
             self.degradation_console.setPlainText(msg)
@@ -1719,6 +1772,24 @@ class LiveBotWidget(QWidget):
             self.degradation_console.setPlainText(msg)
             self._append_log("[DEGRADATION] ❌ Reference metriky nenalezeny")
             return
+
+        try:
+            rank_single = metadata.get("tab5_holdout_ranking") if isinstance(metadata, dict) else None
+            if isinstance(rank_single, dict):
+                fee = rank_single.get("fee_per_trade")
+                if isinstance(fee, (int, float)) and np.isfinite(float(fee)):
+                    self._reference_fee_per_trade = float(fee)
+            rank_by_policy = metadata.get("tab5_holdout_ranking_by_policy") if isinstance(metadata, dict) else None
+            if isinstance(rank_by_policy, dict):
+                for payload in rank_by_policy.values():
+                    if not isinstance(payload, dict):
+                        continue
+                    fee = payload.get("fee_per_trade")
+                    if isinstance(fee, (int, float)) and np.isfinite(float(fee)):
+                        self._reference_fee_per_trade = float(fee)
+                        break
+        except Exception:
+            self._reference_fee_per_trade = 0.0
         
         # Zobraz info o referenčních metrikách
         ref_f1 = self.reference_metrics.get("f1", "?")
@@ -1738,6 +1809,7 @@ class LiveBotWidget(QWidget):
             f"   F1: {f1_str}\n"
             f"   Sharpe: {sharpe_str}\n"
             f"   Profit Net: {profit_str}\n"
+            f"   Fee/Trade: {self._reference_fee_per_trade:.4f}\n"
             f"\n⏳ Čekám na {self.degradation_window_size} barů pro live diagnostiku..."
         )
         self.degradation_console.setPlainText(info_text)
@@ -2477,27 +2549,35 @@ class LiveBotWidget(QWidget):
             # Vezmi poslední N barů pro recent window
             recent_preds = np.array(self._prediction_buffer[-self.degradation_window_size:])
             recent_prices = np.array(self._price_buffer[-self.degradation_window_size:])
+            recent_y_true_raw = list(self._y_true_buffer[-self.degradation_window_size:])
+            has_ground_truth = bool(recent_y_true_raw) and all(
+                (v is not None and np.isfinite(float(v))) for v in recent_y_true_raw
+            )
             
             # Importuj calculate_metrics z utils
             from ibkr_trading_bot.utils.metrics import calculate_metrics
             
-            # V live režimu nemáme y_true → počítáme jen trading metriky
-            # Vytvoř dummy y_true (všechny 0) protože calculate_metrics to vyžaduje
-            y_true_dummy = np.zeros(len(recent_preds))
+            # Bez ground truth neumíme validně porovnat accuracy/F1; držíme je mimo diagnostiku.
+            y_true_eval = np.array(recent_y_true_raw, dtype=float) if has_ground_truth else np.zeros(len(recent_preds))
             
             # Vytvoř DataFrame s cenami
             df_recent = pd.DataFrame({"close": recent_prices})
             
             # Vypočítej metriky na recent window
             recent_metrics = calculate_metrics(
-                y_true=y_true_dummy,
+                y_true=y_true_eval,
                 y_pred=recent_preds,
                 df=df_recent,
-                fee_per_trade=0.0,
+                fee_per_trade=float(getattr(self, "_reference_fee_per_trade", 0.0) or 0.0),
                 slippage_bps=0.0,
                 rolling_window=50,
                 annualize_sharpe=False
             )
+
+            if not has_ground_truth:
+                for key in ("accuracy", "f1", "precision", "recall", "accuracy_binary", "f1_binary"):
+                    recent_metrics.pop(key, None)
+            recent_metrics["_classification_metrics_valid"] = bool(has_ground_truth)
             
             self.live_metrics_recent = recent_metrics
             
@@ -2522,28 +2602,30 @@ class LiveBotWidget(QWidget):
         
         ref_profit = ref.get("profit_net", 0.0)
         live_profit = live.get("profit_net", 0.0)
+
+        classification_valid = bool(live.get("_classification_metrics_valid", False))
         
-        ref_acc = ref.get("accuracy", 0.0) if ref.get("accuracy", 0.0) else 0.0
-        live_acc = live.get("accuracy", 0.0) if live.get("accuracy", 0.0) else 0.0
+        ref_acc = ref.get("accuracy") if classification_valid else None
+        live_acc = live.get("accuracy") if classification_valid else None
         
-        ref_f1 = ref.get("f1", 0.0) if ref.get("f1", 0.0) else 0.0
-        live_f1 = live.get("f1", 0.0) if live.get("f1", 0.0) else 0.0
+        ref_f1 = ref.get("f1") if classification_valid else None
+        live_f1 = live.get("f1") if classification_valid else None
         
         # Vypočítej rozdíly
         diff_sharpe = float(live_sharpe) - float(ref_sharpe) if isinstance(live_sharpe, (int, float)) and isinstance(ref_sharpe, (int, float)) else 0.0
         diff_profit = float(live_profit) - float(ref_profit) if isinstance(live_profit, (int, float)) and isinstance(ref_profit, (int, float)) else 0.0
-        diff_acc = float(live_acc) - float(ref_acc) if isinstance(live_acc, (int, float)) and isinstance(ref_acc, (int, float)) else 0.0
-        diff_f1 = float(live_f1) - float(ref_f1) if isinstance(live_f1, (int, float)) and isinstance(ref_f1, (int, float)) else 0.0
+        diff_acc = float(live_acc) - float(ref_acc) if isinstance(live_acc, (int, float)) and isinstance(ref_acc, (int, float)) else None
+        diff_f1 = float(live_f1) - float(ref_f1) if isinstance(live_f1, (int, float)) and isinstance(ref_f1, (int, float)) else None
         
         # Formátuj hodnoty pro zobrazení (podmínky nelze dát přímo do f-string specifieru)
         ref_sharpe_str = f"{ref_sharpe:7.4f}" if isinstance(ref_sharpe, (int, float)) else f"{str(ref_sharpe):>7}"
         live_sharpe_str = f"{live_sharpe:7.4f}" if isinstance(live_sharpe, (int, float)) else f"{str(live_sharpe):>7}"
         ref_profit_str = f"{ref_profit:7.2f}" if isinstance(ref_profit, (int, float)) else f"{str(ref_profit):>7}"
         live_profit_str = f"{live_profit:7.2f}" if isinstance(live_profit, (int, float)) else f"{str(live_profit):>7}"
-        ref_acc_str = f"{ref_acc:7.4f}" if isinstance(ref_acc, (int, float)) else f"{str(ref_acc):>7}"
-        live_acc_str = f"{live_acc:7.4f}" if isinstance(live_acc, (int, float)) else f"{str(live_acc):>7}"
-        ref_f1_str = f"{ref_f1:7.4f}" if isinstance(ref_f1, (int, float)) else f"{str(ref_f1):>7}"
-        live_f1_str = f"{live_f1:7.4f}" if isinstance(live_f1, (int, float)) else f"{str(live_f1):>7}"
+        ref_acc_str = f"{ref_acc:7.4f}" if isinstance(ref_acc, (int, float)) else "   n/a"
+        live_acc_str = f"{live_acc:7.4f}" if isinstance(live_acc, (int, float)) else "   n/a"
+        ref_f1_str = f"{ref_f1:7.4f}" if isinstance(ref_f1, (int, float)) else "   n/a"
+        live_f1_str = f"{live_f1:7.4f}" if isinstance(live_f1, (int, float)) else "   n/a"
         
         # Formátuj zobrazení
         lines = [
@@ -2560,11 +2642,14 @@ class LiveBotWidget(QWidget):
             "║ ─────────────────────────────────────────────────────  ║",
             f"║ Accuracy (Ref):   {ref_acc_str}                        ║",
             f"║ Accuracy (Live):  {live_acc_str}                        ║",
-            "║ ─────────────────────────────────────────────────────  ║",
             f"║ F1 (Ref):         {ref_f1_str}                        ║",
             f"║ F1 (Live):        {live_f1_str}                        ║",
             "╠════════════════════════════════════════════════════════╣",
         ]
+
+        if not classification_valid:
+            lines.append("║ ℹ️  Accuracy/F1 v live jsou vypnuté (chybí ground truth) ║")
+            lines.append("║    Porovnání je jen přes trading metriky.               ║")
         
         # Diagnóza degradace - OPRAVENÁ LOGIKA
         # Nejprve zkontroluj, zda reference nejsou podezřelé (špatný training)
@@ -2575,6 +2660,7 @@ class LiveBotWidget(QWidget):
         # - Sharpe < -0.5 (velmi špatná reference)
         
         ref_is_suspicious = (
+            classification_valid and
             (isinstance(ref_f1, (int, float)) and ref_f1 < 0.05) and
             (isinstance(ref_acc, (int, float)) and ref_acc >= 0.95)
         ) or (
@@ -2598,8 +2684,8 @@ class LiveBotWidget(QWidget):
             profit_improved = diff_profit > 10  # Profit vzrostl o 10+
             profit_degraded = diff_profit < -10  # Profit klesl o 10+
             
-            f1_improved = diff_f1 > 0.1
-            f1_degraded = diff_f1 < -0.1
+            f1_improved = isinstance(diff_f1, (int, float)) and diff_f1 > 0.1
+            f1_degraded = isinstance(diff_f1, (int, float)) and diff_f1 < -0.1
             
             # Diagnóza na základě trend
             if sharpe_degraded or profit_degraded or f1_degraded:
@@ -2785,6 +2871,9 @@ class LiveBotWidget(QWidget):
         df = pd.DataFrame(self._bars).reset_index(drop=True)
         if len(df) > display_n:
             df = df.tail(display_n).reset_index(drop=True)
+        # Renderuj jen uzavřené bary (odfiltruj poslední neuzavřený bar)
+        if len(df) > 1:
+            df = df.iloc[:-1].reset_index(drop=True)
 
         # MACD 12-26-9
         ema12 = df['close'].ewm(span=12, adjust=False).mean()
@@ -2798,25 +2887,19 @@ class LiveBotWidget(QWidget):
         x = np.arange(len(df))
         bullish_color = '#1f9d55'
         bearish_color = '#d64545'
-        candle_ranges = (df['high'] - df['low']).astype(float)
-        median_range = float(np.nanmedian(candle_ranges.to_numpy(dtype=float))) if len(candle_ranges) else 0.0
-        if not np.isfinite(median_range) or median_range <= 0:
-            median_range = float(np.nanmax(candle_ranges.to_numpy(dtype=float))) if len(candle_ranges) else 0.0
-        if not np.isfinite(median_range) or median_range <= 0:
-            median_range = 1.0
-        min_body_height = median_range * 0.06
         body_width = 0.56
 
         # svíčky
         for i, row in df.iterrows():
             o, h, l, c = map(float, (row['open'], row['high'], row['low'], row['close']))
+            h = max(h, o, c)
+            l = min(l, o, c)
             color = bullish_color if c >= o else bearish_color
             ax1.vlines(i, l, h, linewidth=1.15, color=color, zorder=2)
             body_bottom = min(o, c)
             body_height = abs(c - o)
-            if body_height < min_body_height:
-                body_height = min_body_height
-                body_bottom = ((o + c) / 2.0) - (body_height / 2.0)
+            if body_height <= 0:
+                body_height = 1e-12
             ax1.add_patch(
                 Rectangle(
                     (i - body_width / 2.0, body_bottom),
@@ -2846,7 +2929,13 @@ class LiveBotWidget(QWidget):
             if short_x:
                 ax1.scatter(short_x, short_y, marker='v', s=90, color=bearish_color, zorder=5)
 
-        axis_pad = max(min_body_height, median_range * 0.18)
+        candle_ranges = (df['high'] - df['low']).astype(float)
+        median_range = float(np.nanmedian(candle_ranges.to_numpy(dtype=float))) if len(candle_ranges) else 0.0
+        if not np.isfinite(median_range) or median_range <= 0:
+            median_range = float(np.nanmax(candle_ranges.to_numpy(dtype=float))) if len(candle_ranges) else 0.0
+        if not np.isfinite(median_range) or median_range <= 0:
+            median_range = 1.0
+        axis_pad = median_range * 0.18
         y_min = float(df['low'].min()) - axis_pad
         y_max = float(df['high'].max()) + axis_pad
         if np.isfinite(y_min) and np.isfinite(y_max) and y_max > y_min:
