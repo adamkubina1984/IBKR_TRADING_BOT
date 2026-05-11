@@ -36,3 +36,16 @@ model_outputs/**/*_meta.json
 model_outputs/**/*_rejected_meta.json
 model_outputs/**/*_chain_shortlist.json
 
+# Local workspace / Copilot artifacts
+.codex_*.txt
+.live_service/
+.vscode/
+CODEX_PHASE2_PROMPTS.md
+LIVE_PAPER_SOAK_CHECKLIST.md
+TRAINING_WORKFLOW_REFACTOR_PLAN.md
+
+# Generated sidecars and reports
+data/processed/*_meta.json
+model_outputs/**
+results/balanced_profitable_models_top10.md
+
