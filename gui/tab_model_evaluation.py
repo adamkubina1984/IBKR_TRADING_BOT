@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QSettings, QTimer
 from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -372,6 +372,9 @@ class MplCanvas(FigureCanvas):
 # ---------------- Hlavní widget záložky ----------------
 class ModelEvaluationTab(QWidget):
     _eval_service = EvaluationService(None, None, None)
+    _SETTINGS_ORG = "ibkr_trading_bot"
+    _SETTINGS_APP = "model_evaluation_tab"
+    _SETTINGS_DATA_KEYS = ("last_data_csv_path", "data_csv_path", "csv_path")
 
     def _open_folder(self, path: Path) -> None:
         try:
@@ -390,6 +393,7 @@ class ModelEvaluationTab(QWidget):
         super().__init__()
 
         # --- stavové proměnné ---
+        self._ui_settings = QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
         self.model_path = None
         self.data_path = None
         self.loaded_model = None
@@ -642,7 +646,61 @@ class ModelEvaluationTab(QWidget):
         self._params_timer.setSingleShot(True)
         self._params_timer.setInterval(150)
         self._params_timer.timeout.connect(self._run_params_recalc)
+        self._restore_last_data_path()
         self._refresh_threshold_preview()
+
+    def _save_last_data_path(self, path: str | None) -> None:
+        try:
+            normalized = str(Path(str(path)).expanduser().resolve()) if path else ""
+        except Exception:
+            normalized = str(path or "")
+        try:
+            self._ui_settings.setValue("last_data_csv_path", normalized)
+            self._ui_settings.sync()
+        except Exception:
+            pass
+
+    def _restore_last_data_path(self) -> None:
+        raw_value = ""
+        for key in self._SETTINGS_DATA_KEYS:
+            try:
+                candidate = str(self._ui_settings.value(key, "") or "").strip()
+            except Exception:
+                candidate = ""
+            if candidate:
+                raw_value = candidate
+                break
+        if not raw_value:
+            return
+
+        try:
+            normalized = str(Path(raw_value).expanduser().resolve())
+        except Exception:
+            normalized = raw_value
+
+        if not Path(normalized).is_file():
+            return
+
+        self.data_path = normalized
+        self.data_label.setText(f"Data (CSV): {normalized}")
+        self._set_status("Data (CSV) obnovena z posledni ulozene cesty.")
+
+    def set_data_path(self, file_path: str) -> None:
+        if not file_path:
+            return
+        if not os.path.isfile(file_path):
+            self._error("Soubor neexistuje.")
+            return
+
+        try:
+            normalized_path = str(Path(file_path).expanduser().resolve())
+        except Exception:
+            normalized_path = str(file_path)
+
+        self.data_path = normalized_path
+        self.data_label.setText(f"Data (CSV): {normalized_path}")
+        self._save_last_data_path(normalized_path)
+        self._set_status("Data pripravena.")
 
     # ---------------- Event handlery ----------------
     def on_open_model_clicked(self):
@@ -784,13 +842,7 @@ class ModelEvaluationTab(QWidget):
         )
         if not file_path:
             return
-        if not os.path.isfile(file_path):
-            self._error("Soubor neexistuje.")
-            return
-
-        self.data_path = file_path
-        self.data_label.setText(f"Data (CSV): {file_path}")
-        self._set_status("Data připravena.")
+        self.set_data_path(file_path)
 
     def _on_eval_scope_changed(self, *_):
         mode = self._eval_scope_mode()

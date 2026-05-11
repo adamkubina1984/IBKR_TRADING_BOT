@@ -5,7 +5,6 @@ from PySide6.QtCore import QThread, Signal
 
 class StreamingWorker(QThread):
     on_item = Signal(object)
-    finished = Signal()
     error = Signal(str)
 
     def __init__(self, generator_fn, *args, **kwargs):
@@ -24,7 +23,6 @@ class StreamingWorker(QThread):
                 if not self._running:
                     break
                 self.on_item.emit(item)
-            self.finished.emit()
         except Exception as e:
             self.error.emit(str(e))
 
@@ -33,7 +31,6 @@ class TaskWorker(QThread):
     progress_text = Signal(str)
     result = Signal(object)
     error = Signal(str)
-    finished = Signal()
 
     def __init__(self, task_fn, *args, **kwargs):
         super().__init__()
@@ -62,7 +59,5 @@ class TaskWorker(QThread):
             value = self._task_fn(*self._args, **self._build_kwargs())
             if self._running:
                 self.result.emit(value)
-            self.finished.emit()
         except Exception as e:
             self.error.emit(str(e))
-            self.finished.emit()

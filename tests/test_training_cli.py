@@ -14,7 +14,7 @@ import sklearn
 from ibkr_trading_bot.data.generate_synthetic import generate_synthetic_data
 from ibkr_trading_bot.features.feature_engineering import compute_all_features
 from ibkr_trading_bot.model import train_models
-from ibkr_trading_bot.model.evaluate_models import evaluate_model_once
+from ibkr_trading_bot.model.evaluate_models import _predict_with_thresholds, evaluate_model_once
 from ibkr_trading_bot.model.train_models import train_and_evaluate_model, train_simple_model
 
 
@@ -220,6 +220,27 @@ def test_train_and_evaluate_collects_feature_stability_only_for_best_params(monk
     assert calls[0] == result["best_params"]
     assert meta["feature_stability"]
     assert set(meta["feature_stability"]) == set(meta["trained_features"])
+
+
+class _DummyTernaryEvalModel:
+    def predict_proba(self, X):
+        n = len(X)
+        short = np.full(n, 0.7, dtype=float)
+        hold = np.full(n, 0.2, dtype=float)
+        long = np.full(n, 0.1, dtype=float)
+        return np.column_stack([short, hold, long])
+
+
+def test_predict_with_thresholds_returns_signed_labels_for_ternary_models():
+    X = pd.DataFrame({"f": [0.0, 1.0, 2.0]})
+
+    y_pred = _predict_with_thresholds(
+        _DummyTernaryEvalModel(),
+        X,
+        {"ternary_threshold_short": 0.5, "ternary_threshold_long": 0.5},
+    )
+
+    assert np.array_equal(y_pred, np.array([-1, -1, -1]))
 
 
 def test_train_and_evaluate_unsupported_estimator_writes_empty_feature_stability(monkeypatch):

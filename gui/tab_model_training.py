@@ -39,6 +39,7 @@ from ibkr_trading_bot.core.services.model_training_service import (
 from ibkr_trading_bot.model.train_models import (
     HAS_OPTUNA,
     _align_X_for_estimator,
+    _call_with_feature_name_warning_suppressed,
     _model_dir,
     _select_feature_columns,
     _ternary_predict_mapped,
@@ -127,6 +128,8 @@ class TrainWorker(QThread):
             quality_gate_hard_reject = bool(profile.get("quality_gate_hard_reject", True))
             quality_min_trades = int(profile.get("quality_min_trades", 8))
             quality_min_side_recall = float(profile.get("quality_min_side_recall", 0.01))
+            quality_min_side_prediction_share = float(profile.get("quality_min_side_prediction_share", 0.0))
+            quality_min_side_prediction_count = int(profile.get("quality_min_side_prediction_count", 0))
             quality_require_mc_nonnegative = bool(profile.get("quality_require_mc_nonnegative", True))
             quality_min_mc_sharpe_p50 = float(profile.get("quality_min_mc_sharpe_p50", -0.02))
             quality_min_profit_net = float(profile.get("quality_min_profit_net", 0.0))
@@ -175,6 +178,8 @@ class TrainWorker(QThread):
                 quality_gate_hard_reject=quality_gate_hard_reject,
                 quality_min_trades=quality_min_trades,
                 quality_min_side_recall=quality_min_side_recall,
+                quality_min_side_prediction_share=quality_min_side_prediction_share,
+                quality_min_side_prediction_count=quality_min_side_prediction_count,
                 quality_require_mc_nonnegative=quality_require_mc_nonnegative,
                 quality_min_mc_sharpe_p50=quality_min_mc_sharpe_p50,
                 quality_min_profit_net=quality_min_profit_net,
@@ -222,7 +227,7 @@ class AutoSearchWorker(QThread):
         candidate_top_n: int,
         candidate_fresh_ratio: float,
         state_path: str,
-        search_profile: str = "fast",
+        search_profile: str = "explore",
     ):
         super().__init__()
         self.csv_path = str(csv_path)
@@ -235,7 +240,7 @@ class AutoSearchWorker(QThread):
         self.candidate_top_n = int(max(1, candidate_top_n))
         self.candidate_fresh_ratio = float(np.clip(candidate_fresh_ratio, 0.05, 0.80))
         self.state_path = Path(state_path)
-        self.search_profile = self._normalize_search_profile(search_profile)
+        self.workflow_mode = self._normalize_search_profile(search_profile)
         self._stop_requested = False
 
     def request_stop(self):
@@ -281,73 +286,229 @@ class AutoSearchWorker(QThread):
     @staticmethod
     def _normalize_search_profile(profile: str) -> str:
         p = str(profile or "").strip().lower()
-        return p if p in {"fast", "full", "weekly"} else "fast"
+        alias_map = {
+            "fast": "refine",
+            "full": "explore",
+            "weekly": "refresh",
+        }
+        if p in {"explore", "refine", "refresh"}:
+            return p
+        return alias_map.get(p, "explore")
+
+    def _artifact_stem(self) -> str:
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(self.csv_path).stem).strip("_")
+        return stem or "dataset"
+
+    def _artifact_dir(self) -> Path:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        return self.state_path.parent
+
+    def _region_summary_path(self) -> Path:
+        return self._artifact_dir() / f"{self._artifact_stem()}_region_summary.json"
+
+    def _shortlist_path(self) -> Path:
+        return self._artifact_dir() / f"{self._artifact_stem()}_shortlist.json"
+
+    def _refresh_set_path(self) -> Path:
+        return self._artifact_dir() / f"{self._artifact_stem()}_refresh_set.json"
+
+    @staticmethod
+    def _load_json_file(path: Path) -> dict[str, Any]:
+        if not path.exists():
+            raise FileNotFoundError(path.as_posix())
+        payload = jsonlib.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(f"Invalid JSON artifact: {path.as_posix()}")
+        return payload
+
+    @staticmethod
+    def _grid_values(min_value: float, max_value: float, step: float) -> list[float]:
+        lo = float(min(min_value, max_value))
+        hi = float(max(min_value, max_value))
+        step_value = float(max(step, 1.0))
+        values: list[float] = []
+        current = lo
+        while current <= hi + 1e-9:
+            values.append(round(current, 6))
+            current += step_value
+        return values or [round(lo, 6)]
+
+    @staticmethod
+    def _neighbor_values(center: int, ordered_values: list[int], radius: int) -> list[int]:
+        values = [int(v) for v in ordered_values]
+        if center not in values:
+            values.append(int(center))
+            values = sorted(set(values))
+        if not values:
+            return [int(center)]
+        idx = values.index(int(center))
+        lo = max(0, idx - int(max(0, radius)))
+        hi = min(len(values), idx + int(max(0, radius)) + 1)
+        return values[lo:hi]
+
+    @staticmethod
+    def _unique_queue(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen: set[tuple[str, str, str, int, float, float]] = set()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            key = (
+                str(row.get("phase") or ""),
+                str(row.get("model") or ""),
+                str(row.get("criterion") or ""),
+                int(row.get("horizon") or 0),
+                float(row.get("tp_bps") or 0.0),
+                float(row.get("sl_bps") or 0.0),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(row)
+        return out
+
+    def _queue_from_spec(self, spec: dict[str, Any]) -> list[dict[str, Any]]:
+        mode = str(spec.get("workflow_mode") or self.workflow_mode)
+        queue: list[dict[str, Any]] = []
+        if mode == "explore":
+            for model_name, horizon, tp_bps, sl_bps in product(
+                spec.get("models") or ["lgb", "hgbt"],
+                spec.get("label_horizon_bars") or [8, 12, 16],
+                spec.get("label_tp_bps") or [40.0, 50.0, 60.0],
+                spec.get("label_sl_bps") or [40.0, 50.0, 60.0],
+            ):
+                queue.append(
+                    {
+                        "phase": "explore",
+                        "model": str(model_name),
+                        "criterion": str(spec.get("coarse_criterion") or "balanced"),
+                        "horizon": int(horizon),
+                        "tp_bps": float(tp_bps),
+                        "sl_bps": float(sl_bps),
+                    }
+                )
+            return self._unique_queue(queue)
+
+        if mode == "refine":
+            regions = list(spec.get("approved_regions") or [])
+            criteria = list(spec.get("criteria") or ["balanced", "profit_first", "robustness_first", "recall_balance"])
+            fine_step = float(spec.get("fine_step_bps") or 5.0)
+            for region in regions:
+                models = list(region.get("models") or [])
+                horizons = list(region.get("horizon_values") or [])
+                tp_values = self._grid_values(
+                    float(region.get("tp_bps_min") or 50.0),
+                    float(region.get("tp_bps_max") or 50.0),
+                    fine_step,
+                )
+                sl_values = self._grid_values(
+                    float(region.get("sl_bps_min") or 50.0),
+                    float(region.get("sl_bps_max") or 50.0),
+                    fine_step,
+                )
+                for model_name, criterion, horizon, tp_bps, sl_bps in product(models, criteria, horizons, tp_values, sl_values):
+                    queue.append(
+                        {
+                            "phase": "refine",
+                            "model": str(model_name),
+                            "criterion": str(criterion),
+                            "horizon": int(horizon),
+                            "tp_bps": float(tp_bps),
+                            "sl_bps": float(sl_bps),
+                        }
+                    )
+            return self._unique_queue(queue)
+
+        for candidate in list(spec.get("refresh_candidates") or []):
+            if not bool(candidate.get("enabled", True)):
+                continue
+            queue.append(
+                {
+                    "phase": "refresh",
+                    "model": str(candidate.get("model") or "lgb"),
+                    "criterion": str(candidate.get("criterion") or "balanced"),
+                    "horizon": int(candidate.get("horizon") or 12),
+                    "tp_bps": float(candidate.get("tp_bps") or 50.0),
+                    "sl_bps": float(candidate.get("sl_bps") or 50.0),
+                }
+            )
+        return self._unique_queue(queue)
 
     def _build_spec(self) -> dict[str, Any]:
-        # full keeps the original exhaustive search; fast trims redundant branches.
-        if self.search_profile == "weekly":
+        if self.workflow_mode == "explore":
             return {
-                "version": 1,
-                "search_profile": "weekly",
-                "quick_models": ["lgb", "hgbt", "xgb", "et", "rf"],
-                "criteria": ["profit_first"],
-                "label_horizon_bars": [8, 12, 16],
-                "label_tp_bps": [40.0, 50.0, 60.0],
-                "label_sl_bps": [40.0, 50.0, 60.0],
-                "promote_top_k": 10,
+                "version": 2,
+                "workflow_mode": "explore",
+                "models": ["lgb", "hgbt"],
+                "coarse_criterion": "balanced",
+                "label_horizon_bars": [8, 12, 16, 20],
+                "label_tp_bps": [30.0, 40.0, 50.0, 60.0, 80.0],
+                "label_sl_bps": [30.0, 40.0, 50.0, 60.0, 80.0],
+                "promote_top_k": 3,
+                "approved_model_top_k": 2,
+                "fine_step_bps": 5.0,
+                "region_horizon_neighbors": 1,
+                "region_tp_band_bps": 10.0,
+                "region_sl_band_bps": 10.0,
+                "refine_criteria": ["balanced", "profit_first", "robustness_first", "recall_balance"],
             }
-        if self.search_profile == "full":
+        if self.workflow_mode == "refine":
+            region_summary = self._load_json_file(self._region_summary_path())
+            approved_regions = list(region_summary.get("approved_regions") or [])
+            if not approved_regions:
+                raise ValueError(
+                    f"Refine vyzaduje region_summary s approved_regions: {self._region_summary_path().as_posix()}"
+                )
             return {
-                "version": 1,
-                "search_profile": "full",
-                "quick_models": ["lgb", "hgbt"],
+                "version": 2,
+                "workflow_mode": "refine",
+                "source_region_summary": self._region_summary_path().as_posix(),
+                "approved_regions": approved_regions,
                 "criteria": ["balanced", "profit_first", "robustness_first", "recall_balance"],
-                "label_horizon_bars": [8, 12, 16],
-                "label_tp_bps": [40.0, 50.0, 60.0],
-                "label_sl_bps": [40.0, 50.0, 60.0],
-                "promote_top_k": 8,
+                "fine_step_bps": 5.0,
+                "shortlist_top_k": int(max(1, self.candidate_top_n)),
             }
+        refresh_set_path = self._refresh_set_path()
+        shortlist_path = self._shortlist_path()
+        refresh_candidates: list[dict[str, Any]] = []
+        if refresh_set_path.exists():
+            refresh_candidates = list(self._load_json_file(refresh_set_path).get("refresh_candidates") or [])
+        elif shortlist_path.exists():
+            shortlist = self._load_json_file(shortlist_path)
+            for candidate in list(shortlist.get("candidates") or []):
+                refresh_candidates.append(
+                    {
+                        "enabled": True,
+                        "candidate_id": candidate.get("candidate_id"),
+                        "model": candidate.get("model"),
+                        "criterion": candidate.get("criterion"),
+                        "horizon": candidate.get("horizon"),
+                        "tp_bps": candidate.get("tp_bps"),
+                        "sl_bps": candidate.get("sl_bps"),
+                    }
+                )
+        if not refresh_candidates:
+            raise ValueError(
+                f"Refresh vyzaduje refresh_set nebo shortlist: {refresh_set_path.as_posix()} / {shortlist_path.as_posix()}"
+            )
         return {
-            "version": 1,
-            "search_profile": "fast",
-            "quick_models": ["lgb", "hgbt"],
-            "criteria": ["profit_first"],
-            "label_horizon_bars": [8, 12],
-            "label_tp_bps": [40.0, 50.0, 60.0],
-            "label_sl_bps": [40.0, 50.0, 60.0],
-            "promote_top_k": 5,
+            "version": 2,
+            "workflow_mode": "refresh",
+            "source_shortlist": shortlist_path.as_posix(),
+            "refresh_candidates": refresh_candidates[: int(max(1, self.candidate_top_n))],
         }
 
     def _new_state(self) -> dict[str, Any]:
         spec = self._build_spec()
-        quick_queue: list[dict[str, Any]] = []
-        for model_name, horizon, tp_bps, sl_bps in product(
-            spec["quick_models"],
-            spec["label_horizon_bars"],
-            spec["label_tp_bps"],
-            spec["label_sl_bps"],
-        ):
-            quick_queue.append(
-                {
-                    "phase": "quick",
-                    "model": str(model_name),
-                    "criterion": "balanced",
-                    "horizon": int(horizon),
-                    "tp_bps": float(tp_bps),
-                    "sl_bps": float(sl_bps),
-                }
-            )
+        queue = self._queue_from_spec(spec)
         return {
-            "version": 1,
+            "version": 2,
             "created_at": self._now_str(),
             "updated_at": self._now_str(),
             "csv_path": self.csv_path,
+            "workflow_mode": self.workflow_mode,
             "spec": spec,
-            "phase": "quick",
-            "quick_queue": quick_queue,
-            "quick_idx": 0,
-            "standard_queue": [],
-            "standard_idx": 0,
+            "phase": self.workflow_mode,
+            "queue": queue,
+            "queue_idx": 0,
             "results": [],
             "stopped": False,
             "completed": False,
@@ -360,6 +521,45 @@ class AutoSearchWorker(QThread):
         tmp.write_text(jsonlib.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.state_path)
 
+    def _migrate_legacy_state(self, legacy_state: dict[str, Any]) -> dict[str, Any] | None:
+        if not isinstance(legacy_state, dict) or legacy_state.get("workflow_mode"):
+            return None
+        spec = legacy_state.get("spec") or {}
+        legacy_profile = str(spec.get("search_profile") or "").strip().lower()
+        if legacy_profile != "full" or self.workflow_mode != "explore":
+            return None
+
+        queue: list[dict[str, Any]] = []
+        for row in list(legacy_state.get("quick_queue") or []):
+            queue.append(
+                {
+                    "phase": "explore",
+                    "model": str(row.get("model") or "lgb"),
+                    "criterion": str(row.get("criterion") or "balanced"),
+                    "horizon": int(row.get("horizon") or 12),
+                    "tp_bps": float(row.get("tp_bps") or 50.0),
+                    "sl_bps": float(row.get("sl_bps") or 50.0),
+                }
+            )
+
+        migrated = {
+            "version": 2,
+            "created_at": legacy_state.get("created_at") or self._now_str(),
+            "updated_at": self._now_str(),
+            "csv_path": self.csv_path,
+            "workflow_mode": "explore",
+            "spec": self._build_spec(),
+            "phase": "explore",
+            "queue": queue,
+            "queue_idx": int(legacy_state.get("quick_idx", 0) or 0),
+            "results": list(legacy_state.get("results") or []),
+            "stopped": bool(legacy_state.get("stopped", False)),
+            "completed": False,
+            "migrated_from": "full",
+        }
+        self._save_state(migrated)
+        return migrated
+
     def _load_or_init_state(self) -> tuple[dict[str, Any], bool]:
         if not self.state_path.exists():
             st = self._new_state()
@@ -371,10 +571,14 @@ class AutoSearchWorker(QThread):
             st = self._new_state()
             self._save_state(st)
             return st, False
+        migrated = self._migrate_legacy_state(st)
+        if migrated is not None:
+            return migrated, True
         spec_expected = self._build_spec()
         if (
             not isinstance(st, dict)
             or str(st.get("csv_path")) != self.csv_path
+            or str(st.get("workflow_mode") or "") != self.workflow_mode
             or st.get("spec") != spec_expected
             or st.get("phase") == "done"
         ):
@@ -393,51 +597,223 @@ class AutoSearchWorker(QThread):
                 return float(d)
         return (_fv("profit_net"), _fv("sharpe"), _fv("pf"))
 
-    def _promote_to_standard(self, state: dict[str, Any]) -> dict[str, Any]:
-        quick_rows = [r for r in list(state.get("results") or []) if str(r.get("phase")) == "quick"]
-        quick_rows.sort(key=self._score_result, reverse=True)
-        top_k = int(max(1, int((state.get("spec") or {}).get("promote_top_k", 8))))
-        picked_base: list[dict[str, Any]] = []
+    @staticmethod
+    def _dataset_signature_from_row(row: dict[str, Any]) -> dict[str, Any]:
+        meta = row.get("meta_obj") or {}
+        if not isinstance(meta, dict):
+            meta = {}
+        return {
+            "instrument": meta.get("instrument") or "UNKNOWN",
+            "exchange": meta.get("exchange") or "UNK",
+            "timeframe": meta.get("timeframe") or "UNK",
+            "n_total_bars": int(meta.get("n_total_bars") or 0),
+            "n_holdout_bars": int(meta.get("n_holdout_bars") or 0),
+        }
+
+    def _write_json_artifact(self, path: Path, payload: dict[str, Any]) -> str:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(jsonlib.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path.as_posix()
+
+    def _write_region_summary(self, state: dict[str, Any]) -> str:
+        spec = dict(state.get("spec") or {})
+        ok_rows = [r for r in list(state.get("results") or []) if str(r.get("status")) == "ok"]
+        ok_rows.sort(key=self._score_result, reverse=True)
+        horizon_values = [int(v) for v in list(spec.get("label_horizon_bars") or [])]
+        tp_values = [float(v) for v in list(spec.get("label_tp_bps") or [])]
+        sl_values = [float(v) for v in list(spec.get("label_sl_bps") or [])]
+        horizon_radius = int(max(0, int(spec.get("region_horizon_neighbors", 1))))
+        tp_band = float(max(0.0, float(spec.get("region_tp_band_bps", 10.0))))
+        sl_band = float(max(0.0, float(spec.get("region_sl_band_bps", 10.0))))
+        approved_models: list[str] = []
+        for row in ok_rows:
+            model = str(row.get("model") or "")
+            if model and model not in approved_models:
+                approved_models.append(model)
+            if len(approved_models) >= int(max(1, int(spec.get("approved_model_top_k", 2)))):
+                break
+
+        approved_regions: list[dict[str, Any]] = []
+        seen_region_keys: set[tuple[str, int]] = set()
+        for row in ok_rows:
+            model = str(row.get("model") or "")
+            horizon = int(row.get("horizon") or 0)
+            region_key = (model, horizon)
+            if model not in approved_models or region_key in seen_region_keys:
+                continue
+            seen_region_keys.add(region_key)
+            horizon_neighbors = self._neighbor_values(horizon, horizon_values, horizon_radius)
+            tp_center = float(row.get("tp_bps") or 0.0)
+            sl_center = float(row.get("sl_bps") or 0.0)
+            tp_min = max(min(tp_values or [tp_center]), tp_center - tp_band)
+            tp_max = min(max(tp_values or [tp_center]), tp_center + tp_band)
+            sl_min = max(min(sl_values or [sl_center]), sl_center - sl_band)
+            sl_max = min(max(sl_values or [sl_center]), sl_center + sl_band)
+            approved_regions.append(
+                {
+                    "region_id": (
+                        f"{model}_h{min(horizon_neighbors)}_{max(horizon_neighbors)}"
+                        f"_tp{int(tp_min)}_{int(tp_max)}_sl{int(sl_min)}_{int(sl_max)}"
+                    ),
+                    "models": [model],
+                    "horizon_values": horizon_neighbors,
+                    "tp_bps_min": float(tp_min),
+                    "tp_bps_max": float(tp_max),
+                    "sl_bps_min": float(sl_min),
+                    "sl_bps_max": float(sl_max),
+                    "criteria": list(spec.get("refine_criteria") or ["balanced", "profit_first", "robustness_first", "recall_balance"]),
+                    "evidence": {
+                        "num_runs": 1,
+                        "num_profitable_runs": 1,
+                        "median_profit_net": float(row.get("profit_net") or 0.0),
+                        "median_sharpe": float(row.get("sharpe") or 0.0),
+                        "median_pf": float(row.get("pf") or 0.0),
+                        "trade_band_ok_ratio": 1.0,
+                        "local_stability_score": 0.50,
+                    },
+                    "notes": "Explore winner widened into a local refine region.",
+                }
+            )
+            if len(approved_regions) >= int(max(1, int(spec.get("promote_top_k", 4)))):
+                break
+
+        blocked_regions: list[dict[str, Any]] = []
+        for row in list(state.get("results") or []):
+            reasons = [str(x) for x in list(row.get("qg_reasons") or [])]
+            if not any("trade" in reason.lower() for reason in reasons):
+                continue
+            blocked_regions.append(
+                {
+                    "reason": "trade_gate",
+                    "models": [str(row.get("model") or "")],
+                    "horizon_values": [int(row.get("horizon") or 0)],
+                    "tp_bps_min": float(row.get("tp_bps") or 0.0),
+                    "tp_bps_max": float(row.get("tp_bps") or 0.0),
+                    "sl_bps_min": float(row.get("sl_bps") or 0.0),
+                    "sl_bps_max": float(row.get("sl_bps") or 0.0),
+                }
+            )
+
+        payload = {
+            "version": 1,
+            "mode": "explore",
+            "created_at": self._now_str(),
+            "dataset_signature": self._dataset_signature_from_row(ok_rows[0]) if ok_rows else {},
+            "source_checkpoint": self.state_path.as_posix(),
+            "model_families": {
+                "approved": approved_models,
+                "rejected": [m for m in list(spec.get("models") or []) if m not in approved_models],
+            },
+            "approved_regions": approved_regions,
+            "blocked_regions": blocked_regions,
+            "recommended_refine_budget": {
+                "max_models": int(max(1, int(spec.get("approved_model_top_k", 2)))),
+                "max_regions": int(max(1, int(spec.get("promote_top_k", 4)))),
+                "fine_step_bps": float(spec.get("fine_step_bps") or 5.0),
+            },
+        }
+        return self._write_json_artifact(self._region_summary_path(), payload)
+
+    def _write_shortlist(self, state: dict[str, Any]) -> str:
+        spec = dict(state.get("spec") or {})
+        ok_rows = [r for r in list(state.get("results") or []) if str(r.get("status")) == "ok"]
+        ok_rows.sort(key=self._score_result, reverse=True)
+        candidates: list[dict[str, Any]] = []
         seen: set[tuple[str, int, float, float]] = set()
-        for r in quick_rows:
+        for row in ok_rows:
             key = (
-                str(r.get("model", "")),
-                int(r.get("horizon", 0) or 0),
-                float(r.get("tp_bps", 0.0) or 0.0),
-                float(r.get("sl_bps", 0.0) or 0.0),
+                str(row.get("model") or ""),
+                int(row.get("horizon") or 0),
+                float(row.get("tp_bps") or 0.0),
+                float(row.get("sl_bps") or 0.0),
             )
             if key in seen:
                 continue
             seen.add(key)
-            picked_base.append(
+            criterion = str(row.get("criterion") or "balanced")
+            candidates.append(
                 {
+                    "rank": len(candidates) + 1,
+                    "candidate_id": f"{key[0]}_h{key[1]}_tp{int(key[2])}_sl{int(key[3])}",
                     "model": key[0],
+                    "criterion": criterion,
                     "horizon": key[1],
                     "tp_bps": key[2],
                     "sl_bps": key[3],
+                    "selection_score": float(row.get("profit_net") or 0.0),
+                    "holdout_metrics": {
+                        "profit_net": row.get("profit_net"),
+                        "sharpe_net": row.get("sharpe"),
+                        "pf": row.get("pf"),
+                        "trades": row.get("trades"),
+                    },
+                    "status": "approved_for_refresh",
+                    "refresh_priority": len(candidates) + 1,
+                    "notes": f"Generated from Refine run; representative criterion={criterion}.",
                 }
             )
-            if len(picked_base) >= top_k:
+            if len(candidates) >= int(max(1, int(spec.get("shortlist_top_k", self.candidate_top_n)))):
                 break
 
-        criteria = list((state.get("spec") or {}).get("criteria") or ["balanced"])
-        std_queue: list[dict[str, Any]] = []
-        for b in picked_base:
-            for crit in criteria:
-                std_queue.append(
-                    {
-                        "phase": "standard",
-                        "model": str(b["model"]),
-                        "criterion": str(crit),
-                        "horizon": int(b["horizon"]),
-                        "tp_bps": float(b["tp_bps"]),
-                        "sl_bps": float(b["sl_bps"]),
-                    }
-                )
-        state["phase"] = "standard"
-        state["standard_queue"] = std_queue
-        state["standard_idx"] = 0
-        return state
+        payload = {
+            "version": 1,
+            "mode": "refine",
+            "created_at": self._now_str(),
+            "dataset_signature": self._dataset_signature_from_row(ok_rows[0]) if ok_rows else {},
+            "source_region_summary": str(spec.get("source_region_summary") or self._region_summary_path().as_posix()),
+            "candidates": candidates,
+        }
+        return self._write_json_artifact(self._shortlist_path(), payload)
+
+    def _write_refresh_set(self, state: dict[str, Any]) -> str:
+        ok_rows = [r for r in list(state.get("results") or []) if str(r.get("status")) == "ok"]
+        ok_rows.sort(key=self._score_result, reverse=True)
+        refresh_candidates: list[dict[str, Any]] = []
+        seen: set[tuple[str, int, float, float]] = set()
+        for row in ok_rows:
+            key = (
+                str(row.get("model") or ""),
+                int(row.get("horizon") or 0),
+                float(row.get("tp_bps") or 0.0),
+                float(row.get("sl_bps") or 0.0),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            criterion = str(row.get("criterion") or "balanced")
+            refresh_candidates.append(
+                {
+                    "refresh_priority": len(refresh_candidates) + 1,
+                    "candidate_id": f"{key[0]}_h{key[1]}_tp{int(key[2])}_sl{int(key[3])}",
+                    "model": key[0],
+                    "criterion": criterion,
+                    "horizon": key[1],
+                    "tp_bps": key[2],
+                    "sl_bps": key[3],
+                    "enabled": True,
+                }
+            )
+            if len(refresh_candidates) >= int(max(1, self.candidate_top_n)):
+                break
+
+        payload = {
+            "version": 1,
+            "mode": "refresh",
+            "created_at": self._now_str(),
+            "source_shortlist": self._shortlist_path().as_posix(),
+            "refresh_candidates": refresh_candidates,
+        }
+        return self._write_json_artifact(self._refresh_set_path(), payload)
+
+    def _finalize_workflow(self, state: dict[str, Any]) -> str | None:
+        mode = str(state.get("workflow_mode") or self.workflow_mode)
+        if mode == "explore":
+            return self._write_region_summary(state)
+        if mode == "refine":
+            return self._write_shortlist(state)
+        if mode == "refresh":
+            return self._write_refresh_set(state)
+        return None
 
     @staticmethod
     def _meta_metrics(meta: dict[str, Any]) -> dict[str, Any]:
@@ -447,7 +823,7 @@ class AutoSearchWorker(QThread):
         return mh
 
     def _train_one(self, cfg: dict[str, Any]) -> dict[str, Any]:
-        phase = str(cfg.get("phase", "quick"))
+        phase = str(cfg.get("phase", self.workflow_mode or "explore"))
         estimator_name = str(cfg.get("model", "lgb")).strip().lower()
         criterion = str(cfg.get("criterion", "balanced")).strip().lower()
         horizon = int(cfg.get("horizon", 12))
@@ -473,60 +849,37 @@ class AutoSearchWorker(QThread):
         try:
             state, resumed = self._load_or_init_state()
             spec = (state.get("spec") or {}) if isinstance(state, dict) else {}
-            search_profile = str(spec.get("search_profile") or self.search_profile)
+            workflow_mode = str(spec.get("workflow_mode") or self.workflow_mode)
+            queue = list(state.get("queue") or [])
             self.message.emit(
-                f"INFO Auto-search {'resume' if resumed else 'start'}: {self.state_path.as_posix()} "
-                f"| profile={search_profile} "
-                f"| phase={state.get('phase')} quick={state.get('quick_idx', 0)}/{len(state.get('quick_queue') or [])} "
-                f"standard={state.get('standard_idx', 0)}/{len(state.get('standard_queue') or [])}"
+                f"INFO Workflow {'resume' if resumed else 'start'}: {self.state_path.as_posix()} "
+                f"| mode={workflow_mode} "
+                f"| phase={state.get('phase')} queue={state.get('queue_idx', 0)}/{len(queue)}"
             )
 
             while not self._stop_requested:
-                phase = str(state.get("phase") or "quick")
-                if phase == "quick":
-                    q = list(state.get("quick_queue") or [])
-                    i = int(state.get("quick_idx", 0))
-                    if i >= len(q):
-                        state = self._promote_to_standard(state)
-                        self._save_state(state)
-                        self.message.emit(
-                            f"INFO Auto-search promote: quick_done={len(q)} -> standard_queue={len(state.get('standard_queue') or [])}"
-                        )
-                        continue
-                    cfg = dict(q[i])
-                    self.message.emit(
-                        f"INFO Auto-search run [{i+1}/{len(q)}] phase=quick "
-                        f"model={cfg.get('model')} horizon={cfg.get('horizon')} tp={cfg.get('tp_bps')} sl={cfg.get('sl_bps')}"
-                    )
-                    row = self._train_one(cfg)
-                    state.setdefault("results", []).append(row)
-                    state["quick_idx"] = i + 1
+                q = list(state.get("queue") or [])
+                i = int(state.get("queue_idx", 0))
+                if i >= len(q):
+                    artifact_path = self._finalize_workflow(state)
+                    state["phase"] = "done"
+                    state["completed"] = True
                     self._save_state(state)
-                    self.result.emit(dict(row))
-                    continue
+                    if artifact_path:
+                        self.message.emit(f"INFO Workflow artifact saved: {artifact_path}")
+                    break
 
-                if phase == "standard":
-                    q = list(state.get("standard_queue") or [])
-                    i = int(state.get("standard_idx", 0))
-                    if i >= len(q):
-                        state["phase"] = "done"
-                        state["completed"] = True
-                        self._save_state(state)
-                        break
-                    cfg = dict(q[i])
-                    self.message.emit(
-                        f"INFO Auto-search run [{i+1}/{len(q)}] phase=standard "
-                        f"model={cfg.get('model')} criterion={cfg.get('criterion')} "
-                        f"horizon={cfg.get('horizon')} tp={cfg.get('tp_bps')} sl={cfg.get('sl_bps')}"
-                    )
-                    row = self._train_one(cfg)
-                    state.setdefault("results", []).append(row)
-                    state["standard_idx"] = i + 1
-                    self._save_state(state)
-                    self.result.emit(dict(row))
-                    continue
-
-                break
+                cfg = dict(q[i])
+                self.message.emit(
+                    f"INFO Workflow run [{i+1}/{len(q)}] mode={workflow_mode} "
+                    f"model={cfg.get('model')} criterion={cfg.get('criterion')} "
+                    f"horizon={cfg.get('horizon')} tp={cfg.get('tp_bps')} sl={cfg.get('sl_bps')}"
+                )
+                row = self._train_one(cfg)
+                state.setdefault("results", []).append(row)
+                state["queue_idx"] = i + 1
+                self._save_state(state)
+                self.result.emit(dict(row))
 
             if self._stop_requested:
                 state["stopped"] = True
@@ -571,7 +924,7 @@ class ModelTrainingTab(QWidget):
         lay1.addWidget(self.btn_csv)
         root.addWidget(box1)
 
-        box2 = QGroupBox("2) Auto-search modelu")
+        box2 = QGroupBox("2) Workflow hledani modelu")
         box2.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         lay2 = QVBoxLayout(box2)
 
@@ -619,8 +972,8 @@ class ModelTrainingTab(QWidget):
         row.addWidget(self.spn_optuna_timeout)
         row.addWidget(QLabel("Auto profil:"))
         self.cmb_auto_search_profile = QComboBox()
-        self.cmb_auto_search_profile.addItems(["fast", "full", "weekly"])
-        self.cmb_auto_search_profile.setCurrentText("fast")
+        self.cmb_auto_search_profile.addItems(["Explore", "Refine", "Refresh"])
+        self.cmb_auto_search_profile.setCurrentText("Explore")
         row.addWidget(self.cmb_auto_search_profile)
         row.addStretch(1)
 
@@ -628,7 +981,7 @@ class ModelTrainingTab(QWidget):
         self.btn_train.setEnabled(False)
         self.btn_train.clicked.connect(self.run_training)
         self.btn_train.hide()
-        self.btn_auto_search = QPushButton("Auto-search (resume)")
+        self.btn_auto_search = QPushButton("Workflow (resume)")
         self.btn_auto_search.setEnabled(False)
         self.btn_auto_search.clicked.connect(self.run_auto_search)
         row.addWidget(self.btn_auto_search)
@@ -727,7 +1080,7 @@ class ModelTrainingTab(QWidget):
         if self.dataset is None:
             self.btn_train.setText(f"Trenovat ({mode})")
             self.btn_train.setEnabled(False)
-            self.btn_auto_search.setText("Auto-search (resume)")
+            self.btn_auto_search.setText("Workflow (resume)")
             self.btn_auto_search.setEnabled(False)
             self.btn_auto_stop.setEnabled(self._is_auto_search_running())
             return
@@ -738,7 +1091,7 @@ class ModelTrainingTab(QWidget):
             f"Trenovat [{mode}] ({n_rows} rows, holdout {n_hold} [{float(self.holdout_pct_default) * 100.0:.1f}%])"
         )
         self.btn_train.setEnabled(not running)
-        self.btn_auto_search.setText(f"Auto-search [{profile}] (resume) [{n_rows} rows, holdout {n_hold}]")
+        self.btn_auto_search.setText(f"Workflow [{profile}] (resume) [{n_rows} rows, holdout {n_hold}]")
         self.btn_auto_search.setEnabled(not running)
         self.btn_auto_stop.setEnabled(self._is_auto_search_running())
 
@@ -785,7 +1138,14 @@ class ModelTrainingTab(QWidget):
 
     def _current_auto_search_profile(self) -> str:
         txt = (self.cmb_auto_search_profile.currentText() or "").strip().lower()
-        return txt if txt in {"fast", "full", "weekly"} else "fast"
+        alias_map = {
+            "fast": "refine",
+            "full": "explore",
+            "weekly": "refresh",
+        }
+        if txt in {"explore", "refine", "refresh"}:
+            return txt
+        return alias_map.get(txt, "explore")
 
     def _compute_holdout_bars(self, n_total: int) -> int:
         return runtime_compute_holdout_bars(
@@ -855,7 +1215,7 @@ class ModelTrainingTab(QWidget):
             self.log.appendPlainText("WARN Nejprve vyber CSV.")
             return
         if self._is_training_running():
-            self.log.appendPlainText("WARN Jiz probiha trenink/auto-search. Pockej na dokonceni.")
+            self.log.appendPlainText("WARN Jiz probiha trenink nebo workflow. Pockej na dokonceni.")
             return
 
         est = self.cmb_model.currentText().strip().lower()
@@ -973,13 +1333,17 @@ class ModelTrainingTab(QWidget):
         if not safe:
             safe = "dataset"
         profile_norm = str(profile or "").strip().lower()
-        if profile_norm not in {"fast", "full", "weekly"}:
-            profile_norm = "fast"
+        profile_norm = {
+            "fast": "refine",
+            "full": "explore",
+            "weekly": "refresh",
+        }.get(profile_norm, profile_norm)
+        if profile_norm not in {"explore", "refine", "refresh"}:
+            profile_norm = "explore"
         state_dir = Path(_model_dir()) / "auto_search"
         prof_path = state_dir / f"{safe}_{profile_norm}_state.json"
         legacy_path = state_dir / f"{safe}_state.json"
-        # Backward compatibility: older runs stored only one state file without profile suffix.
-        if profile_norm == "full" and legacy_path.exists() and not prof_path.exists():
+        if profile_norm == "explore" and legacy_path.exists() and not prof_path.exists():
             return legacy_path
         return prof_path
 
@@ -988,14 +1352,15 @@ class ModelTrainingTab(QWidget):
             self.log.appendPlainText("WARN Nejprve vyber CSV.")
             return
         if self._is_training_running():
-            self.log.appendPlainText("WARN Jiz probiha trenink/auto-search. Pockej na dokonceni.")
+            self.log.appendPlainText("WARN Jiz probiha trenink nebo workflow. Pockej na dokonceni.")
             return
 
         auto_profile = self._current_auto_search_profile()
         state_path = self._auto_search_state_path(auto_profile)
         profiles = {
-            "quick": self._apply_search_backend_profile_overrides(self._training_profile_for_mode("quick")),
-            "standard": self._apply_search_backend_profile_overrides(self._training_profile_for_mode("standard")),
+            "explore": self._apply_search_backend_profile_overrides(self._training_profile_for_mode("explore")),
+            "refine": self._apply_search_backend_profile_overrides(self._training_profile_for_mode("refine")),
+            "refresh": self._apply_search_backend_profile_overrides(self._training_profile_for_mode("refresh")),
         }
         top_n = int(max(1, self._current_candidate_top_n()))
         fresh_ratio = float(np.clip(self._current_candidate_fresh_ratio(), 0.05, 0.80))
@@ -1018,7 +1383,7 @@ class ModelTrainingTab(QWidget):
         self.auto_worker.error.connect(self._on_auto_error)
         self.auto_worker.finished.connect(self._on_auto_worker_finished)
         self.log.appendPlainText(
-            f"INFO Auto-search start: profile={auto_profile} checkpoint={state_path.as_posix()} "
+            f"INFO Workflow start: mode={auto_profile} checkpoint={state_path.as_posix()} "
             f"| backend={self._selected_search_backend()} "
             f"optuna_trials={self._selected_optuna_trials()} "
             f"optuna_timeout={self._selected_optuna_timeout_seconds()}s "
@@ -1031,7 +1396,7 @@ class ModelTrainingTab(QWidget):
     def stop_auto_search(self):
         if self._is_auto_search_running() and self.auto_worker is not None:
             self.auto_worker.request_stop()
-            self.log.appendPlainText("INFO Auto-search: stop requested (ulozim checkpoint a ukoncim beh).")
+            self.log.appendPlainText("INFO Workflow: stop requested (ulozim checkpoint a ukoncim beh).")
 
     def _on_auto_result(self, row: dict[str, Any]):
         if not isinstance(row, dict):
@@ -1054,7 +1419,7 @@ class ModelTrainingTab(QWidget):
         sl_bps = row.get("sl_bps")
         status = row.get("status")
         self.log.appendPlainText(
-            "INFO Auto result: "
+            "INFO Workflow result: "
             f"phase={phase} model={model} crit={criterion} "
             f"h={horizon} tp={tp_bps} sl={sl_bps} "
             f"status={status} profit_net={_fmt(row.get('profit_net'), 2)} "
@@ -1067,15 +1432,15 @@ class ModelTrainingTab(QWidget):
         if status != "ok":
             reasons = row.get("qg_reasons") or []
             self.log.appendPlainText(
-                f"INFO Auto reject/error: reasons={reasons} meta={row.get('meta_path') or 'n/a'}"
+                f"INFO Workflow reject/error: reasons={reasons} meta={row.get('meta_path') or 'n/a'}"
             )
 
     def _on_auto_finished_state(self, state_path: str, completed: bool):
         state = "completed" if completed else "paused"
-        self.log.appendPlainText(f"INFO Auto-search {state}: checkpoint={state_path}")
+        self.log.appendPlainText(f"INFO Workflow {state}: checkpoint={state_path}")
 
     def _on_auto_error(self, msg: str):
-        self.log.appendPlainText(f"ERROR Auto-search: {msg}")
+        self.log.appendPlainText(f"ERROR Workflow: {msg}")
 
     def _on_auto_worker_finished(self):
         self.auto_worker = None
@@ -1256,7 +1621,7 @@ class ModelTrainingTab(QWidget):
                 X_eval = self.X_test.reindex(columns=feats, fill_value=0.0) if feats else self.X_test
                 X_eval_use = _align_X_for_estimator(mdl, X_eval)
                 if hasattr(mdl, "predict_proba"):
-                    pr = mdl.predict_proba(X_eval_use)
+                    pr = _call_with_feature_name_warning_suppressed(mdl.predict_proba, X_eval_use)
                     if isinstance(pr, np.ndarray) and pr.ndim == 2 and pr.shape[1] >= 3:
                         p_short = pr[:, 0]
                         p_long = pr[:, 2]
@@ -1273,7 +1638,7 @@ class ModelTrainingTab(QWidget):
                     p1 = 1.0 / (1.0 + np.exp(-z))
                     y_pred = (p1 >= thr).astype(int)
                 else:
-                    y_pred = mdl.predict(X_eval_use)
+                    y_pred = _call_with_feature_name_warning_suppressed(mdl.predict, X_eval_use)
 
                 acc = accuracy_score(self.y_test, y_pred)
                 if len(np.unique(np.asarray(self.y_test))) >= 3:
@@ -1303,6 +1668,32 @@ class ModelTrainingTab(QWidget):
         self.worker = None
         self._set_controls_running(False)
         self._refresh_train_button_text()
+
+    def shutdown(self) -> bool:
+        ok = True
+        if self.auto_worker is not None:
+            try:
+                self.auto_worker.request_stop()
+            except Exception:
+                pass
+            if self.auto_worker.isRunning() and not self.auto_worker.wait(3000):
+                ok = False
+            elif not self.auto_worker.isRunning():
+                try:
+                    self.auto_worker.deleteLater()
+                except Exception:
+                    pass
+                self.auto_worker = None
+        if self.worker is not None:
+            if self.worker.isRunning():
+                ok = False
+            else:
+                try:
+                    self.worker.deleteLater()
+                except Exception:
+                    pass
+                self.worker = None
+        return ok
 
     def _log_reject_summary_from_diag_meta(self, msg: str):
         try:
@@ -1356,6 +1747,21 @@ class ModelTrainingTab(QWidget):
                 f"mode={tt.get('selected_mode', 'n/a')} | "
                 f"reasons={qg.get('reasons') or []}"
             )
+            chunks = qg.get("holdout_chunks") if isinstance(qg, dict) else None
+            if isinstance(chunks, list) and chunks:
+                parts: list[str] = []
+                for chunk in chunks[:3]:
+                    if not isinstance(chunk, dict):
+                        continue
+                    pb = chunk.get("prediction_balance") if isinstance(chunk.get("prediction_balance"), dict) else {}
+                    parts.append(
+                        f"c{int(chunk.get('chunk_index', len(parts) + 1) or (len(parts) + 1))} "
+                        f"pnl={_f(chunk.get('profit_net'), 2)} "
+                        f"trades={int(chunk.get('num_trades', 0) or 0)} "
+                        f"S/L={int(pb.get('n_short', 0) or 0)}/{int(pb.get('n_long', 0) or 0)}"
+                    )
+                if parts:
+                    self.log.appendPlainText("INFO Reject holdout chunks: " + " | ".join(parts))
         except Exception:
             return
 
@@ -1398,6 +1804,23 @@ class ModelTrainingTab(QWidget):
                 f"rec_short={_f(rs, 4)} rec_long={_f(rl, 4)} | "
                 f"mc_p50={_f(mc_p50, 4)}"
             )
+
+            qg = meta.get("quality_gate") or {}
+            chunks = qg.get("holdout_chunks") if isinstance(qg, dict) else None
+            if isinstance(chunks, list) and chunks:
+                parts: list[str] = []
+                for chunk in chunks[:3]:
+                    if not isinstance(chunk, dict):
+                        continue
+                    pb = chunk.get("prediction_balance") if isinstance(chunk.get("prediction_balance"), dict) else {}
+                    parts.append(
+                        f"c{int(chunk.get('chunk_index', len(parts) + 1) or (len(parts) + 1))} "
+                        f"pnl={_f(chunk.get('profit_net'), 2)} "
+                        f"trades={int(chunk.get('num_trades', 0) or 0)} "
+                        f"S/L={int(pb.get('n_short', 0) or 0)}/{int(pb.get('n_long', 0) or 0)}"
+                    )
+                if parts:
+                    self.log.appendPlainText("INFO Holdout chunks: " + " | ".join(parts))
         except Exception:
             return
 

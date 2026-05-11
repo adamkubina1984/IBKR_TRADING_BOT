@@ -1,7 +1,8 @@
 import json
 
 import pytest
-from PySide6.QtCore import QItemSelectionModel
+from PySide6.QtCore import QItemSelectionModel, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QAbstractItemView, QMessageBox, QWidget
 
 from ibkr_trading_bot.gui import tab_model_ranking as tab_model_ranking_module
@@ -105,42 +106,36 @@ def test_model_ranking_delete_shortcut_deletes_multiple_models(monkeypatch, qapp
         window.close()
 
 
-def test_model_ranking_strict_top5_uses_preview_and_starts_batch(monkeypatch, qapp, tmp_path):
-    csv_path = tmp_path / "GC_5m_features.csv"
-    csv_path.write_text("timestamp,open,high,low,close,volume\n1,1,1,1,1,1\n", encoding="utf-8")
+def test_model_ranking_delete_uses_visible_filtered_records(monkeypatch, qapp, tmp_path):
+    visible_model = write_model(
+        tmp_path,
+        "visible.pkl",
+        ranking={"status": "error"},
+        profit_net=1.0,
+    )
+    hidden_model = write_model(
+        tmp_path,
+        "hidden.pkl",
+        ranking={"status": "error"},
+        profit_net=2.0,
+    )
 
-    for name, estimator, opt_profit, base_profit, sharpe, horizon, tp_bps, sl_bps in [
-        ("candidate_a.pkl", "hgbt", 640.0, 140.0, 0.02, 8, 50.0, 50.0),
-        ("candidate_b.pkl", "lgb", 590.0, -10.0, 0.01, 12, 40.0, 60.0),
-        ("rescued_only.pkl", "xgb", 700.0, -20.0, 0.0, 8, 40.0, 40.0),
+    for model_path, rec_short, rec_long in [
+        (visible_model, 0.31, 0.29),
+        (hidden_model, 0.61, 0.09),
     ]:
-        model_path = write_model(
-            tmp_path,
-            name,
-            ranking=ranking_payload(csv_path, fee=0.25, profit_h=opt_profit, trades_h=120.0),
-            profit_net=base_profit,
-        )
         meta_path = model_path.with_name(model_path.stem + "_meta.json")
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        meta.update(
-            {
-                "instrument": "GC",
-                "exchange": "COMEX",
-                "timeframe": "5m",
-                "n_total_bars": 44268,
-                "estimator_name": estimator,
-                "label_horizon_bars": horizon,
-                "label_take_profit_bps": tp_bps,
-                "label_stop_loss_bps": sl_bps,
-            }
-        )
-        meta["metrics_holdout"]["sharpe"] = sharpe
+        meta.setdefault("metrics_holdout", {})["per_class_3"] = {
+            "-1": {"recall": rec_short},
+            "1": {"recall": rec_long},
+        }
         meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     monkeypatch.setattr(tab_model_ranking_module, "DEFAULT_MODEL_DIR", tmp_path)
     monkeypatch.setattr(MainWindow, "_create_data_tab", lambda self: QWidget())
-    monkeypatch.setattr(MainWindow, "_create_train_tab", lambda self: StubTrainTab(str(csv_path), n_total_bars=44268))
-    monkeypatch.setattr(MainWindow, "_create_eval_tab", lambda self: StubEvalRankingTab(str(csv_path)))
+    monkeypatch.setattr(MainWindow, "_create_train_tab", lambda self: QWidget())
+    monkeypatch.setattr(MainWindow, "_create_eval_tab", lambda self: StubEvalTab())
     monkeypatch.setattr(MainWindow, "_create_live_tab", lambda self: StubLiveTab())
     monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.Yes)
 
@@ -150,36 +145,35 @@ def test_model_ranking_strict_top5_uses_preview_and_starts_batch(monkeypatch, qa
         ranking = window.tab_model_ranking
         assert ranking is not None
 
-        captured = {}
-        monkeypatch.setattr(
-            ranking,
-            "_start_strict_worker",
-            lambda **kwargs: captured.update(kwargs),
-        )
+        ranking.set_bias_filter("tight")
+        qapp.processEvents()
+        assert ranking.tbl.rowCount() == 1
+        assert ranking.tbl.item(0, 0).text() == "visible.pkl"
 
-        ranking._on_strict_top5_clicked()
+        ranking.tbl.setCurrentCell(0, 0)
+        qapp.processEvents()
+        ranking._on_delete_selected()
         qapp.processEvents()
 
-        assert [candidate.record.model_path.name for candidate in captured["selected"]] == [
-            "candidate_a.pkl",
-            "candidate_b.pkl",
-        ]
-        assert captured["selected"][0].tier_label == "A"
-        assert captured["selected"][1].tier_label == "B"
-        assert captured["training_context"]["csv_path"].endswith("GC_5m_features.csv")
+        assert not visible_model.exists()
+        assert not visible_model.with_name("visible_meta.json").exists()
+        assert hidden_model.exists()
+        assert hidden_model.with_name("hidden_meta.json").exists()
+        assert ranking.tbl.rowCount() == 0
     finally:
         window.close()
 
 
-def test_model_ranking_strict_top5_requires_training_csv(monkeypatch, qapp, tmp_path):
+def test_model_ranking_delete_key_uses_sorted_visible_row(monkeypatch, qapp, tmp_path):
+    alpha_model = write_model(tmp_path, "alpha.pkl", profit_net=1.0)
+    omega_model = write_model(tmp_path, "omega.pkl", profit_net=9.0)
+
     monkeypatch.setattr(tab_model_ranking_module, "DEFAULT_MODEL_DIR", tmp_path)
     monkeypatch.setattr(MainWindow, "_create_data_tab", lambda self: QWidget())
-    monkeypatch.setattr(MainWindow, "_create_train_tab", lambda self: StubTrainTab(None))
-    monkeypatch.setattr(MainWindow, "_create_eval_tab", lambda self: StubEvalRankingTab(str(tmp_path / "missing.csv")))
+    monkeypatch.setattr(MainWindow, "_create_train_tab", lambda self: QWidget())
+    monkeypatch.setattr(MainWindow, "_create_eval_tab", lambda self: StubEvalTab())
     monkeypatch.setattr(MainWindow, "_create_live_tab", lambda self: StubLiveTab())
-
-    warnings = []
-    monkeypatch.setattr(QMessageBox, "warning", lambda *args, **kwargs: warnings.append(args[2]) or QMessageBox.Ok)
+    monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.Yes)
 
     window = MainWindow()
     try:
@@ -187,10 +181,22 @@ def test_model_ranking_strict_top5_requires_training_csv(monkeypatch, qapp, tmp_
         ranking = window.tab_model_ranking
         assert ranking is not None
 
-        ranking._on_strict_top5_clicked()
+        ranking.tbl.sortItems(0, Qt.DescendingOrder)
         qapp.processEvents()
 
-        assert warnings
-        assert "Tab 2" in warnings[0]
+        assert ranking.tbl.item(0, 0).text() == "omega.pkl"
+        ranking.tbl.setFocus()
+        ranking.tbl.setCurrentCell(0, 0)
+        qapp.processEvents()
+
+        QTest.keyClick(ranking.tbl, Qt.Key_Delete)
+        qapp.processEvents()
+
+        assert not omega_model.exists()
+        assert not omega_model.with_name("omega_meta.json").exists()
+        assert alpha_model.exists()
+        assert alpha_model.with_name("alpha_meta.json").exists()
     finally:
         window.close()
+
+

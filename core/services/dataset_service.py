@@ -8,6 +8,7 @@ from ibkr_trading_bot.features.feature_engineering import prepare_dataset_with_t
 from ibkr_trading_bot.labels import make_triple_barrier_labels
 from ibkr_trading_bot.labels.triple_barrier import make_triple_barrier_labels_ternary
 from ibkr_trading_bot.utils.io_helpers import load_dataframe
+from ibkr_trading_bot.utils.labeling import normalize_target_for_mode
 
 
 class DatasetService:
@@ -107,17 +108,7 @@ class DatasetService:
                 df_prepared["target"] = pd.Series(y_series, index=df_prepared.index)
 
         # --- 6) final normalizace targetu dle zvoleného režimu
-        df_prepared["target"] = pd.Series(df_prepared["target"]).astype(float)
-        if target_mode == "ternary":
-            # mapuj na {-1, 0, 1}
-            df_prepared["target"] = np.where(
-                df_prepared["target"] > 0,
-                1,
-                np.where(df_prepared["target"] < 0, -1, 0),
-            ).astype(int)
-        else:
-            # binární fallback {0,1}
-            df_prepared["target"] = (df_prepared["target"] > 0).astype(int)
+        df_prepared["target"] = normalize_target_for_mode(df_prepared["target"], target_mode)
 
         if df_prepared["target"].dropna().empty:
             raise ValueError("Po přípravě chybí platné hodnoty pro 'target'.")

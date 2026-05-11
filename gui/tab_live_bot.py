@@ -1,4 +1,4 @@
-# ==============================================
+﻿# ==============================================
 # Záložka 5) Live trading bot – TradingView only
 # + Ensemble AND (MA ∧ Model) + pojmenované vrstvy L0/L1/L2
 # + Auto-align featur na expected_features/feature_names_in_ (vč. 'average')
@@ -28,6 +28,7 @@ load_dotenv()
 from PySide6.QtCore import QSettings, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QTextCursor
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -47,8 +48,15 @@ from PySide6.QtWidgets import (
 )
 
 from ibkr_trading_bot.core.config.presets import PRESETS_BY_TF
-from ibkr_trading_bot.core.services.signal_policy import apply_live_hysteresis, build_live_proposal
-from ibkr_trading_bot.core.services.trade_executor import ClosedTrade, TradeExecutor
+from ibkr_trading_bot.core.services.live import TwsConnectionConfig
+from ibkr_trading_bot.core.services.live_service_controller import LiveServiceController
+from ibkr_trading_bot.core.services.signal_policy import (
+    apply_live_hysteresis,
+    build_live_proposal,
+    infer_label_map_from_classes as infer_signal_policy_label_map,
+    pick_ternary_direction_from_raw_proba as pick_shared_ternary_direction_from_raw_proba,
+)
+from ibkr_trading_bot.core.services.trade_executor import ClosedTrade, TradeExecutor, TradeState
 from ibkr_trading_bot.features.feature_engineering import compute_all_features
 
 try:
@@ -71,17 +79,51 @@ except Exception as e:
     raise ImportError(f"Nelze importovat LiveWarmupService: {e}")
 
 
-# TradingView klient
-from ibkr_trading_bot.core.datasource.tradingview_client import (
-    TradingViewClient,
-    load_saved_tv_credentials,
-    save_tv_credentials,
-)
+# TradingView klient (různé fallback importy)
+try:
+    from ibkr_trading_bot.core.datasource.tradingview_client import (
+        TradingViewClient,
+        load_saved_tv_credentials,
+        save_tv_credentials,
+    )
+except ModuleNotFoundError:
+    try:
+        from ibkr_trading_bot.core.data_sources.tradingview_client import (
+            TradingViewClient,
+            load_saved_tv_credentials,
+            save_tv_credentials,
+        )
+    except ModuleNotFoundError:
+        try:
+            from core.datasource.tradingview_client import (
+                TradingViewClient,
+                load_saved_tv_credentials,
+                save_tv_credentials,
+            )
+        except ModuleNotFoundError:
+            from core.data_sources.tradingview_client import (
+                TradingViewClient,
+                load_saved_tv_credentials,
+                save_tv_credentials,
+            )
 
 # Logger
-from ibkr_trading_bot.core.utils.logging_setup import get_logger
+try:
+    from ibkr_trading_bot.core.utils.logging_setup import get_logger
+except Exception:
+    def get_logger(name: str):
+        import logging
+        logger = logging.getLogger(name)
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+            logger.addHandler(handler)
+        if logger.level == logging.NOTSET:
+            logger.setLevel(logging.INFO)
+        logger.propagate = False
+        return logger
 
-DEFAULT_MODEL_DIR = str(Path(__file__).resolve().parent.parent / "model_outputs")
+DEFAULT_MODEL_DIR = r"C:\Users\adamk\Můj disk\Trader\ibkr_trading_bot\model_outputs"
 
 def _make_proxy_target_from_df(df):
     """
@@ -147,51 +189,7 @@ def _predict_proba_safely(model, X):
 
 
 def _infer_label_map_from_classes(classes, base_map: dict | None = None) -> dict[int, str]:
-    """
-    Vrátí robustní mapu numerických tříd na směr:
-    - binární: {-1,+1} nebo {0,1}
-    - ternární: {-1,0,+1} nebo {0,1,2}
-    Pokud je base_map dodaná, má prioritu nad inferovanou mapou.
-    """
-    inferred: dict[int, str] = {}
-
-    ints: list[int] = []
-    if classes is not None:
-        for c in list(classes):
-            try:
-                ints.append(int(c))
-            except Exception:
-                pass
-
-    uniq = sorted(set(ints))
-    if uniq:
-        s = set(uniq)
-        if s == {-1, 1}:
-            inferred = {-1: "SHORT", 1: "LONG"}
-        elif s == {0, 1}:
-            inferred = {0: "SHORT", 1: "LONG"}
-        elif s == {-1, 0, 1}:
-            inferred = {-1: "SHORT", 0: "HOLD", 1: "LONG"}
-        elif s == {0, 1, 2}:
-            inferred = {0: "SHORT", 1: "HOLD", 2: "LONG"}
-        else:
-            if len(uniq) >= 2:
-                inferred[uniq[0]] = "SHORT"
-                inferred[uniq[-1]] = "LONG"
-            for u in uniq[1:-1]:
-                inferred[u] = "HOLD"
-
-    if not inferred:
-        inferred = {0: "SHORT", 1: "LONG"}
-
-    if base_map:
-        for k, v in base_map.items():
-            try:
-                inferred[int(k)] = str(v).upper()
-            except Exception:
-                continue
-
-    return inferred
+    return infer_signal_policy_label_map(classes, base_map=base_map)
 
 
 def _coerce_bool(value: Any, default: bool = False) -> bool:
@@ -342,30 +340,13 @@ def _pick_direction_from_raw_proba(
         if classes_i is None or raw_proba is None or len(raw_proba) != len(classes_i):
             return None, 0.0
 
-        map_i = _infer_label_map_from_classes(classes_i, base_map=label_map)
-
-        p_long = p_short = p_hold = 0.0
-        for idx, cls in enumerate(classes_i):
-            try:
-                d = str(map_i.get(int(cls), "")).upper()
-            except Exception:
-                d = ""
-            p = float(raw_proba[idx])
-            if d == "LONG":
-                p_long += p
-            elif d == "SHORT":
-                p_short += p
-            elif d in ("HOLD", "FLAT", "NONE", "NEUTRAL"):
-                p_hold += p
-
-        t_short = float(short_threshold)
-        t_long = float(long_threshold)
-        if p_long >= t_long and p_long >= p_short:
-            return "LONG", float(p_long)
-        if p_short >= t_short and p_short > p_long:
-            return "SHORT", float(p_short)
-
-        return "FLAT", float(max(p_long, p_short, p_hold))
+        return pick_shared_ternary_direction_from_raw_proba(
+            raw_proba,
+            classes_i,
+            short_threshold=float(short_threshold),
+            long_threshold=float(long_threshold),
+            label_map=label_map,
+        )
     except Exception:
         return None, 0.0
 
@@ -382,7 +363,7 @@ class LiveConfig:
     sensitivity: float = 0.5      # confidence threshold (0..1)
     dry_run: bool = True
     max_fresh_age_min: int = 5
-    max_bars_buffer: int = 300  # Buffer pro live bars (po dropna z rolling bude ~200 validních)
+    max_bars_buffer: int = 300  # Buffer pro live bars (po dropna z rolling bude ~200 validnich)
     display_bars: int = 144  # Pocet svicek zobrazenych v grafech
     use_ma_only: bool = False
     use_and_ensemble: bool = False  # default VOTE (AND vypnuto)
@@ -391,18 +372,25 @@ class LiveConfig:
     alert_cooldown_s: int = 5
 
     # E-mail
-    alert_email_enabled: bool = (os.getenv("ALERT_EMAIL_ENABLED", "0").lower() in ("1","true","yes"))
+    alert_email_enabled: bool = (os.getenv("ALERT_EMAIL_ENABLED", "0").lower() in ("1", "true", "yes"))
     alert_email_to: str | None = os.getenv("ALERT_EMAIL_TO")
     smtp_host: str | None = os.getenv("SMTP_HOST")
     smtp_port: int = int(os.getenv("SMTP_PORT", "465"))
     smtp_user: str | None = os.getenv("SMTP_USER")
     smtp_password: str | None = os.getenv("SMTP_PASS")
-    smtp_use_ssl: bool = os.getenv("SMTP_USE_SSL", "1").lower() not in ("0","false","no")
+    smtp_use_ssl: bool = os.getenv("SMTP_USE_SSL", "1").lower() not in ("0", "false", "no")
     smtp_from: str | None = os.getenv("SMTP_FROM")
 
     entry_thr: float = 0.50
     exit_thr: float = 0.50
     rounds_enabled: bool = False
+    ib_startup_check: bool = True
+    ib_host: str = "127.0.0.1"
+    ib_port: int = 7497
+    ib_client_id: int = 1
+    ib_client_id_retry_span: int = 3
+    ib_account: str | None = None
+    ib_readonly: bool = True
 
 
 @dataclass
@@ -411,6 +399,12 @@ class LiveBootstrapPayload:
     live_df: pd.DataFrame
     label_maps: list[dict[int, str] | None]
     snapshot_bars: int
+
+
+@dataclass
+class LiveWarmupPayload:
+    warm_service: Any
+    adapter: Any
 
 
 @dataclass
@@ -427,6 +421,63 @@ def _empty_live_bootstrap_payload(model_count: int = 0) -> LiveBootstrapPayload:
         label_maps=[None] * max(0, int(model_count)),
         snapshot_bars=0,
     )
+
+
+def _bar_size_to_timedelta(bar_size: str | None) -> pd.Timedelta:
+    key = str(bar_size or "1 hour").strip().lower()
+    mapping = {
+        "5 min": pd.Timedelta(minutes=5),
+        "5 mins": pd.Timedelta(minutes=5),
+        "5m": pd.Timedelta(minutes=5),
+        "5min": pd.Timedelta(minutes=5),
+        "15 min": pd.Timedelta(minutes=15),
+        "15 mins": pd.Timedelta(minutes=15),
+        "15m": pd.Timedelta(minutes=15),
+        "15min": pd.Timedelta(minutes=15),
+        "30 min": pd.Timedelta(minutes=30),
+        "30 mins": pd.Timedelta(minutes=30),
+        "30m": pd.Timedelta(minutes=30),
+        "30min": pd.Timedelta(minutes=30),
+        "1 hour": pd.Timedelta(hours=1),
+        "1h": pd.Timedelta(hours=1),
+        "1hr": pd.Timedelta(hours=1),
+        "60 min": pd.Timedelta(hours=1),
+        "60 mins": pd.Timedelta(hours=1),
+        "60m": pd.Timedelta(hours=1),
+        "60min": pd.Timedelta(hours=1),
+    }
+    return mapping.get(key, pd.Timedelta(hours=1))
+
+
+def _trim_forming_history_tail(
+    df: pd.DataFrame | None,
+    *,
+    bar_size: str | None,
+    reference_time_utc: pd.Timestamp | None = None,
+) -> pd.DataFrame | None:
+    if df is None:
+        return None
+    if df.empty:
+        return df.copy()
+
+    time_col = next((col for col in ("time", "timestamp", "date") if col in df.columns), None)
+    if time_col is None:
+        return df.copy()
+
+    work = df.copy()
+    work[time_col] = pd.to_datetime(work[time_col], utc=True, errors="coerce")
+    work = work.dropna(subset=[time_col]).sort_values(time_col).reset_index(drop=True)
+    if work.empty:
+        return work
+
+    now_utc = pd.to_datetime(reference_time_utc, utc=True, errors="coerce")
+    if pd.isna(now_utc):
+        now_utc = pd.Timestamp.now(tz="UTC")
+
+    last_ts = pd.to_datetime(work[time_col].iloc[-1], utc=True, errors="coerce")
+    if pd.notna(last_ts) and now_utc < (last_ts + _bar_size_to_timedelta(bar_size)):
+        work = work.iloc[:-1].reset_index(drop=True)
+    return work
 
 
 def _sanitize_live_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -495,7 +546,9 @@ def _build_live_bootstrap_payload_from_history_df(
     df: pd.DataFrame | None,
     models: list[dict[str, Any]],
     *,
+    bar_size: str | None = None,
     max_bars_buffer: int | None = None,
+    reference_time_utc: pd.Timestamp | None = None,
 ) -> LiveBootstrapPayload:
     if df is None or df.empty:
         return _empty_live_bootstrap_payload(len(models))
@@ -513,15 +566,12 @@ def _build_live_bootstrap_payload_from_history_df(
     work["time"] = pd.to_datetime(work["time"], utc=True, errors="coerce")
     for col in ("open", "high", "low", "close", "volume"):
         work[col] = pd.to_numeric(work[col], errors="coerce")
-    work = (
-        work.dropna(subset=["time", "open", "high", "low", "close"])
-        .sort_values("time")
-        .drop_duplicates(subset=["time"], keep="last")
-        .reset_index(drop=True)
+    work = work.dropna(subset=["time", "open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
+    work = _trim_forming_history_tail(
+        work,
+        bar_size=bar_size,
+        reference_time_utc=reference_time_utc,
     )
-    if len(work) > 1:
-        # Last row from history can be currently-open bar; bootstrap only with closed bars.
-        work = work.iloc[:-1].reset_index(drop=True)
     if work.empty:
         return _empty_live_bootstrap_payload(len(models))
 
@@ -610,8 +660,38 @@ def _task_build_live_bootstrap(
     return _build_live_bootstrap_payload_from_history_df(
         df,
         models,
+        bar_size=bar_size,
         max_bars_buffer=int(max_bars_buffer),
     )
+
+
+def _task_run_live_warmup(
+    *,
+    widget: Any,
+    symbol: str,
+    exchange: str,
+    timeframe: str,
+    progress_cb=None,
+) -> LiveWarmupPayload:
+    if callable(progress_cb):
+        progress_cb("[INFO] Warm-up bezi na pozadi...")
+
+    adapter = _WarmAdapter(widget)
+    entry_thr = widget.user_settings.get("entry_threshold", widget.config.sensitivity)
+    warm_service = LiveWarmupService(
+        base_service=adapter,
+        config=WarmupConfig(
+            threshold=float(entry_thr),
+            warmup_bars=500,
+            min_sim_trades=3,
+            start_sharpe=0.00,
+            max_dd=25.0,
+            diag_first_n=220,
+            force_live_after_warmup=True,
+        ),
+    )
+    warm_service.start(symbol, exchange, timeframe)
+    return LiveWarmupPayload(warm_service=warm_service, adapter=adapter)
 
 
 def _task_preload_degradation(
@@ -646,80 +726,44 @@ def _task_preload_degradation(
         return DegradationPreloadPayload(predictions=[], prices=[], timestamps=[])
 
     df_recent = df_feats.tail(int(degradation_window_size)).copy().reset_index(drop=True)
+    model_info = models[0]
+    model = model_info["predictor"]
+    exp_feats = model_info.get("exp_feats")
+    X_prepared = df_recent
+    if exp_feats:
+        X_prepared = _prepare_X_for_model_static(df_recent, exp_feats)
 
-    model_predictions: list[list[int]] = []
-    for model_info in models:
-        try:
-            model = model_info.get("predictor")
-            if model is None:
-                continue
-            exp_feats = model_info.get("exp_feats")
-            X_prepared = df_recent
-            if exp_feats:
-                X_prepared = _prepare_X_for_model_static(df_recent, exp_feats)
-
-            label_map = model_info.get("label_map") or _infer_label_map_from_classes(getattr(model, "classes_", None))
-            X_pred = _align_X_for_model(model, X_prepared)
-            proba_all = _predict_proba_safely(model, X_pred)
-            t_short = float(model_info.get("t_short", 0.5))
-            t_long = float(model_info.get("t_long", 0.5))
-            classes = getattr(model, "classes_", None)
-            if classes is not None:
-                if any(isinstance(c, str) for c in classes):
-                    lut = {str(c).upper(): i for i, c in enumerate(classes)}
-                    idx_long = lut.get("LONG")
-                    idx_short = lut.get("SHORT")
-                else:
-                    idx_long = next(
-                        (i for i, c in enumerate(classes) if str(label_map.get(int(c), "")).upper() == "LONG"),
-                        None,
-                    )
-                    idx_short = next(
-                        (i for i, c in enumerate(classes) if str(label_map.get(int(c), "")).upper() == "SHORT"),
-                        None,
-                    )
+    try:
+        label_map = model_info.get("label_map") or _infer_label_map_from_classes(getattr(model, "classes_", None))
+        X_pred = _align_X_for_model(model, X_prepared)
+        proba_all = _predict_proba_safely(model, X_pred)
+        t_short = float(model_info.get("t_short", 0.5))
+        t_long = float(model_info.get("t_long", 0.5))
+        classes = getattr(model, "classes_", None)
+        if classes is not None:
+            if any(isinstance(c, str) for c in classes):
+                lut = {str(c).upper(): i for i, c in enumerate(classes)}
+                idx_long = lut.get("LONG")
+                idx_short = lut.get("SHORT")
             else:
-                idx_long = 1
-                idx_short = 0
+                idx_long = next((i for i, c in enumerate(classes) if str(label_map.get(int(c), "")).upper() == "LONG"), None)
+                idx_short = next((i for i, c in enumerate(classes) if str(label_map.get(int(c), "")).upper() == "SHORT"), None)
+        else:
+            idx_long = 1
+            idx_short = 0
 
-            preds_i: list[int] = []
-            for proba_row in proba_all:
-                pL = float(proba_row[idx_long]) if idx_long is not None else 0.5
-                pS = float(proba_row[idx_short]) if idx_short is not None else 0.5
-                if pL >= t_long and pL >= pS:
-                    preds_i.append(1)
-                elif pS >= t_short and pS > pL:
-                    preds_i.append(-1)
-                else:
-                    preds_i.append(0)
-            model_predictions.append(preds_i)
-        except Exception:
-            continue
-
-    if not model_predictions:
-        predictions = [0] * len(df_recent)
-    elif len(model_predictions) == 1:
-        predictions = model_predictions[0]
-    else:
-        predictions = []
-        n_rows = len(df_recent)
-        for row_idx in range(n_rows):
-            longs = 0
-            shorts = 0
-            for preds_i in model_predictions:
-                if row_idx >= len(preds_i):
-                    continue
-                val = int(preds_i[row_idx])
-                if val > 0:
-                    longs += 1
-                elif val < 0:
-                    shorts += 1
-            if longs > shorts:
+        predictions: list[int] = []
+        for proba_row in proba_all:
+            pL = float(proba_row[idx_long]) if idx_long is not None else 0.5
+            pS = float(proba_row[idx_short]) if idx_short is not None else 0.5
+            if pL >= t_long and pL >= pS:
                 predictions.append(1)
-            elif shorts > longs:
+            elif pS >= t_short and pS > pL:
                 predictions.append(-1)
             else:
                 predictions.append(0)
+    except Exception:
+        predictions = [0] * len(df_recent)
 
     prices = df_recent["close"].astype(float).tolist()
     timestamps = df_recent["time"].tolist()
@@ -737,7 +781,7 @@ class TVWorker(QThread):
         super().__init__(parent)
         self.cfg = cfg
         self._stop = False
-        self._last_closed_ns: int | None = None
+        self._last_ns: int | None = None
         self.tv = TradingViewClient(
             username=os.getenv("TV_USERNAME"),
             password=os.getenv("TV_PASSWORD")
@@ -763,25 +807,24 @@ class TVWorker(QThread):
                 tf_label = (self.cfg.bar_size or "1 hour").replace("mins", "min")
                 exchange = (getattr(self.cfg, "exchange", None) or "COMEX")
                 df = self.tv.get_history(self.cfg.symbol, exchange, tf_label, limit=2)
-                if df is not None and len(df.index) >= 2:
-                    # TradingView typically returns [closed_bar, currently_open_bar] for limit=2.
-                    # Emit only the closed bar to avoid rendering malformed/incomplete candles.
-                    closed_bar = df.iloc[-2]
-                    closed_ts = pd.to_datetime(closed_bar["time"], utc=True, errors="coerce")
-                    if pd.isna(closed_ts):
+                closed_df = _trim_forming_history_tail(df, bar_size=self.cfg.bar_size)
+                if closed_df is not None and not closed_df.empty:
+                    last = closed_df.iloc[-1]
+                    ts = pd.to_datetime(last["time"], utc=True, errors="coerce")
+                    if pd.isna(ts):
                         self.msleep(self._poll_interval_s() * 1000); continue
-                    closed_ns = int(closed_ts.value)
-                    if closed_ns != self._last_closed_ns:
-                        self._last_closed_ns = closed_ns
+                    ts_ns = int(ts.value)
+                    if ts_ns != self._last_ns:
+                        self._last_ns = ts_ns
                         stale_count = 0
                         self.statusChanged.emit("Connected")
                         self.barClosed.emit({
-                            "time": str(closed_ts),
-                            "open": float(closed_bar.get("open", 0)),
-                            "high": float(closed_bar.get("high", 0)),
-                            "low":  float(closed_bar.get("low",  0)),
-                            "close":float(closed_bar.get("close",0)),
-                            "volume": float(closed_bar.get("volume", 0) or 0),
+                            "time": str(ts),
+                            "open": float(last.get("open", 0)),
+                            "high": float(last.get("high", 0)),
+                            "low":  float(last.get("low",  0)),
+                            "close":float(last.get("close",0)),
+                            "volume": float(last.get("volume", 0) or 0),
                         })
                     else:
                         stale_count += 1
@@ -802,7 +845,7 @@ class TVWorker(QThread):
                     except Exception:
                         pass
                     stale_count = 0
-                    self._last_closed_ns = None
+                    self._last_ns = None
 
                 self.msleep(self._poll_interval_s() * 1000)
         except Exception as e:
@@ -836,6 +879,10 @@ class _WarmAdapter:
         df = df.copy()
         df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
         df = df.dropna(subset=["time"]).sort_values("time")
+        df = _trim_forming_history_tail(df, bar_size=timeframe)
+        if df is None or df.empty:
+            self._hist_df = self._hist_df.iloc[0:0].copy()
+            return []
 
         out = []
         for _, r in df.iterrows():
@@ -847,14 +894,7 @@ class _WarmAdapter:
                 "close":float(r.get("close",np.nan)),
                 "volume": float(r.get("volume", 0) or 0),
             })
-        self._hist_df = pd.DataFrame({
-            "date":   df["time"].to_numpy(),
-            "open":   df["open"].astype(float).to_numpy(),
-            "high":   df["high"].astype(float).to_numpy(),
-            "low":    df["low"].astype(float).to_numpy(),
-            "close":  df["close"].astype(float).to_numpy(),
-            "volume": df["volume"].astype(float).to_numpy(),
-        })
+        self._hist_df = self._hist_df.iloc[0:0].copy()
         return out
 
     def featurize_until(self, bar: dict[str, Any]):
@@ -996,6 +1036,7 @@ class LiveBotWidget(QWidget):
         self.config = config or LiveConfig()
         self._ui_settings = QSettings("ibkr_trading_bot", "live_tab")
         self._load_ui_settings()
+
         self.model = None                          # používá se jen pro feature_names_in_
         self.models: list[dict[str, Any]] = []     # členové ensemble
         self.class_to_dir = {1: "LONG", 0: "SHORT"}  # lze přepsat z meta
@@ -1004,6 +1045,7 @@ class LiveBotWidget(QWidget):
         self.model_expected_features: list[str] | None = None
         self.worker: TVWorker | None = None
         self._bootstrap_worker: TaskWorker | None = None
+        self._warmup_worker: TaskWorker | None = None
         self._degradation_worker: TaskWorker | None = None
         self._retired_threads: list[QThread] = []
         self.warm: LiveWarmupService | None = None
@@ -1015,20 +1057,17 @@ class LiveBotWidget(QWidget):
         self._pending_bar_payloads: list[dict[str, Any]] = []
         self._bar_refresh_scheduled = False
         self._bootstrap_request_id = 0
+        self._warmup_request_id = 0
         self._degradation_request_id = 0
+        self._bootstrap_done = True
+        self._warmup_done = True
         self._log_queue = deque()
-
-        self._build_ui()
-        self._restore_model_path_setting()
-        self._load_tv_credentials_into_ui()
-        self._wire_basic_logic()
-        self._last_alert_sig: str | None = None
-        self._last_alert_bar_key: int | None = None
-        self._se = None
 
         self._live_pos = 0       # -1 short, 0 flat, +1 long
         self._live_entry_px = None
         self._trade_executor = TradeExecutor()
+        self._trades: list[dict[str, Any]] = []
+        self._open_trade: dict[str, Any] | None = None
         self._trading_enabled = False
         self._curr_entry_thr = self.config.entry_thr
         self._curr_exit_thr = self.config.exit_thr
@@ -1036,24 +1075,32 @@ class LiveBotWidget(QWidget):
         self._curr_t_long = None
         self._rounds = {"grid": [], "tol_atr": 0.0}
         self.class_to_dir = {0: "SHORT", 1: "LONG"}
-        
+
         # Nastavení modelu z Tab 3 (uložená v metadata)
-        self.user_settings = {}  # dict se všemi thresholdy a flagy z Tab 3
+        self.user_settings = {}
 
         # Diagnostika degradace modelu (Reference vs Live)
-        self.reference_metrics = {}  # Referenční metriky z metadata (train nebo holdout)
-        self._prediction_buffer = []  # Buffer posledních N predictions (signály)
-        self._price_buffer = []  # Buffer posledních N cen (close)
-        self._y_true_buffer = []  # Buffer posledních N ground truth (pokud dostupné)
-        self._tracked_timestamps = set()  # Set timestampů již trackovaných barů (pro deduplicitu)
-        self.degradation_window_size = 500  # Počet barů pro recent window
-        self._last_degradation_check = 0  # Index posledního checku
-        self.live_metrics_recent = {}  # Aktuální metriky na recent window
-        self._reference_fee_per_trade = 0.0
+        self.reference_metrics = {}
+        self._prediction_buffer = []
+        self._price_buffer = []
+        self._y_true_buffer = []
+        self._tracked_timestamps = set()
+        self.degradation_window_size = 500
+        self._last_degradation_check = 0
+        self.live_metrics_recent = {}
 
-        # Sledování obchodů
-        self._trades: list[dict[str, Any]] = []  # seznam obchodů pro tabulku
-        self._open_trade: dict[str, Any] | None = None  # otevřený obchod
+        self._build_ui()
+        self._restore_model_path_setting()
+        self._restore_ibkr_paper_settings()
+        self._load_tv_credentials_into_ui()
+        self.live_controller = self._build_live_service_controller()
+        self._refresh_controller_status(run_startup_check=True)
+        self._sync_live_state_from_controller()
+        self._refresh_trades_from_controller()
+        self._wire_basic_logic()
+        self._last_alert_sig: str | None = None
+        self._last_alert_bar_key: int | None = None
+        self._se = None
 
         if QSoundEffect is not None and QUrl is not None and self.config.alert_sound:
             try:
@@ -1072,7 +1119,6 @@ class LiveBotWidget(QWidget):
         self._log_timer.setInterval(100)
         self._log_timer.timeout.connect(self._flush_log_queue)
         self._log_timer.start()
-        self._set_session_running_ui(False)
 
     def _load_ui_settings(self) -> None:
         try:
@@ -1082,26 +1128,204 @@ class LiveBotWidget(QWidget):
         except Exception:
             self.config.display_bars = max(30, min(2000, int(self.config.display_bars)))
 
-    def _restore_model_path_setting(self) -> None:
-        """Restore last saved model path(s) from QSettings. Call after _build_ui."""
-        try:
-            saved_paths = str(self._ui_settings.value("model_paths", "") or "").strip()
-            if saved_paths and saved_paths != DEFAULT_MODEL_DIR:
-                valid = [p for p in saved_paths.split(";") if p.strip() and os.path.isfile(p.strip())]
-                if valid:
-                    self.le_model_path.setText(";".join(valid))
-        except Exception:
-            pass
-
     def _save_ui_settings(self) -> None:
         try:
             self._ui_settings.setValue("display_bars", int(self.config.display_bars))
-            model_text = (self.le_model_path.text() or "").strip()
-            if model_text and model_text != DEFAULT_MODEL_DIR:
-                self._ui_settings.setValue("model_paths", model_text)
+            if hasattr(self, "le_model_path"):
+                self._ui_settings.setValue("model_paths", self.le_model_path.text().strip())
+            if hasattr(self, "chk_ib_startup_check"):
+                self._ui_settings.setValue("ib_startup_check", bool(self.chk_ib_startup_check.isChecked()))
+                self._ui_settings.setValue("ib_host", self.ed_ib_host.text().strip())
+                self._ui_settings.setValue("ib_port", int(self.spn_ib_port.value()))
+                self._ui_settings.setValue("ib_client_id", int(self.spn_ib_client_id.value()))
+                self._ui_settings.setValue("ib_account", self.ed_ib_account.text().strip())
+                self._ui_settings.setValue("ib_readonly", bool(self.chk_ib_readonly.isChecked()))
             self._ui_settings.sync()
         except Exception:
             pass
+
+    @staticmethod
+    def _coerce_setting_bool(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return bool(default)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _restore_model_path_setting(self) -> None:
+        raw = self._ui_settings.value("model_paths", "")
+        text = str(raw or "").strip()
+        if not text:
+            return
+        self.le_model_path.setText(text)
+        items = [chunk.strip() for chunk in text.replace("\n", ";").split(";") if chunk.strip()]
+        if items:
+            self._apply_market_context_from_model_paths(items)
+
+    def _restore_ibkr_paper_settings(self) -> None:
+        startup_check = self._coerce_setting_bool(
+            self._ui_settings.value("ib_startup_check", self.config.ib_startup_check),
+            self.config.ib_startup_check,
+        )
+        host = str(self._ui_settings.value("ib_host", self.config.ib_host) or self.config.ib_host).strip() or self.config.ib_host
+        port = int(self._ui_settings.value("ib_port", self.config.ib_port) or self.config.ib_port)
+        client_id = int(self._ui_settings.value("ib_client_id", self.config.ib_client_id) or self.config.ib_client_id)
+        account = str(self._ui_settings.value("ib_account", self.config.ib_account or "") or "").strip()
+        readonly = self._coerce_setting_bool(
+            self._ui_settings.value("ib_readonly", self.config.ib_readonly),
+            self.config.ib_readonly,
+        )
+
+        self.chk_ib_startup_check.setChecked(startup_check)
+        self.ed_ib_host.setText(host)
+        self.spn_ib_port.setValue(port)
+        self.spn_ib_client_id.setValue(client_id)
+        self.ed_ib_account.setText(account)
+        self.chk_ib_readonly.setChecked(readonly)
+
+        self.config.ib_startup_check = startup_check
+        self.config.ib_host = host
+        self.config.ib_port = port
+        self.config.ib_client_id = client_id
+        self.config.ib_account = account or None
+        self.config.ib_readonly = readonly
+
+    def _build_ib_connection_config(self) -> TwsConnectionConfig | None:
+        if not bool(self.chk_ib_startup_check.isChecked()):
+            return None
+        account = (self.ed_ib_account.text() or "").strip() or None
+        return TwsConnectionConfig(
+            host=(self.ed_ib_host.text() or self.config.ib_host).strip() or self.config.ib_host,
+            port=int(self.spn_ib_port.value()),
+            client_id=int(self.spn_ib_client_id.value()),
+            client_id_retry_span=int(getattr(self.config, "ib_client_id_retry_span", 3) or 3),
+            account=account,
+            readonly=bool(self.chk_ib_readonly.isChecked()),
+        )
+
+    def _build_live_service_controller(self) -> LiveServiceController:
+        return LiveServiceController(
+            strategy_id="tab5-live-service",
+            instrument=(self.ed_symbol.text() or self.config.symbol).strip(),
+            exchange=(self.ed_expiry.text() or self.config.exchange).strip(),
+            timeframe=(self.cmb_interval.currentText() or self.config.bar_size).strip(),
+            entry_threshold=float(self._curr_entry_thr),
+            exit_threshold=float(self._curr_exit_thr),
+            use_ma_alignment=bool(self.config.use_and_ensemble),
+            freshness_timeout_sec=max(60, int(self.config.max_fresh_age_min) * 60),
+            broker_connection=self._build_ib_connection_config(),
+        )
+
+    def _set_trade_button_text(self) -> None:
+        if hasattr(self, "btn_trade"):
+            self.btn_trade.setText(f"Arm trading: {'ON' if self._trading_enabled else 'OFF'}")
+
+    def _set_execution_mode_selection(self, mode: str) -> None:
+        if not hasattr(self, "cmb_execution_mode"):
+            return
+        target = str(mode or "PAPER").strip().upper() or "PAPER"
+        idx = self.cmb_execution_mode.findData(target)
+        if idx < 0:
+            idx = 0
+        self.cmb_execution_mode.blockSignals(True)
+        self.cmb_execution_mode.setCurrentIndex(idx)
+        self.cmb_execution_mode.blockSignals(False)
+
+    def _format_broker_status_tooltip(self, broker_status) -> str:
+        if broker_status is None:
+            return "Broker startup check není inicializovaný."
+        if not broker_status.enabled:
+            return "Paper broker startup check disabled."
+
+        configured_client_id = int(self.spn_ib_client_id.value()) if hasattr(self, "spn_ib_client_id") else None
+        lines = [f"{broker_status.host}:{broker_status.port}"]
+        if configured_client_id is not None:
+            lines.append(f"configured clientId={configured_client_id}")
+        if broker_status.client_id is not None:
+            lines.append(f"clientId={int(broker_status.client_id)}")
+        if configured_client_id is not None and broker_status.client_id is not None and int(broker_status.client_id) != configured_client_id:
+            lines.append("auto-fallback active")
+        if broker_status.account:
+            lines.append(f"account={broker_status.account}")
+        if broker_status.error:
+            lines.append(f"error={broker_status.error}")
+        return "\n".join(lines)
+
+    def _format_release_gate_tooltip(self) -> str:
+        if getattr(self, "live_controller", None) is None:
+            return "Release gate není k dispozici."
+        gate = self.live_controller.release_gate_result
+        lines = list(gate.blockers) + list(gate.warnings)
+        return "\n".join(lines) if lines else "No release gate blockers."
+
+    def _refresh_controller_status(self, *, run_startup_check: bool = False) -> None:
+        controller = getattr(self, "live_controller", None)
+        if controller is None:
+            self.lbl_broker_status.setText("Broker: unavailable")
+            self.lbl_broker_status.setToolTip("LiveServiceController se nepodařilo vytvořit.")
+            self.lbl_release_gate.setText("Release Gate: --")
+            self.lbl_release_gate.setToolTip("Release gate není k dispozici.")
+            self.lbl_mode.setText("Mode: OBSERVE")
+            self.btn_trade.setEnabled(False)
+            self._set_execution_mode_selection("PAPER")
+            self._set_trade_button_text()
+            return
+
+        broker_status = controller.broker_status
+        if run_startup_check and broker_status.enabled:
+            broker_status = controller.refresh_paper_broker_session()
+        status = controller.status
+        gate = controller.release_gate_result
+
+        self.lbl_release_gate.setText("Release Gate: READY" if gate.allowed else "Release Gate: BLOCKED")
+        self.lbl_release_gate.setToolTip(self._format_release_gate_tooltip())
+
+        real_item = self.cmb_execution_mode.model().item(1)
+        if real_item is not None:
+            real_item.setEnabled(bool(gate.allowed))
+        self._set_execution_mode_selection(controller.execution_mode)
+
+        if not broker_status.enabled:
+            self.lbl_broker_status.setText("Broker: startup check disabled")
+            self.lbl_mode.setText(f"Mode: {status.mode}")
+            trade_enabled = True
+        elif broker_status.connected:
+            account = broker_status.account or (self.ed_ib_account.text() or "").strip()
+            suffix = f" ({account})" if account else ""
+            self.lbl_broker_status.setText(f"Broker: PAPER OK{suffix}")
+            self.lbl_mode.setText(f"Mode: {status.mode}")
+            trade_enabled = True
+        else:
+            self.lbl_broker_status.setText("Broker: OFFLINE")
+            self.lbl_mode.setText("Mode: BLOCKED (BROKER_OFFLINE)")
+            trade_enabled = False
+
+        self.lbl_broker_status.setToolTip(self._format_broker_status_tooltip(broker_status))
+        self.btn_trade.setEnabled(trade_enabled)
+        self._set_trade_button_text()
+
+    def _sync_ib_config_from_ui(self, *, rebuild_controller: bool = False, run_startup_check: bool = False) -> None:
+        self.config.ib_startup_check = bool(self.chk_ib_startup_check.isChecked())
+        self.config.ib_host = (self.ed_ib_host.text() or self.config.ib_host).strip() or self.config.ib_host
+        self.config.ib_port = int(self.spn_ib_port.value())
+        self.config.ib_client_id = int(self.spn_ib_client_id.value())
+        self.config.ib_account = (self.ed_ib_account.text() or "").strip() or None
+        self.config.ib_readonly = bool(self.chk_ib_readonly.isChecked())
+        self.config.mode = self.cmb_mode.currentText()
+        self.config.symbol = (self.ed_symbol.text() or self.config.symbol).strip() or self.config.symbol
+        self.config.exchange = (self.ed_expiry.text() or self.config.exchange).strip() or self.config.exchange
+        self.config.bar_size = (self.cmb_interval.currentText() or self.config.bar_size).strip() or self.config.bar_size
+
+        if rebuild_controller or getattr(self, "live_controller", None) is None:
+            try:
+                self.live_controller = self._build_live_service_controller()
+            except Exception as exc:
+                self.live_controller = None
+                self._append_log(f"[WARN] LiveServiceController init selhal: {exc}")
+
+        self._refresh_controller_status(run_startup_check=run_startup_check)
+        self._sync_live_state_from_controller()
+        self._refresh_trades_from_controller()
 
     def _load_tv_credentials_into_ui(self) -> None:
         try:
@@ -1119,7 +1343,7 @@ class LiveBotWidget(QWidget):
             save_tv_credentials(username, password)
             if username and password:
                 self.lbl_tv_auth.setText("TV login: ulozen")
-                self._append_log("[TV] Login ulozen lokalne. Pokud uz bezi session, pouzij Start (RESET) a znovu Start (SET).")
+                self._append_log("[TV] Login ulozen lokalne. Klikni Reconnect, pokud uz bezi session.")
             else:
                 self.lbl_tv_auth.setText("TV login: neni ulozen")
                 self._append_log("[TV] Ulozeny login byl vymazan.")
@@ -1191,18 +1415,23 @@ class LiveBotWidget(QWidget):
         status_box = QGroupBox("Status")
         grid = QGridLayout()
         self.lbl_ib_status = QLabel("TV: Disconnected")
+        self.lbl_broker_status = QLabel("Broker: --")
+        self.lbl_release_gate = QLabel("Release Gate: --")
         self.lbl_time = QLabel("Time: --:--:--")
         self.lbl_fresh = QLabel("Freshness: --")
+        self.lbl_mode = QLabel("Mode: OBSERVE")
         grid.addWidget(self.lbl_ib_status, 0, 0)
-        grid.addWidget(self.lbl_time,      0, 1)
-        grid.addWidget(self.lbl_fresh,     0, 2)
-        self.lbl_mode = QLabel("Mode: WARM-UP")
-        grid.addWidget(self.lbl_mode,      0, 3)
+        grid.addWidget(self.lbl_broker_status, 0, 1)
+        grid.addWidget(self.lbl_release_gate, 0, 2)
+        grid.addWidget(self.lbl_time, 1, 0)
+        grid.addWidget(self.lbl_fresh, 1, 1)
+        grid.addWidget(self.lbl_mode, 1, 2)
         status_box.setLayout(grid)
 
         # Sezení
         session_box = QGroupBox("Sezení")
         h = QHBoxLayout()
+        self.cmb_mode = QComboBox(); self.cmb_mode.addItems(["live"]); self.cmb_mode.setCurrentText("live"); self.cmb_mode.setEnabled(False)
         self.ed_symbol = QLineEdit(self.config.symbol)
         self.ed_expiry = QLineEdit(self.config.exchange)
         self.cmb_interval = QComboBox(); self.cmb_interval.addItems(["5 min", "15 min", "30 min", "1 hour"])
@@ -1212,18 +1441,48 @@ class LiveBotWidget(QWidget):
         self.spn_display_bars.setSingleStep(12)
         self.spn_display_bars.setValue(max(30, int(getattr(self.config, "display_bars", 144))))
         self.spn_display_bars.setToolTip("Kolik poslednich uzavrenych svicek zobrazit v grafech.")
+        self.cmb_execution_mode = QComboBox()
+        self.cmb_execution_mode.addItem("PAPER", "PAPER")
+        self.cmb_execution_mode.addItem("REAL", "REAL")
         self.btn_start = QPushButton("Start (SET)")
         self.btn_reset = QPushButton("Reset")
-        self.btn_trade = QPushButton("Obchodovat: OFF")
+        self.btn_trade = QPushButton("Arm trading: OFF")
         self.btn_trade.setCheckable(True)
-        h.addWidget(QLabel("Symbol:"));     h.addWidget(self.ed_symbol)
-        h.addWidget(QLabel("Exchange:"));   h.addWidget(self.ed_expiry)
-        h.addWidget(QLabel("Timeframe:"));  h.addWidget(self.cmb_interval)
-        h.addWidget(QLabel("Svíček:"));     h.addWidget(self.spn_display_bars)
+        h.addWidget(QLabel("Symbol:")); h.addWidget(self.ed_symbol)
+        h.addWidget(QLabel("Exchange:")); h.addWidget(self.ed_expiry)
+        h.addWidget(QLabel("Timeframe:")); h.addWidget(self.cmb_interval)
+        h.addWidget(QLabel("Svíček:")); h.addWidget(self.spn_display_bars)
+        h.addWidget(QLabel("Execution:")); h.addWidget(self.cmb_execution_mode)
         h.addWidget(self.btn_start)
         h.addWidget(self.btn_reset)
         h.addWidget(self.btn_trade)
         session_box.setLayout(h)
+
+        ibkr_box = QGroupBox("IBKR Paper")
+        ibkr_grid = QGridLayout()
+        ibkr_grid.setHorizontalSpacing(12)
+        ibkr_grid.setVerticalSpacing(8)
+        self.chk_ib_startup_check = QCheckBox("Startup check")
+        self.ed_ib_host = QLineEdit(self.config.ib_host)
+        self.spn_ib_port = QSpinBox(); self.spn_ib_port.setRange(1, 65535); self.spn_ib_port.setValue(int(self.config.ib_port))
+        self.spn_ib_client_id = QSpinBox(); self.spn_ib_client_id.setRange(0, 999999); self.spn_ib_client_id.setValue(int(self.config.ib_client_id))
+        self.ed_ib_account = QLineEdit(self.config.ib_account or "")
+        self.ed_ib_account.setPlaceholderText("DU123456 (volitelne)")
+        self.ed_ib_account.setToolTip("Volitelny IBKR paper ucet (DU...), ktery se ma pri startup checku vyzadovat.")
+        self.chk_ib_readonly = QCheckBox("Readonly")
+        self.chk_ib_readonly.setChecked(bool(self.config.ib_readonly))
+        lbl_ib_account = QLabel("DU ucet:")
+        lbl_ib_account.setToolTip("Volitelny IBKR paper ucet (DU...), ktery se ma pri startup checku vyzadovat.")
+        self.ed_ib_host.setMinimumWidth(180)
+        self.ed_ib_account.setMinimumWidth(180)
+        ibkr_grid.addWidget(self.chk_ib_startup_check, 0, 0)
+        ibkr_grid.addWidget(self.chk_ib_readonly, 0, 1)
+        ibkr_grid.addWidget(QLabel("Host:"), 0, 2); ibkr_grid.addWidget(self.ed_ib_host, 0, 3)
+        ibkr_grid.addWidget(QLabel("Port:"), 0, 4); ibkr_grid.addWidget(self.spn_ib_port, 0, 5)
+        ibkr_grid.addWidget(QLabel("Client ID:"), 1, 0); ibkr_grid.addWidget(self.spn_ib_client_id, 1, 1)
+        ibkr_grid.addWidget(lbl_ib_account, 1, 2); ibkr_grid.addWidget(self.ed_ib_account, 1, 3, 1, 3)
+        ibkr_grid.setColumnStretch(3, 1)
+        ibkr_box.setLayout(ibkr_grid)
 
         tv_auth_box = QGroupBox("TradingView login")
         tv_auth_layout = QHBoxLayout()
@@ -1245,31 +1504,23 @@ class LiveBotWidget(QWidget):
         tv_auth_layout.addStretch(1)
         tv_auth_box.setLayout(tv_auth_layout)
 
-        # Model
-        model_box = QGroupBox("Model")
-        g = QGridLayout()
+        model_panel = QWidget()
+        g = QGridLayout(model_panel)
+        g.setContentsMargins(0, 0, 0, 0)
+        g.setHorizontalSpacing(8)
         self.le_model_path = QLineEdit(DEFAULT_MODEL_DIR)
         self.btn_model = QPushButton("…")
-
+        
         # Cesta k modelu
         g.addWidget(QLabel("Cesta:"), 0, 0); g.addWidget(self.le_model_path, 0, 1); g.addWidget(self.btn_model, 0, 2)
-
-        self.lbl_decision_threshold = QLabel("T-short/T-long: – / –")
-        self.lbl_entry_threshold = QLabel("Entry Threshold: –")
-        self.lbl_exit_threshold = QLabel("Exit Threshold: –")
-        self.lbl_ma_only = QLabel("MA-Only: –")
-        self.lbl_and_ensemble = QLabel("AND Ensemble: –")
-        self.lbl_ma_only.setVisible(False)
-        self.lbl_and_ensemble.setVisible(False)
-        model_box.setLayout(g)
-
+        
         # Diagnostika degradace modelu
         degradation_box = QGroupBox("📊 Diagnostika degradace modelu")
         deg_layout = QVBoxLayout()
         self.degradation_console = QPlainTextEdit()
         self.degradation_console.setReadOnly(True)
-        self.degradation_console.setMinimumHeight(210)
-        self.degradation_console.setStyleSheet("font-family: Consolas, 'Courier New', monospace;")
+        self.degradation_console.setMinimumHeight(220)
+        self.degradation_console.setMaximumHeight(320)
         self.degradation_console.setPlainText("(Žádný model načten)")
         deg_layout.addWidget(self.degradation_console)
         degradation_box.setLayout(deg_layout)
@@ -1278,7 +1529,7 @@ class LiveBotWidget(QWidget):
         log_box = QGroupBox("Log")
         lv = QVBoxLayout()
         self.console = QPlainTextEdit(); self.console.setReadOnly(True)
-        self.console.setMinimumHeight(120)
+        self.console.setCenterOnScroll(False)
         lv.addWidget(self.console)
         log_box.setLayout(lv)
 
@@ -1289,7 +1540,6 @@ class LiveBotWidget(QWidget):
         self.tbl_trades.setColumnCount(5)
         self.tbl_trades.setHorizontalHeaderLabels(["Čas", "Směr", "Vstup", "Výstup", "PnL"])
         self.tbl_trades.horizontalHeader().setStretchLastSection(True)
-        self.tbl_trades.setMinimumHeight(120)
         tv.addWidget(self.tbl_trades)
         trades_box.setLayout(tv)
 
@@ -1300,9 +1550,10 @@ class LiveBotWidget(QWidget):
         left = QVBoxLayout()
         left.addWidget(status_box)
         left.addWidget(session_box)
+        left.addWidget(ibkr_box)
         left.addWidget(tv_auth_box)
-        left.addWidget(model_box)
-        left.addWidget(degradation_box, 3)
+        left.addWidget(model_panel)
+        left.addWidget(degradation_box)
         left.addWidget(log_box, 1)
         left.addWidget(trades_box, 1)
 
@@ -1327,6 +1578,8 @@ class LiveBotWidget(QWidget):
     def _wire_basic_logic(self) -> None:
         self.btn_model.clicked.connect(self._on_choose_model)
         self.cmb_interval.currentTextChanged.connect(self._on_interval_changed)
+        self.cmb_mode.currentTextChanged.connect(self._on_mode_changed)
+        self.cmb_execution_mode.currentIndexChanged.connect(self._on_execution_mode_changed)
         self.btn_start.clicked.connect(self._on_toggle_start)
         self.btn_reset.clicked.connect(self._on_reset_tab)
         self.btn_trade.clicked.connect(self._on_toggle_trading)
@@ -1340,33 +1593,101 @@ class LiveBotWidget(QWidget):
     def _set_session_running_ui(self, running: bool) -> None:
         self.btn_start.setText("Start (RESET)" if running else "Start (SET)")
 
-    @Slot()
-    def _on_toggle_start(self) -> None:
-        if self.worker is not None or self._bootstrap_worker is not None:
-            self._on_stop()
+    def _sync_live_mode_label(self) -> None:
+        if getattr(self, "live_controller", None) is not None:
+            self._refresh_controller_status()
+            self._sync_live_state_from_controller()
             return
-        self._on_start()
+        if self.warm is not None:
+            self.lbl_mode.setText("Mode: LIVE" if self.warm.state == "LIVE" else "Mode: WARM-UP")
+            return
+        self.lbl_mode.setText("Mode: OBSERVE")
 
-    @Slot()
-    def _on_reset_tab(self) -> None:
-        self._append_log("[INFO] Resetuji Tab 5 do vychoziho stavu.")
-        self._stop_worker(wait_ms=1500, allow_background=True)
-        self._reset_runtime_state(full_reset=True)
-        self._set_session_running_ui(False)
+    def _sync_live_state_from_controller(self) -> None:
+        controller = getattr(self, "live_controller", None)
+        if controller is None:
+            self._set_trade_button_text()
+            return
 
-    @Slot(bool)
-    def _on_toggle_trading(self, enabled: bool) -> None:
-        self._trading_enabled = bool(enabled)
-        self.btn_trade.setText("Obchodovat: ON" if self._trading_enabled else "Obchodovat: OFF")
-        if not self._trading_enabled:
-            self._trade_executor = TradeExecutor()
-            self._sync_live_state_from_executor()
-        self._append_log(
-            "[TRADE] Obchodni exekuce signalu je zapnuta." if self._trading_enabled
-            else "[TRADE] Obchodni exekuce signalu je vypnuta."
+        status = controller.status
+        runtime = status.runtime_state
+        position = runtime.position
+        side = str(position.side or "FLAT").upper()
+
+        self._trading_enabled = bool(runtime.armed)
+        self.btn_trade.blockSignals(True)
+        self.btn_trade.setChecked(self._trading_enabled)
+        self.btn_trade.blockSignals(False)
+        self._set_trade_button_text()
+
+        if side == "LONG":
+            self._live_pos = 1
+            self._live_entry_px = float(position.avg_price) if position.avg_price is not None else None
+            self._open_trade = {
+                "direction": "LONG",
+                "entry_time": str(position.opened_at or "")[:19],
+                "entry_price": float(position.avg_price or 0.0),
+            }
+        elif side == "SHORT":
+            self._live_pos = -1
+            self._live_entry_px = float(position.avg_price) if position.avg_price is not None else None
+            self._open_trade = {
+                "direction": "SHORT",
+                "entry_time": str(position.opened_at or "")[:19],
+                "entry_price": float(position.avg_price or 0.0),
+            }
+        else:
+            self._live_pos = 0
+            self._live_entry_px = None
+            self._open_trade = None
+
+        self._trade_executor = TradeExecutor(
+            TradeState(
+                position=int(self._live_pos),
+                entry_price=self._live_entry_px,
+                entry_time=(position.opened_at if self._live_pos != 0 else None),
+            )
         )
 
-    def _reset_runtime_state(self, *, full_reset: bool = False) -> None:
+        broker_status = controller.broker_status
+        if broker_status.enabled and not broker_status.connected:
+            self.lbl_mode.setText("Mode: BLOCKED (BROKER_OFFLINE)")
+        else:
+            self.lbl_mode.setText(f"Mode: {status.mode}")
+
+    def _refresh_trades_from_controller(self) -> None:
+        controller = getattr(self, "live_controller", None)
+        if controller is None or not hasattr(self, "tbl_trades"):
+            return
+        rows = controller.list_closed_trades()
+        self.tbl_trades.setRowCount(0)
+        self._trades = []
+        for row in rows:
+            entry_time = str(row.get("entry_time") or "")[:19]
+            direction = str(row.get("direction") or "")
+            entry_price = float(row.get("entry_price", 0.0) or 0.0)
+            exit_time = str(row.get("exit_time") or "")[:19]
+            exit_price = float(row.get("exit_price", 0.0) or 0.0)
+            pnl = float(row.get("pnl", 0.0) or 0.0)
+            self._add_trade_to_table(entry_time, direction, entry_price, exit_time, exit_price, pnl)
+            self._trades.append(
+                {
+                    "entry_time": entry_time,
+                    "direction": direction,
+                    "entry_price": entry_price,
+                    "exit_time": exit_time,
+                    "exit_price": exit_price,
+                    "pnl": pnl,
+                }
+            )
+
+    def _reset_runtime_state(
+        self,
+        *,
+        full_reset: bool = False,
+        reset_controller: bool = False,
+        clear_persistence: bool = False,
+    ) -> None:
         self.warm = None
         self._pending_bar_payloads.clear()
         self._bar_refresh_scheduled = False
@@ -1374,9 +1695,14 @@ class LiveBotWidget(QWidget):
         self._bar_index.clear()
         self.live_df = self.live_df.iloc[0:0].copy()
         self._bootstrap_request_id += 1
+        self._warmup_request_id += 1
         self._degradation_request_id += 1
+        self._bootstrap_done = True
+        self._warmup_done = True
         self._trade_executor = TradeExecutor()
-        self._sync_live_state_from_executor()
+        self._live_pos = 0
+        self._live_entry_px = None
+        self._open_trade = None
         self._trades.clear()
         self.tbl_trades.setRowCount(0)
         self._prediction_buffer = []
@@ -1390,10 +1716,16 @@ class LiveBotWidget(QWidget):
         self._last_alert_bar_key = None
         self._last_alert_bar_ns = None
         self._last_signal = None
-        self.lbl_mode.setText("Mode: WARM-UP")
         self.lbl_ib_status.setText("TV: Disconnected")
         self.lbl_fresh.setText("Freshness: --")
         self.degradation_console.setPlainText("(Žádný model načten)")
+
+        if reset_controller and getattr(self, "live_controller", None) is not None:
+            try:
+                self.live_controller.reset_session(clear_persistence=clear_persistence)
+            except Exception as exc:
+                self._append_log(f"[WARN] Reset live controlleru selhal: {exc}")
+
         if full_reset:
             self.le_model_path.setText(DEFAULT_MODEL_DIR)
             self.models = []
@@ -1403,12 +1735,86 @@ class LiveBotWidget(QWidget):
             self.user_settings = {}
             self._curr_t_short = None
             self._curr_t_long = None
-            self.btn_trade.blockSignals(True)
-            self.btn_trade.setChecked(False)
-            self.btn_trade.blockSignals(False)
-            self._trading_enabled = False
-            self.btn_trade.setText("Obchodovat: OFF")
+            self._set_execution_mode_selection("PAPER")
+
+        self._trading_enabled = False
+        self.btn_trade.blockSignals(True)
+        self.btn_trade.setChecked(False)
+        self.btn_trade.blockSignals(False)
+        self._set_trade_button_text()
         self._render_charts()
+
+        if getattr(self, "live_controller", None) is not None:
+            self._refresh_controller_status()
+            self._sync_live_state_from_controller()
+            self._refresh_trades_from_controller()
+        else:
+            self.lbl_mode.setText("Mode: OBSERVE")
+
+    @Slot()
+    def _on_toggle_start(self) -> None:
+        if self.worker is not None or self._bootstrap_worker is not None or self._warmup_worker is not None:
+            self._on_stop()
+            return
+        self._on_start()
+
+    @Slot()
+    def _on_reset_tab(self) -> None:
+        self._append_log("[INFO] Resetuji Tab 5 do vychoziho stavu.")
+        self._stop_worker(wait_ms=1500, allow_background=True)
+        self._reset_runtime_state(full_reset=True, reset_controller=True, clear_persistence=True)
+        self._set_session_running_ui(False)
+
+    @Slot(bool)
+    def _on_toggle_trading(self, enabled: bool) -> None:
+        controller = getattr(self, "live_controller", None)
+        try:
+            if controller is not None:
+                if enabled:
+                    controller.arm_trading(actor="tab5_gui", reason="manual_arm")
+                else:
+                    controller.disarm_trading(actor="tab5_gui", reason="manual_disarm")
+        except Exception as exc:
+            self._append_log(f"[WARN] Zmena trading arm stavu selhala: {exc}")
+            enabled = False
+
+        self._trading_enabled = bool(enabled)
+        self.btn_trade.blockSignals(True)
+        self.btn_trade.setChecked(self._trading_enabled)
+        self.btn_trade.blockSignals(False)
+        self._set_trade_button_text()
+
+        if controller is not None:
+            self._refresh_controller_status()
+            self._sync_live_state_from_controller()
+            self._refresh_trades_from_controller()
+        else:
+            if not self._trading_enabled:
+                self._trade_executor = TradeExecutor()
+                self._sync_live_state_from_executor()
+            self.lbl_mode.setText("Mode: LIVE" if self._trading_enabled else "Mode: OBSERVE")
+
+    @Slot(int)
+    def _on_execution_mode_changed(self, index: int) -> None:
+        controller = getattr(self, "live_controller", None)
+        if controller is None:
+            self._set_execution_mode_selection("PAPER")
+            return
+
+        mode = self.cmb_execution_mode.itemData(int(index))
+        if mode is None:
+            mode = self.cmb_execution_mode.currentData()
+        desired_mode = str(mode or "PAPER").strip().upper() or "PAPER"
+
+        try:
+            resolved = controller.set_execution_mode(desired_mode)
+        except Exception as exc:
+            self._set_execution_mode_selection("PAPER")
+            QMessageBox.warning(self, "Execution Mode", str(exc))
+            resolved = "PAPER"
+
+        self._set_execution_mode_selection(resolved)
+        self._refresh_controller_status()
 
     # ---------- Model (ensemble) ----------
     def _load_models(self) -> bool:
@@ -1679,28 +2085,8 @@ class LiveBotWidget(QWidget):
                 t_long = _sf(user.get("ternary_threshold_long_eval"))
         return t_short, t_long
 
-    @staticmethod
-    def _format_diag_value(value: Any, *, decimals: int = 4, percent: bool = False) -> str:
-        if isinstance(value, (int, float)):
-            num = float(value)
-            if np.isfinite(num):
-                if percent:
-                    return f"{num * 100:.1f}%"
-                return f"{num:.{decimals}f}"
-        return "n/a"
-
-    @staticmethod
-    def _format_diag_delta(value: Any, *, decimals: int = 4, percent: bool = False) -> str:
-        if isinstance(value, (int, float)):
-            num = float(value)
-            if np.isfinite(num):
-                if percent:
-                    return f"{num * 100:+.1f}%"
-                return f"{num:+.{decimals}f}"
-        return "n/a"
-
     def _load_user_settings_from_first_model(self) -> None:
-        """Načte user_settings z metadat prvního modelu a zobrazí je jako read-only info panel."""
+        """Načte user_settings z metadat prvního modelu a synchronizuje runtime nastavení."""
         if not self.models or not self.models[0]:
             self._append_log("[SETTINGS] ❌ Žádné modely načteny")
             self._update_settings_display({}, {})
@@ -1747,7 +2133,6 @@ class LiveBotWidget(QWidget):
     
     def _load_reference_metrics(self, metadata: dict) -> None:
         """Extrahuje referenční metriky z metadata modelu (holdout preferovaně, jinak train)."""
-        self._reference_fee_per_trade = 0.0
         if not metadata:
             msg = "❌ PRÁZDNÁ METADATA\n\nModel neobsahuje žádná metadata.\nOvěřte, že existuje soubor *_meta.json vedle .pkl souboru."
             self.degradation_console.setPlainText(msg)
@@ -1800,54 +2185,210 @@ class LiveBotWidget(QWidget):
             self.degradation_console.setPlainText(msg)
             self._append_log("[DEGRADATION] ❌ Reference metriky nenalezeny")
             return
-
-        try:
-            rank_single = metadata.get("tab5_holdout_ranking") if isinstance(metadata, dict) else None
-            if isinstance(rank_single, dict):
-                fee = rank_single.get("fee_per_trade")
-                if isinstance(fee, (int, float)) and np.isfinite(float(fee)):
-                    self._reference_fee_per_trade = float(fee)
-            rank_by_policy = metadata.get("tab5_holdout_ranking_by_policy") if isinstance(metadata, dict) else None
-            if isinstance(rank_by_policy, dict):
-                for payload in rank_by_policy.values():
-                    if not isinstance(payload, dict):
-                        continue
-                    fee = payload.get("fee_per_trade")
-                    if isinstance(fee, (int, float)) and np.isfinite(float(fee)):
-                        self._reference_fee_per_trade = float(fee)
-                        break
-        except Exception:
-            self._reference_fee_per_trade = 0.0
         
         # Zobraz info o referenčních metrikách
         ref_f1 = self.reference_metrics.get("f1", "?")
         ref_acc = self.reference_metrics.get("accuracy", "?")
         ref_sharpe = self.reference_metrics.get("sharpe", "?")
         ref_profit = self.reference_metrics.get("profit_net", "?")
-        ref_max_dd = self.reference_metrics.get("max_drawdown_net") or self.reference_metrics.get("max_drawdown")
-        ref_trades = self.reference_metrics.get("num_trades")
-        ref_stability = self.reference_metrics.get("signal_stability")
         
-        sharpe_str = self._format_diag_value(ref_sharpe)
-        profit_str = self._format_diag_value(ref_profit, decimals=2)
-        max_dd_str = self._format_diag_value(abs(float(ref_max_dd)) if isinstance(ref_max_dd, (int, float)) else ref_max_dd, decimals=2)
-        trades_str = self._format_diag_value(ref_trades, decimals=0)
-        stability_str = self._format_diag_value(ref_stability, percent=True)
+        # Formátuj hodnoty (nelze použít podmínky přímo v format specifieru)
+        acc_str = f"{ref_acc:.4f}" if isinstance(ref_acc, (int, float)) else str(ref_acc)
+        f1_str = f"{ref_f1:.4f}" if isinstance(ref_f1, (int, float)) else str(ref_f1)
+        sharpe_str = f"{ref_sharpe:.4f}" if isinstance(ref_sharpe, (int, float)) else str(ref_sharpe)
+        profit_str = f"{ref_profit:.2f}" if isinstance(ref_profit, (int, float)) else str(ref_profit)
         
         info_text = (
-            f"Referencni metriky ({ref_source})\n"
-            f"{'Sharpe net':<18} {sharpe_str}\n"
-            f"{'Profit net':<18} {profit_str}\n"
-            f"{'Max drawdown':<18} {max_dd_str}\n"
-            f"{'Pocet obchodu':<18} {trades_str}\n"
-            f"{'Signal stability':<18} {stability_str}\n"
-            f"{'Fee / trade':<18} {self._reference_fee_per_trade:.4f}\n"
-            f"\nCekam na {self.degradation_window_size} baru pro live diagnostiku..."
+            f"📌 Referenční metriky ({ref_source}):\n"
+            f"   Accuracy: {acc_str}\n"
+            f"   F1: {f1_str}\n"
+            f"   Sharpe: {sharpe_str}\n"
+            f"   Profit Net: {profit_str}\n"
+            f"\n⏳ Čekám na {self.degradation_window_size} barů pro live diagnostiku..."
         )
         self.degradation_console.setPlainText(info_text)
     
+    def _preload_historical_data_for_degradation(self) -> None:
+        """
+        Načte historická data z TradingView a naplní buffery pro degradation diagnostiku.
+        Umožní okamžitou diagnostiku bez čekání na 500+ nových barů.
+        """
+        if not self.models:
+            self._append_log("[DEGRADATION] Přeskakuji preload - žádné modely načteny")
+            self.degradation_console.setPlainText("(Načtěte model pro spuštění diagnostiky)")
+            return
+        
+        if not self.reference_metrics:
+            self._append_log("[DEGRADATION] Přeskakuji preload - žádné referenční metriky")
+            self.degradation_console.setPlainText("(Model neobsahuje referenční metriky)")
+            return
+        
+        try:
+            from pathlib import Path
+            
+            self._append_log("[DEGRADATION] 🔄 Načítám historická data pro okamžitou diagnostiku...")
+            self.degradation_console.setPlainText("⏳ Načítám historická data z TradingView...\nMůže trvat několik sekund...")
+            
+            # Načti potřebný počet barů (+ extra pro výpočet feature s rolling window)
+            bars_needed = self.degradation_window_size + 200  # +200 pro MA/ATR warmup
+            
+            # Použij aktuální symbol/exchange z konfigurace (nebo z modelu)
+            symbol = (self.ed_symbol.text() or "GOLD").strip()
+            exchange = (self.ed_expiry.text() or "TVC").strip()
+            timeframe = self.cmb_interval.currentText().replace("mins", "min")
+            
+            self._append_log(f"[DEGRADATION] Symbol={symbol}, Exchange={exchange}, TF={timeframe}, Bars={bars_needed}")
+            
+            from ibkr_trading_bot.core.datasource.tradingview_client import TradingViewClient
+            tv = TradingViewClient(
+                username=os.getenv("TV_USERNAME"),
+                password=os.getenv("TV_PASSWORD")
+            )
+            
+            self._append_log("[DEGRADATION] TradingView client vytvořen, stahuji data...")
+            df = tv.get_history(symbol, exchange, timeframe, limit=bars_needed)
+            
+            if df is None or df.empty:
+                msg = "❌ Nelze načíst historická data z TradingView"
+                self._append_log(f"[WARN] {msg}")
+                self.degradation_console.setPlainText(f"{msg}\nDiagnostika bude dostupná po načtení {self.degradation_window_size} live barů.")
+                return
+            
+            self._append_log(f"[DEGRADATION] Staženo {len(df)} historických barů, připravuji data...")
+            
+            # Připrav data
+            df = df.copy()
+            df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+            df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+            
+            self._append_log(f"[DEGRADATION] Data připravena ({len(df)} barů po cleanupu), počítám features...")
+            
+            # Připrav index podle očekávání feature_engineering (timestamp v UTC)
+            df = df.copy()
+            df["timestamp"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+            df = df.dropna(subset=["timestamp"]).set_index("timestamp")
+            df.index.name = "timestamp"
+            
+            # Vypočítej features pomocí compute_all_features
+            from ibkr_trading_bot.features.feature_engineering import compute_all_features
+            
+            df_feats = compute_all_features(df)
+            
+            if df_feats.empty:
+                msg = "❌ Feature calculation selhala"
+                self._append_log(f"[WARN] {msg}")
+                self.degradation_console.setPlainText(f"{msg}\nDiagnostika bude dostupná po načtení {self.degradation_window_size} live barů.")
+                return
+            
+            self._append_log(f"[DEGRADATION] Features vypočítány ({len(df_feats)} barů, {len(df_feats.columns)} sloupců)")
+            
+            # Vezmi posledních degradation_window_size barů
+            df_recent = df_feats.tail(self.degradation_window_size).copy().reset_index(drop=True)
+            
+            self._append_log(f"[DEGRADATION] Používám posledních {len(df_recent)} barů, spouštím predikce...")
+            
+            # Vypočítej predikce modelu pro CELÝ DataFrame najednou (efektivnější a bez feature warnings)
+            model = self.models[0]["predictor"]
+            exp_feats = self.models[0].get("exp_feats")
+            
+            # Připrav celý DataFrame pro model
+            X_prepared = df_recent
+            if exp_feats:
+                X_prepared = self._prepare_X_for_model(df_recent, exp_feats)
+            
+            try:
+                # Vypočítej predikce pro všechny řádky najednou
+                label_map = self.models[0].get("label_map") or _infer_label_map_from_classes(getattr(model, "classes_", None))
+                
+                # Batch prediction - rychlejší a bez warningů
+                X_pred = _align_X_for_model(model, X_prepared)
+                proba_all = _predict_proba_safely(model, X_pred)
+                t_short = float(self.models[0].get("t_short", 0.5))
+                t_long = float(self.models[0].get("t_long", 0.5))
+                
+                # Určení indexů LONG a SHORT v classes_
+                classes = getattr(model, "classes_", None)
+                if classes is not None:
+                    # Textové classes
+                    if any(isinstance(c, str) for c in classes):
+                        lut = {str(c).upper(): i for i, c in enumerate(classes)}
+                        idx_long = lut.get("LONG")
+                        idx_short = lut.get("SHORT")
+                    # Numerické classes s label_map
+                    else:
+                        idx_long = next((i for i, c in enumerate(classes)
+                                       if str(label_map.get(int(c), "")).upper() == "LONG"), None)
+                        idx_short = next((i for i, c in enumerate(classes)
+                                        if str(label_map.get(int(c), "")).upper() == "SHORT"), None)
+                else:
+                    # Fallback: předpokládej binární klasifikaci
+                    idx_long = 1
+                    idx_short = 0
+                
+                # Konverze proba → predictions (-1/0/+1)
+                predictions = []
+                for proba_row in proba_all:
+                    pL = float(proba_row[idx_long]) if idx_long is not None else 0.5
+                    pS = float(proba_row[idx_short]) if idx_short is not None else 0.5
+                    
+                    if pL >= t_long and pL >= pS:
+                        predictions.append(1)  # LONG
+                    elif pS >= t_short and pS > pL:
+                        predictions.append(-1)  # SHORT
+                    else:
+                        predictions.append(0)  # NEUTRAL
+                
+                prices = df_recent["close"].astype(float).tolist()
+                timestamps = df_recent["time"].tolist()
+                
+                self._append_log(f"[DEGRADATION] Predikce dokončeny: {len(predictions)} barů zpracováno")
+                
+            except Exception as e:
+                self._append_log(f"[ERROR] Batch predikce selhala: {e}")
+                import traceback
+                self._append_log(f"[DEBUG] {traceback.format_exc()}")
+                
+                # Fallback: prázdné buffery
+                predictions = [0] * len(df_recent)
+                prices = df_recent["close"].astype(float).tolist()
+                timestamps = df_recent["time"].tolist()
+            
+            # Naplň buffery
+            self._prediction_buffer = predictions
+            self._price_buffer = prices
+            self._y_true_buffer = [None] * len(predictions)
+            
+            # Označ všechny timestampy jako trackované
+            self._tracked_timestamps = {str(ts) for ts in timestamps}
+            
+            self._append_log(f"[DEGRADATION] ✅ Načteno {len(predictions)} historických barů")
+            
+            # Spusť okamžitou diagnostiku
+            if len(self._prediction_buffer) >= self.degradation_window_size:
+                self._update_degradation_diagnostics()
+                self._last_degradation_check = len(self._prediction_buffer)
+                self._append_log("[DEGRADATION] ✅ Okamžitá diagnostika spuštěna")
+            else:
+                msg = f"📊 Načteno {len(self._prediction_buffer)} barů (potřeba {self.degradation_window_size})"
+                self._append_log(f"[DEGRADATION] {msg}")
+                self.degradation_console.setPlainText(msg)
+            
+        except Exception as e:
+            error_msg = f"❌ Preload historických dat selhal: {e}"
+            self._append_log(f"[ERROR] {error_msg}")
+            import traceback
+            traceback_str = traceback.format_exc()
+            self._append_log(f"[DEBUG] {traceback_str}")
+            
+            # Zobraz chybu i v degradation konzoli pro uživatele
+            self.degradation_console.setPlainText(
+                f"{error_msg}\n\n"
+                f"Detail:\n{traceback_str[:500]}\n\n"
+                f"Diagnostika bude dostupná po načtení {self.degradation_window_size} live barů."
+            )
+    
     def _update_settings_display(self, user_settings: dict, metadata: dict | None = None) -> None:
-        """Aktualizuje display panelu s nastavením modelu (read-only) a uloží do self.user_settings."""
+        """Uloží user_settings a synchronizuje runtime nastavení TAB 5 s metadaty modelu."""
         self.user_settings = user_settings  # uložit pro použití v predikci
 
         t_short, t_long = self._extract_ternary_thresholds_from_metadata(metadata or {})
@@ -1861,12 +2402,6 @@ class LiveBotWidget(QWidget):
 
         t_short_disp = f"{float(t_short):.3f}" if isinstance(t_short, (int, float)) else "–"
         t_long_disp = f"{float(t_long):.3f}" if isinstance(t_long, (int, float)) else "–"
-        self.lbl_decision_threshold.setText(f"T-short/T-long: {t_short_disp} / {t_long_disp}")
-        self.lbl_entry_threshold.setText(f"Entry Threshold: {entry_threshold}")
-        self.lbl_exit_threshold.setText(f"Exit Threshold: {exit_threshold}")
-        self.lbl_ma_only.setText(f"MA-Only: {'✓ zapnuto' if use_ma_only else '✗ vypnuto'}")
-        self.lbl_and_ensemble.setText(f"AND Ensemble: {'✓ AND' if use_and_ensemble else '✗ VOTE'}")
-
         # Synchronizuj runtime chování Tab 5 s nastavením načteným z Tab 3
         self.config.use_ma_only = use_ma_only
         self.config.use_and_ensemble = use_and_ensemble
@@ -2042,55 +2577,69 @@ class LiveBotWidget(QWidget):
     def _on_start(self):
         if not self._load_models():
             return
-        # New Start session should not inherit stale bars/snapshot from previous runs.
-        self._reset_runtime_state(full_reset=False)
-        self._set_session_running_ui(True)
+
+        self.config.symbol = (self.ed_symbol.text() or "GOLD").strip()
+        self.config.exchange = (self.ed_expiry.text() or "TVC").strip()
+        self.config.bar_size = self.cmb_interval.currentText()
         self._apply_tf_presets()
-        self._start_worker()
+        self._sync_ib_config_from_ui(rebuild_controller=True, run_startup_check=False)
+        self._reset_runtime_state(full_reset=False, reset_controller=True, clear_persistence=True)
+
+        if self.live_controller is not None and self.live_controller.broker_status.enabled:
+            try:
+                self.live_controller.assert_paper_broker_ready()
+            except Exception as exc:
+                message = f"Paper broker není dostupný.\n\n{exc}"
+                error_text = str(exc).lower()
+                if "already in use" in error_text or "client id" in error_text:
+                    message += (
+                        "\n\nIBKR teď automaticky zkouší několik vyšších Client ID. "
+                        "Pokud problém trvá, změň Client ID v paper nastavení (např. na 2)."
+                    )
+                QMessageBox.warning(self, "IBKR Paper Startup Check", message)
+                self._refresh_controller_status(run_startup_check=True)
+                self._sync_live_state_from_controller()
+                self._set_session_running_ui(False)
+                return
+
+        if self.live_controller is not None:
+            try:
+                self.live_controller.start_session()
+            except Exception as exc:
+                self._append_log(f"[WARN] Start live controlleru selhal: {exc}")
+
+        self._set_session_running_ui(True)
         self._append_log("[INFO] Start sezení…")
         self._append_log(f"[MODE] MA-only={self.config.use_ma_only} | AND={self.config.use_and_ensemble}")
         self._append_log(
             f"[INFO] Cekam na uzavreni nove svicky ({self.config.bar_size}). "
             "Mimo obchodni hodiny muze byt delsi pauza bez noveho baru."
         )
-
-        try:
-            adapter = _WarmAdapter(self)
-            # Použij entry_threshold z user_settings (náklad z Tab 3), nebo fallback
-            entry_thr = self.user_settings.get("entry_threshold", self.config.sensitivity)
-            self.warm = LiveWarmupService(
-                base_service=adapter,
-                config=WarmupConfig(
-                    threshold=float(entry_thr),
-                    warmup_bars=500,
-                    min_sim_trades=3,
-                    start_sharpe=0.00,
-                    max_dd=25.0,
-                    diag_first_n=220,
-                    force_live_after_warmup=True,
-                ),
-            )
-            cfg = getattr(self.warm, "config", None)
-            self._append_log(f"[WARMUP-CONFIG] {cfg if cfg is not None else 'MISSING'}")
-            self.warm.start(self.config.symbol, self.config.exchange, self.config.bar_size)
-            self._seed_snapshot_from_warmup_history(adapter)
-            self.lbl_mode.setText("Mode: LIVE" if self.warm.state == "LIVE" else "Mode: WARM-UP")
-        except Exception as e:
-            self._append_log(f"[WARN] Warm-up inicializace selhala: {e}")
+        self._start_warmup_worker()
 
     @Slot()
     def _on_stop(self) -> None:
         self._append_log("[INFO] Stop sezení.")
         self._stop_worker()
         self._set_session_running_ui(False)
+        if getattr(self, "live_controller", None) is not None:
+            try:
+                self.live_controller.stop_session()
+            except Exception as exc:
+                self._append_log(f"[WARN] Stop live controlleru selhal: {exc}")
+            self._refresh_controller_status()
+            self._sync_live_state_from_controller()
+
+    @Slot(str)
+    def _on_mode_changed(self, mode: str) -> None:
+        self.config.mode = mode
 
     @Slot(float)
     def _on_sensitivity_changed(self, val: float) -> None:
         self._append_log(f"[INFO] Citlivost (min conf) → {val:.2f} (přepočet signálů)")
         try:
             self._rescore_all()
-            if self.warm is not None:
-                self.lbl_mode.setText("Mode: LIVE" if self.warm.state == "LIVE" else "Mode: WARM-UP")
+            self._sync_live_mode_label()
         except Exception as e:
             self._append_log(f"[WARN] Re-score selhal: {e}")
         self._render_charts()
@@ -2114,6 +2663,91 @@ class LiveBotWidget(QWidget):
         self._render_charts()
 
     # ---------- Worker reakce ----------
+    @Slot(dict)
+    def _on_bar_closed(self, bar: dict) -> None:
+        ts_raw = bar.get("time")
+        close = float(bar.get("close", 0.0))
+        self._append_log(f"[BAR] {ts_raw} close={close}")
+
+        ts = pd.to_datetime(ts_raw, utc=True, errors="coerce")
+        if pd.isna(ts):
+            return
+        key = int(ts.value)
+        payload = {
+            "time": ts,
+            "open":  float(bar.get("open",  np.nan)),
+            "high":  float(bar.get("high",  np.nan)),
+            "low":   float(bar.get("low",   np.nan)),
+            "close": close,
+            "volume": float(bar.get("volume", 0) or 0),
+        }
+        idx = self._bar_index.get(key)
+        if idx is None:
+            self._bar_index[key] = len(self._bars)
+            self._bars.append(payload)
+        else:
+            self._bars[idx] = payload
+
+        self._bars.sort(key=lambda item: pd.to_datetime(item.get("time"), utc=True, errors="coerce"))
+        self._bar_index = {int(pd.to_datetime(item["time"]).value): i for i, item in enumerate(self._bars)}
+
+        if len(self._bars) > self.config.max_bars_buffer:
+            self._bars = self._bars[-self.config.max_bars_buffer:]
+            self._bar_index = {int(pd.to_datetime(x["time"]).value): i for i, x in enumerate(self._bars)}
+
+        row = {
+            "timestamp": ts,
+            "open": payload["open"],
+            "high": payload["high"],
+            "low":  payload["low"],
+            "close": payload["close"],
+            "volume": payload["volume"],
+        }
+        self.live_df = pd.concat([self.live_df, pd.DataFrame([row])], ignore_index=True)
+        self.live_df.dropna(subset=["timestamp"], inplace=True)
+        self.live_df.drop_duplicates(subset=["timestamp"], keep="last", inplace=True)
+        self.live_df.sort_values("timestamp", inplace=True)
+        self.live_df.reset_index(drop=True, inplace=True)
+        
+        # Udržuj VĚTŠÍ buffer (700 barů) pro rolling indicators - neřezat na max_bars_buffer!
+        # Display se ořeže až při rendering
+        max_live_buffer = max(700, self.config.max_bars_buffer + 400)  # +400 pro rolling warmup
+        if len(self.live_df) > max_live_buffer:
+            self.live_df = self.live_df.tail(max_live_buffer).reset_index(drop=True)
+
+        try:
+            if self.warm is not None:
+                self.warm.on_new_bar(payload)
+                self._sync_live_mode_label()
+            self._rescore_all()
+            self._maybe_alert_flip_on_last_bar()
+        except Exception as e:
+            self._append_log(f"[WARN] Re-score selhal: {e}")
+
+        self._last_arrival_utc = pd.Timestamp.now(tz='UTC')
+        self._update_freshness()
+        self._render_charts()
+
+        # email flip alert
+        try:
+            if self.config.alert_email_enabled and self._bars:
+                last = self._bars[-1]
+                sig = last.get("signal")
+                if sig in ("LONG", "SHORT"):
+                    bar_key = int(pd.to_datetime(last["time"]).value)
+                    if self._last_alert_bar_key is None or bar_key > self._last_alert_bar_key:
+                        prev = self._last_alert_sig
+                        if prev in ("LONG", "SHORT") and prev != sig:
+                            subj, body = self._format_flip_email(prev, sig, last["time"], float(last.get("close", float("nan"))))
+                            for addr in (self.config.alert_email_to or "").split(","):
+                                addr = addr.strip()
+                                if addr:
+                                    self._send_email_async(addr, subj, body)
+                        self._last_alert_sig = sig
+                        self._last_alert_bar_key = bar_key
+        except Exception:
+            pass
+
     @Slot(str)
     def _on_ib_status(self, status: str) -> None:
         status_text = str(status or "").strip() or "Unknown"
@@ -2350,6 +2984,7 @@ class LiveBotWidget(QWidget):
 
         # Ensemble AND (volitelně MA ∧ L1_AND)
         use_ma_and = self.config.use_and_ensemble
+        replay_live_pos = 0
 
         n_mapped = n_shown = n_long = n_short = 0
         n_none = 0
@@ -2380,7 +3015,7 @@ class LiveBotWidget(QWidget):
             final = apply_live_hysteresis(
                 proposal,
                 conf_min,
-                self._live_pos,
+                replay_live_pos,
                 self._curr_entry_thr,
                 self._curr_exit_thr,
             )
@@ -2394,6 +3029,13 @@ class LiveBotWidget(QWidget):
             self._bars[idx]["proba"]  = proba
             self._bars[idx]["layers"] = layers
 
+            if final == "LONG":
+                replay_live_pos = 1
+            elif final == "SHORT":
+                replay_live_pos = -1
+            else:
+                replay_live_pos = 0
+
             n_mapped += 1
             if final == "LONG":  n_long += 1; n_shown += 1
             elif final == "SHORT":
@@ -2404,8 +3046,7 @@ class LiveBotWidget(QWidget):
 
         # Sleduj obchody po všech signálech
         try:
-            if self._trading_enabled:
-                self._update_position_and_trades(raw)
+            self._update_position_and_trades(raw)
         except Exception as e:
             self._append_log(f"[WARN] Sledování obchodů selhalo: {e}")
 
@@ -2581,35 +3222,27 @@ class LiveBotWidget(QWidget):
             # Vezmi poslední N barů pro recent window
             recent_preds = np.array(self._prediction_buffer[-self.degradation_window_size:])
             recent_prices = np.array(self._price_buffer[-self.degradation_window_size:])
-            recent_y_true_raw = list(self._y_true_buffer[-self.degradation_window_size:])
-            has_ground_truth = bool(recent_y_true_raw) and all(
-                (v is not None and np.isfinite(float(v))) for v in recent_y_true_raw
-            )
             
             # Importuj calculate_metrics z utils
             from ibkr_trading_bot.utils.metrics import calculate_metrics
             
-            # Bez ground truth neumíme validně porovnat accuracy/F1; držíme je mimo diagnostiku.
-            y_true_eval = np.array(recent_y_true_raw, dtype=float) if has_ground_truth else np.zeros(len(recent_preds))
+            # V live režimu nemáme y_true → počítáme jen trading metriky
+            # Vytvoř dummy y_true (všechny 0) protože calculate_metrics to vyžaduje
+            y_true_dummy = np.zeros(len(recent_preds))
             
             # Vytvoř DataFrame s cenami
             df_recent = pd.DataFrame({"close": recent_prices})
             
             # Vypočítej metriky na recent window
             recent_metrics = calculate_metrics(
-                y_true=y_true_eval,
+                y_true=y_true_dummy,
                 y_pred=recent_preds,
                 df=df_recent,
-                fee_per_trade=float(getattr(self, "_reference_fee_per_trade", 0.0) or 0.0),
+                fee_per_trade=0.0,
                 slippage_bps=0.0,
                 rolling_window=50,
                 annualize_sharpe=False
             )
-
-            if not has_ground_truth:
-                for key in ("accuracy", "f1", "precision", "recall", "accuracy_binary", "f1_binary"):
-                    recent_metrics.pop(key, None)
-            recent_metrics["_classification_metrics_valid"] = bool(has_ground_truth)
             
             self.live_metrics_recent = recent_metrics
             
@@ -2634,57 +3267,49 @@ class LiveBotWidget(QWidget):
         
         ref_profit = ref.get("profit_net", 0.0)
         live_profit = live.get("profit_net", 0.0)
-
-        ref_max_dd_raw = ref.get("max_drawdown_net")
-        if not isinstance(ref_max_dd_raw, (int, float)):
-            ref_max_dd_raw = ref.get("max_drawdown")
-        live_max_dd_raw = live.get("max_drawdown_net")
-        if not isinstance(live_max_dd_raw, (int, float)):
-            live_max_dd_raw = live.get("max_drawdown")
-
-        ref_max_dd = abs(float(ref_max_dd_raw)) if isinstance(ref_max_dd_raw, (int, float)) else None
-        live_max_dd = abs(float(live_max_dd_raw)) if isinstance(live_max_dd_raw, (int, float)) else None
-
-        ref_trades = ref.get("num_trades")
-        live_trades = live.get("num_trades")
-
-        ref_stability = ref.get("signal_stability")
-        live_stability = live.get("signal_stability")
-
-        classification_valid = bool(live.get("_classification_metrics_valid", False))
-        ref_acc = ref.get("accuracy") if classification_valid else None
-        ref_f1 = ref.get("f1") if classification_valid else None
+        
+        ref_acc = ref.get("accuracy", 0.0) if ref.get("accuracy", 0.0) else 0.0
+        live_acc = live.get("accuracy", 0.0) if live.get("accuracy", 0.0) else 0.0
+        
+        ref_f1 = ref.get("f1", 0.0) if ref.get("f1", 0.0) else 0.0
+        live_f1 = live.get("f1", 0.0) if live.get("f1", 0.0) else 0.0
         
         # Vypočítej rozdíly
         diff_sharpe = float(live_sharpe) - float(ref_sharpe) if isinstance(live_sharpe, (int, float)) and isinstance(ref_sharpe, (int, float)) else 0.0
         diff_profit = float(live_profit) - float(ref_profit) if isinstance(live_profit, (int, float)) and isinstance(ref_profit, (int, float)) else 0.0
-        diff_f1 = None
-        if classification_valid:
-            live_f1 = live.get("f1")
-            if isinstance(live_f1, (int, float)) and isinstance(ref_f1, (int, float)):
-                diff_f1 = float(live_f1) - float(ref_f1)
-
-        diff_max_dd = live_max_dd - ref_max_dd if isinstance(live_max_dd, (int, float)) and isinstance(ref_max_dd, (int, float)) else None
-        diff_trades = int(live_trades) - int(ref_trades) if isinstance(live_trades, (int, float)) and isinstance(ref_trades, (int, float)) else None
-        diff_stability = float(live_stability) - float(ref_stability) if isinstance(live_stability, (int, float)) and isinstance(ref_stability, (int, float)) else None
-
-        table_header = f"{'Metrika':<18} {'Ref':>10} {'Live':>10} {'Delta':>10}"
+        diff_acc = float(live_acc) - float(ref_acc) if isinstance(live_acc, (int, float)) and isinstance(ref_acc, (int, float)) else 0.0
+        diff_f1 = float(live_f1) - float(ref_f1) if isinstance(live_f1, (int, float)) and isinstance(ref_f1, (int, float)) else 0.0
+        
+        # Formátuj hodnoty pro zobrazení (podmínky nelze dát přímo do f-string specifieru)
+        ref_sharpe_str = f"{ref_sharpe:7.4f}" if isinstance(ref_sharpe, (int, float)) else f"{str(ref_sharpe):>7}"
+        live_sharpe_str = f"{live_sharpe:7.4f}" if isinstance(live_sharpe, (int, float)) else f"{str(live_sharpe):>7}"
+        ref_profit_str = f"{ref_profit:7.2f}" if isinstance(ref_profit, (int, float)) else f"{str(ref_profit):>7}"
+        live_profit_str = f"{live_profit:7.2f}" if isinstance(live_profit, (int, float)) else f"{str(live_profit):>7}"
+        ref_acc_str = f"{ref_acc:7.4f}" if isinstance(ref_acc, (int, float)) else f"{str(ref_acc):>7}"
+        live_acc_str = f"{live_acc:7.4f}" if isinstance(live_acc, (int, float)) else f"{str(live_acc):>7}"
+        ref_f1_str = f"{ref_f1:7.4f}" if isinstance(ref_f1, (int, float)) else f"{str(ref_f1):>7}"
+        live_f1_str = f"{live_f1:7.4f}" if isinstance(live_f1, (int, float)) else f"{str(live_f1):>7}"
+        
+        # Formátuj zobrazení
         lines = [
-            "DIAGNOSTIKA DEGRADACE MODELU",
-            "",
-            table_header,
-            "-" * len(table_header),
-            f"{'Sharpe net':<18} {self._format_diag_value(ref_sharpe):>10} {self._format_diag_value(live_sharpe):>10} {self._format_diag_delta(diff_sharpe):>10}",
-            f"{'Profit net':<18} {self._format_diag_value(ref_profit, decimals=2):>10} {self._format_diag_value(live_profit, decimals=2):>10} {self._format_diag_delta(diff_profit, decimals=2):>10}",
-            f"{'Max drawdown':<18} {self._format_diag_value(ref_max_dd, decimals=2):>10} {self._format_diag_value(live_max_dd, decimals=2):>10} {self._format_diag_delta(diff_max_dd, decimals=2):>10}",
-            f"{'Pocet obchodu':<18} {self._format_diag_value(ref_trades, decimals=0):>10} {self._format_diag_value(live_trades, decimals=0):>10} {self._format_diag_delta(diff_trades, decimals=0):>10}",
-            f"{'Signal stability':<18} {self._format_diag_value(ref_stability, percent=True):>10} {self._format_diag_value(live_stability, percent=True):>10} {self._format_diag_delta(diff_stability, percent=True):>10}",
-            "",
+            "╔════════════════════════════════════════════════════════╗",
+            "║      DIAGNOSTIKA DEGRADACE MODELU                      ║",
+            "╠════════════════════════════════════════════════════════╣",
+            f"║ Sharpe (Ref):     {ref_sharpe_str}                        ║",
+            f"║ Sharpe (Live):    {live_sharpe_str}                        ║",
+            f"║ Rozdíl:           {diff_sharpe:+7.4f}                        ║",
+            "║ ─────────────────────────────────────────────────────  ║",
+            f"║ Profit (Ref):     {ref_profit_str}                        ║",
+            f"║ Profit (Live):    {live_profit_str}                        ║",
+            f"║ Rozdíl:           {diff_profit:+7.2f}                        ║",
+            "║ ─────────────────────────────────────────────────────  ║",
+            f"║ Accuracy (Ref):   {ref_acc_str}                        ║",
+            f"║ Accuracy (Live):  {live_acc_str}                        ║",
+            "║ ─────────────────────────────────────────────────────  ║",
+            f"║ F1 (Ref):         {ref_f1_str}                        ║",
+            f"║ F1 (Live):        {live_f1_str}                        ║",
+            "╠════════════════════════════════════════════════════════╣",
         ]
-
-        if not classification_valid:
-            lines.append("Poznamka: Accuracy/F1 v live nezobrazuji, protoze chybi ground truth.")
-            lines.append("")
         
         # Diagnóza degradace - OPRAVENÁ LOGIKA
         # Nejprve zkontroluj, zda reference nejsou podezřelé (špatný training)
@@ -2695,7 +3320,6 @@ class LiveBotWidget(QWidget):
         # - Sharpe < -0.5 (velmi špatná reference)
         
         ref_is_suspicious = (
-            classification_valid and
             (isinstance(ref_f1, (int, float)) and ref_f1 < 0.05) and
             (isinstance(ref_acc, (int, float)) and ref_acc >= 0.95)
         ) or (
@@ -2703,72 +3327,53 @@ class LiveBotWidget(QWidget):
         )
         
         if ref_is_suspicious:
-            lines.append("Stav: referencni metriky nejsou spolehlive.")
-            lines.append("Doporuceni: model mel uz v treninku slaby signal; live nelze cist jako degradaci.")
+            # Reference jsou špatné - diagnostika se nedá provádět
+            lines.append("║ ⚠️  UPOZORNĚNÍ: Referenční metriky nejsou spolehlivé   ║")
+            lines.append("║    Model měl špatný výkon v tréninku (F1≈0, Acc=100%)  ║")
+            lines.append("║    Live metriky nelze interpretovat jako degradaci!    ║")
+            lines.append("║    → Přetrénujte model s lepšíma daty                  ║")
         else:
+            # Reference jsou OK - normální diagnóza
+            # Logika: Porovnávej změny v Sharpe a Profitu
+            
+            # Změny v klíčových metrikách
             sharpe_improved = diff_sharpe > 0.1  # Zlepšení > 0.1
             sharpe_degraded = diff_sharpe < -0.1  # Zhoršení > 0.1
             
             profit_improved = diff_profit > 10  # Profit vzrostl o 10+
             profit_degraded = diff_profit < -10  # Profit klesl o 10+
             
-            f1_improved = isinstance(diff_f1, (int, float)) and diff_f1 > 0.1
-            f1_degraded = isinstance(diff_f1, (int, float)) and diff_f1 < -0.1
-
-            drawdown_improved = isinstance(diff_max_dd, (int, float)) and diff_max_dd < -10
-            drawdown_degraded = isinstance(diff_max_dd, (int, float)) and diff_max_dd > 10
-            stability_improved = isinstance(diff_stability, (int, float)) and diff_stability > 0.15
-            stability_degraded = isinstance(diff_stability, (int, float)) and diff_stability < -0.15
-            trade_regime_shift = isinstance(diff_trades, (int, float)) and abs(diff_trades) >= max(5, int(0.3 * float(ref_trades))) if isinstance(ref_trades, (int, float)) else False
-
-            degradations: list[str] = []
-            improvements: list[str] = []
-
-            if sharpe_degraded:
-                degradations.append("Sharpe je pod referenci")
-            elif sharpe_improved:
-                improvements.append("Sharpe je lepsi nez reference")
-
-            if profit_degraded:
-                degradations.append("profit je slabsi")
-            elif profit_improved:
-                improvements.append("profit je vyssi")
-
-            if drawdown_degraded:
-                degradations.append("drawdown narostl")
-            elif drawdown_improved:
-                improvements.append("drawdown klesl")
-
-            if stability_degraded:
-                degradations.append("signal je mene stabilni")
-            elif stability_improved:
-                improvements.append("signal je stabilnejsi")
-
-            if trade_regime_shift:
-                degradations.append("vyrazne se zmenila frekvence obchodu")
-
-            if len(degradations) >= 2:
-                lines.append("Stav: degradace modelu je pravdepodobna.")
-                lines.append("Duvody: " + "; ".join(degradations[:3]) + ".")
-                lines.append("Doporuceni: sledujte dalsi window a zvažte retraining.")
-            elif degradations:
-                lines.append("Stav: mirne zhorseni proti referenci.")
-                lines.append("Signal: " + "; ".join(degradations[:3]) + ".")
-            elif sharpe_improved or profit_improved or f1_improved or drawdown_improved or stability_improved:
-                lines.append("Stav: live vykon je lepsi nebo stabilnejsi nez reference.")
-                if improvements:
-                    lines.append("Pozitiva: " + "; ".join(improvements[:3]) + ".")
+            f1_improved = diff_f1 > 0.1
+            f1_degraded = diff_f1 < -0.1
+            
+            # Diagnóza na základě trend
+            if sharpe_degraded or profit_degraded or f1_degraded:
+                if sharpe_degraded and profit_degraded and f1_degraded:
+                    lines.append("║ ❌ DEGRADACE: Model zhoršil výkon v TŘECH metrikách  ║")
+                    lines.append("║    → Zvažte přetrénování modelu                        ║")
+                elif sharpe_degraded or profit_degraded:
+                    lines.append("║ ⚠️  MÍRNÉ ZHORŠENÍ: Live výkon pod referenční úrovní   ║")
+                    lines.append("║    → Sledujte další vývoj, zvažte retraining          ║")
+                else:
+                    lines.append("║ ⚠️  F1 POKLES: Model dává méně signálů než v tréninku  ║")
+            elif sharpe_improved or profit_improved or f1_improved:
+                lines.append("║ ✅ ZLEPŠENÍ: Live výkon je lepší než reference!         ║")
+                lines.append("║    Model se chová lépe než v tréninku                   ║")
             else:
-                lines.append("Stav: model je zatim stabilni vuci referenci.")
+                lines.append("║ ✅ STABILNÍ: Live výkon je srovnatelný s referencí      ║")
         
-        lines.append("")
-        lines.append(
-            f"Recent window: {self.degradation_window_size} baru | Celkem nasbirano: {len(self._prediction_buffer)} baru"
-        )
+        lines.append("╚════════════════════════════════════════════════════════╝")
+        lines.append(f"📊 Recent window: {self.degradation_window_size} barů | Last check: {len(self._prediction_buffer)} barů total")
         
         self.degradation_console.setPlainText("\n".join(lines))
     
     # ========== END Degradation Diagnostics ==========
+
+    def _append_log(self, text: str) -> None:
+        self.console.appendPlainText(text)
+        cursor = self.console.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self.console.setTextCursor(cursor)
 
     def _add_trade_to_table(self, entry_time: str, direction: str, entry_price: float, exit_time: str, exit_price: float, pnl: float) -> None:
         """Přidá obchod do tabulky."""
@@ -2928,7 +3533,12 @@ class LiveBotWidget(QWidget):
         if not self._bars:
             self.ax_price.cla(); self.ax_macd.cla(); self.canvas.draw_idle(); return
         display_n = max(30, int(getattr(self.config, "display_bars", 144)))
-        df = pd.DataFrame(self._bars).reset_index(drop=True)
+        df = pd.DataFrame(self._bars)
+        if "time" in df.columns:
+            df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+            df.dropna(subset=["time"], inplace=True)
+            df.sort_values("time", inplace=True)
+        df.reset_index(drop=True, inplace=True)
         if len(df) > display_n:
             df = df.tail(display_n).reset_index(drop=True)
 
@@ -2944,19 +3554,25 @@ class LiveBotWidget(QWidget):
         x = np.arange(len(df))
         bullish_color = '#1f9d55'
         bearish_color = '#d64545'
+        candle_ranges = (df['high'] - df['low']).astype(float)
+        median_range = float(np.nanmedian(candle_ranges.to_numpy(dtype=float))) if len(candle_ranges) else 0.0
+        if not np.isfinite(median_range) or median_range <= 0:
+            median_range = float(np.nanmax(candle_ranges.to_numpy(dtype=float))) if len(candle_ranges) else 0.0
+        if not np.isfinite(median_range) or median_range <= 0:
+            median_range = 1.0
+        min_body_height = median_range * 0.06
         body_width = 0.56
 
         # svíčky
         for i, row in df.iterrows():
             o, h, l, c = map(float, (row['open'], row['high'], row['low'], row['close']))
-            h = max(h, o, c)
-            l = min(l, o, c)
             color = bullish_color if c >= o else bearish_color
             ax1.vlines(i, l, h, linewidth=1.15, color=color, zorder=2)
             body_bottom = min(o, c)
             body_height = abs(c - o)
-            if body_height <= 0:
-                body_height = 1e-12
+            if body_height < min_body_height:
+                body_height = min_body_height
+                body_bottom = ((o + c) / 2.0) - (body_height / 2.0)
             ax1.add_patch(
                 Rectangle(
                     (i - body_width / 2.0, body_bottom),
@@ -2986,13 +3602,7 @@ class LiveBotWidget(QWidget):
             if short_x:
                 ax1.scatter(short_x, short_y, marker='v', s=90, color=bearish_color, zorder=5)
 
-        candle_ranges = (df['high'] - df['low']).astype(float)
-        median_range = float(np.nanmedian(candle_ranges.to_numpy(dtype=float))) if len(candle_ranges) else 0.0
-        if not np.isfinite(median_range) or median_range <= 0:
-            median_range = float(np.nanmax(candle_ranges.to_numpy(dtype=float))) if len(candle_ranges) else 0.0
-        if not np.isfinite(median_range) or median_range <= 0:
-            median_range = 1.0
-        axis_pad = median_range * 0.18
+        axis_pad = max(min_body_height, median_range * 0.18)
         y_min = float(df['low'].min()) - axis_pad
         y_max = float(df['high'].max()) + axis_pad
         if np.isfinite(y_min) and np.isfinite(y_max) and y_max > y_min:
@@ -3016,11 +3626,28 @@ class LiveBotWidget(QWidget):
     def _flush_log_queue(self) -> None:
         if not hasattr(self, "console"):
             return
+        scrollbar = None
+        follow_tail = True
+        try:
+            scrollbar = self.console.verticalScrollBar()
+            follow_tail = scrollbar.value() >= max(0, scrollbar.maximum() - 2)
+        except Exception:
+            scrollbar = None
         while self._log_queue:
             self.console.appendPlainText(self._log_queue.popleft())
-        cursor = self.console.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        self.console.setTextCursor(cursor)
+        if follow_tail:
+            if scrollbar is not None:
+                try:
+                    scrollbar.setValue(scrollbar.maximum())
+                    return
+                except Exception:
+                    pass
+            try:
+                cursor = self.console.textCursor()
+                cursor.movePosition(QTextCursor.End)
+                self.console.setTextCursor(cursor)
+            except Exception:
+                pass
 
     def _append_log(self, text: str) -> None:
         try:
@@ -3084,7 +3711,7 @@ class LiveBotWidget(QWidget):
 
     def _stop_background_workers(self, *, wait_ms: int = 1000, allow_background: bool = True) -> bool:
         ok = True
-        for attr_name in ("_bootstrap_worker", "_degradation_worker"):
+        for attr_name in ("_bootstrap_worker", "_warmup_worker", "_degradation_worker"):
             ok = self._stop_thread_attr(attr_name, wait_ms=wait_ms, allow_background=allow_background) and ok
         return ok
 
@@ -3110,13 +3737,18 @@ class LiveBotWidget(QWidget):
         self._stop_background_workers(wait_ms=500, allow_background=True)
         self._pending_bar_payloads.clear()
         self._bar_refresh_scheduled = False
+        self._bars.clear()
+        self._bar_index.clear()
+        self.live_df = self.live_df.iloc[0:0].copy()
+        self._render_charts()
 
-        self.config.mode = "live"
+        self.config.mode = self.cmb_mode.currentText()
         self.config.symbol = (self.ed_symbol.text() or "GOLD").strip()
         self.config.exchange = (self.ed_expiry.text() or "TVC").strip()
         self.config.bar_size = self.cmb_interval.currentText()
 
         self._bootstrap_request_id += 1
+        self._bootstrap_done = False
         req_id = self._bootstrap_request_id
         self._append_log("[INFO] Nacitam pocatecni snapshot...")
         worker = TaskWorker(
@@ -3134,6 +3766,34 @@ class LiveBotWidget(QWidget):
         worker.finished.connect(lambda rid=req_id: self._on_bootstrap_finished(rid))
         worker.start()
 
+    def _start_warmup_worker(self) -> None:
+        if self._warmup_worker is not None:
+            self._stop_thread_attr("_warmup_worker", wait_ms=500, allow_background=True)
+
+        self._warmup_request_id += 1
+        self._warmup_done = False
+        req_id = self._warmup_request_id
+        worker = TaskWorker(
+            _task_run_live_warmup,
+            widget=self,
+            symbol=self.config.symbol,
+            exchange=self.config.exchange,
+            timeframe=self.config.bar_size,
+        )
+        self._warmup_worker = worker
+        worker.progress_text.connect(self._append_log)
+        worker.result.connect(lambda payload, rid=req_id: self._on_warmup_result(rid, payload))
+        worker.error.connect(lambda msg, rid=req_id: self._on_warmup_error(rid, msg))
+        worker.finished.connect(lambda rid=req_id: self._on_warmup_finished(rid))
+        worker.start()
+
+    def _maybe_launch_stream_worker(self) -> None:
+        if self.worker is not None:
+            return
+        if not self._bootstrap_done or not self._warmup_done:
+            return
+        self._launch_stream_worker()
+
     def shutdown(self) -> bool:
         ok = self._stop_worker(wait_ms=3000, allow_background=False)
         self.warm = None
@@ -3141,6 +3801,11 @@ class LiveBotWidget(QWidget):
             self._log_timer.stop()
         except Exception:
             pass
+        if getattr(self, "live_controller", None) is not None:
+            try:
+                self.live_controller.stop_session()
+            except Exception:
+                pass
         self._save_ui_settings()
         return ok
 
@@ -3158,6 +3823,7 @@ class LiveBotWidget(QWidget):
     def _on_bootstrap_result(self, req_id: int, payload: LiveBootstrapPayload) -> None:
         if req_id != self._bootstrap_request_id or payload is None:
             return
+        self._bootstrap_done = True
         used_local_snapshot = False
         if int(payload.snapshot_bars or 0) < 2:
             existing_snapshot_bars = int(len(self.live_df.index)) if isinstance(self.live_df, pd.DataFrame) else 0
@@ -3179,22 +3845,59 @@ class LiveBotWidget(QWidget):
         if not used_local_snapshot:
             self._apply_bootstrap_payload(payload, source_label="pocatecni snapshot")
 
-        self._launch_stream_worker()
+        self._maybe_launch_stream_worker()
 
     def _on_bootstrap_error(self, req_id: int, message: str) -> None:
         if req_id != self._bootstrap_request_id:
             return
+        self._bootstrap_done = True
         self._append_log(f"[WARN] Pocatecni snapshot selhal: {message}")
         existing_snapshot_bars = int(len(self.live_df.index)) if isinstance(self.live_df, pd.DataFrame) else 0
         if existing_snapshot_bars >= 2:
             self._append_log("[INFO] Ponechavam cerstvou historii z warm-upu a preskakuji lokalni CSV fallback.")
         else:
             self._try_seed_local_snapshot()
-        self._launch_stream_worker()
+        self._maybe_launch_stream_worker()
 
     def _on_bootstrap_finished(self, req_id: int) -> None:
         if req_id == self._bootstrap_request_id:
             self._bootstrap_worker = None
+
+    def _on_warmup_result(self, req_id: int, payload: LiveWarmupPayload) -> None:
+        if req_id != self._warmup_request_id or payload is None:
+            return
+
+        self._warmup_done = True
+        self.warm = payload.warm_service
+        cfg = getattr(self.warm, "config", None)
+        self._append_log(f"[WARMUP-CONFIG] {cfg if cfg is not None else 'MISSING'}")
+
+        try:
+            seeded = self._seed_snapshot_from_warmup_history(payload.adapter)
+            self._sync_live_mode_label()
+        except Exception as exc:
+            self._append_log(f"[WARN] Warm-up finalizace selhala: {exc}")
+            seeded = False
+
+        if seeded:
+            self._maybe_launch_stream_worker()
+            return
+
+        self._append_log("[INFO] Warm-up snapshot nestaci, spoustim bootstrap fallback.")
+        self._start_worker()
+
+    def _on_warmup_error(self, req_id: int, message: str) -> None:
+        if req_id != self._warmup_request_id:
+            return
+
+        self._warmup_done = True
+        self._append_log(f"[WARN] Warm-up inicializace selhala: {message}")
+        self._sync_live_mode_label()
+        self._start_worker()
+
+    def _on_warmup_finished(self, req_id: int) -> None:
+        if req_id == self._warmup_request_id:
+            self._warmup_worker = None
 
     def _seed_snapshot_from_warmup_history(self, adapter: _WarmAdapter | None) -> bool:
         hist_df = getattr(adapter, "_hist_df", None)
@@ -3205,6 +3908,7 @@ class LiveBotWidget(QWidget):
         payload = _build_live_bootstrap_payload_from_history_df(
             hist_df,
             self.models,
+            bar_size=self.config.bar_size,
             max_bars_buffer=int(self.config.max_bars_buffer),
         )
         if int(payload.snapshot_bars or 0) < 2:
@@ -3317,12 +4021,12 @@ class LiveBotWidget(QWidget):
         else:
             self._bars[idx] = payload
 
+        self._bars.sort(key=lambda item: pd.to_datetime(item.get("time"), utc=True, errors="coerce"))
+        self._bar_index = {int(pd.to_datetime(item["time"]).value): i for i, item in enumerate(self._bars)}
+
         if len(self._bars) > self.config.max_bars_buffer:
             self._bars = self._bars[-self.config.max_bars_buffer:]
-            self._bar_index = {
-                int(pd.to_datetime(x["time"], utc=True, errors="coerce").value): i
-                for i, x in enumerate(self._bars)
-            }
+            self._bar_index = {int(pd.to_datetime(x["time"]).value): i for i, x in enumerate(self._bars)}
 
         row = {
             "timestamp": ts,
@@ -3336,6 +4040,7 @@ class LiveBotWidget(QWidget):
         self.live_df.dropna(subset=["timestamp"], inplace=True)
         self.live_df.drop_duplicates(subset=["timestamp"], keep="last", inplace=True)
         self.live_df.sort_values("timestamp", inplace=True)
+        self.live_df.reset_index(drop=True, inplace=True)
         max_live_buffer = max(700, self.config.max_bars_buffer + 400)
         if len(self.live_df) > max_live_buffer:
             self.live_df = self.live_df.tail(max_live_buffer).reset_index(drop=True)
@@ -3381,7 +4086,7 @@ class LiveBotWidget(QWidget):
             if self.warm is not None:
                 for payload in pending:
                     self.warm.on_new_bar(payload)
-                self.lbl_mode.setText("Mode: LIVE" if self.warm.state == "LIVE" else "Mode: WARM-UP")
+                self._sync_live_mode_label()
             self._rescore_all()
             self._maybe_alert_flip_on_last_bar()
             self._maybe_send_flip_email_on_last_bar()
@@ -3394,20 +4099,22 @@ class LiveBotWidget(QWidget):
             self._schedule_bar_refresh()
 
     def _apply_bootstrap_payload(self, payload: LiveBootstrapPayload, *, source_label: str) -> None:
-        raw_bars = list(payload.bars or [])
-        # Deduplicate by timestamp (keep last), consistent UTC key with _on_bar_closed
-        seen: dict[int, int] = {}
-        for idx, bar in enumerate(raw_bars):
-            ts_key = pd.to_datetime(bar.get("time"), utc=True, errors="coerce")
-            if pd.notna(ts_key):
-                seen[int(ts_key.value)] = idx
-        self._bars = [raw_bars[i] for i in sorted(seen.values())]
+        self._bars = sorted(
+            list(payload.bars or []),
+            key=lambda item: pd.to_datetime(item.get("time"), utc=True, errors="coerce"),
+        )
         self._bar_index = {
-            int(pd.to_datetime(bar["time"], utc=True, errors="coerce").value): idx
+            int(pd.to_datetime(bar["time"]).value): idx
             for idx, bar in enumerate(self._bars)
+            if pd.notna(pd.to_datetime(bar.get("time"), utc=True, errors="coerce"))
         }
         if isinstance(payload.live_df, pd.DataFrame):
             self.live_df = payload.live_df.copy()
+            if "timestamp" in self.live_df.columns:
+                self.live_df["timestamp"] = pd.to_datetime(self.live_df["timestamp"], utc=True, errors="coerce")
+                self.live_df.dropna(subset=["timestamp"], inplace=True)
+                self.live_df.sort_values("timestamp", inplace=True)
+                self.live_df.reset_index(drop=True, inplace=True)
         else:
             self.live_df = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
@@ -3506,6 +4213,7 @@ class LiveBotWidget(QWidget):
         payload = _build_live_bootstrap_payload_from_history_df(
             df.rename(columns={time_col: "time"}),
             self.models,
+            bar_size=self.config.bar_size,
             max_bars_buffer=int(self.config.max_bars_buffer),
         )
         if int(payload.snapshot_bars or 0) < 1:

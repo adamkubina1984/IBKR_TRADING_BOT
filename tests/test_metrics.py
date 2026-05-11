@@ -9,7 +9,9 @@
 
 import numpy as np
 import pandas as pd
+import importlib
 
+from ibkr_trading_bot.utils.model_io import calculate_metrics as legacy_calculate_metrics
 from ibkr_trading_bot.utils.metrics import calculate_metrics
 
 
@@ -100,3 +102,90 @@ def test_binary_labels_are_not_ternary_remapped():
     assert out["signals"] == len(y_pred)
     assert out["num_trades"] >= 1
     assert out["num_trades_long"] >= 1
+
+
+def test_metrics_expose_equity_curves_from_shared_executor():
+    prices = [100, 101, 102, 101]
+    df = _df_from_prices(prices)
+    y_pred = [0, 1, 1, 0]
+
+    out = calculate_metrics([0] * len(y_pred), y_pred, df=df, fee_per_trade=0.1, slippage_bps=0.0)
+
+    assert "equity_curve" in out
+    assert "equity_curve_net" in out
+    assert len(out["equity_curve"]) == len(prices)
+    assert len(out["equity_curve_net"]) == len(prices)
+    assert out["equity_curve_net"][-1] == out["profit_net"]
+
+
+def test_metrics_expose_detailed_trade_records():
+    prices = [100, 101, 103, 102]
+    df = _df_from_prices(prices)
+    y_pred = [0, 1, 1, 0]
+
+    out = calculate_metrics([0] * len(y_pred), y_pred, df=df, fee_per_trade=0.25, slippage_bps=0.0)
+
+    assert "trades" in out
+    assert len(out["trades"]) == 1
+    trade = out["trades"][0]
+    assert trade["direction"] == "LONG"
+    assert trade["entry_price"] == 101.0
+    assert trade["exit_price"] == 102.0
+    assert trade["pnl"] == 1.0
+    assert trade["pnl_net"] == 0.75
+
+
+def test_metrics_support_trading_only_mode_without_ground_truth():
+    prices = [100, 101, 103, 102]
+    df = _df_from_prices(prices)
+    y_pred = [0, 1, 1, 0]
+
+    out = calculate_metrics(None, y_pred, df=df, fee_per_trade=0.25, slippage_bps=0.0)
+
+    assert out["classification_available"] is False
+    assert "accuracy" not in out
+    assert out["profit_net"] == 0.75
+    assert "winrate_net" in out
+    assert "profit_factor_net" in out
+
+
+def test_metrics_explicit_ternary_mapped_mode_handles_missing_class_two():
+    prices = [100, 101, 100, 99]
+    df = _df_from_prices(prices)
+
+    out = calculate_metrics(
+        y_true=[0, 1, 1, 0],
+        y_pred=[0, 1, 1, 0],
+        df=df,
+        label_mode="ternary_mapped",
+    )
+
+    assert out["classification_mode"] == "ternary"
+    assert out["label_mode"] == "ternary_mapped"
+    assert "f1_macro_3" in out
+
+
+def test_legacy_model_io_metrics_delegates_to_canonical_metrics():
+    prices = [100, 101, 100, 99]
+    df = _df_from_prices(prices)
+
+    out = legacy_calculate_metrics(
+        y_true=[-1, 0, 1, 0],
+        y_pred=[-1, 0, 1, 0],
+        df=df,
+        label_mode="ternary_signed",
+    )
+
+    assert out["classification_mode"] == "ternary"
+    assert out["label_mode"] == "ternary_signed"
+
+
+def test_legacy_model_io_import_smoke_and_sidecar_roundtrip(tmp_path):
+    module = importlib.import_module("ibkr_trading_bot.utils.model_io")
+    model_path = tmp_path / "model.pkl"
+
+    module.save_model_meta(model_path, {"label_mode": "ternary_signed", "profit_net": 1.25})
+    loaded = module.load_model_meta(model_path)
+
+    assert loaded["label_mode"] == "ternary_signed"
+    assert loaded["profit_net"] == 1.25

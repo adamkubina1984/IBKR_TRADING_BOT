@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ibkr_trading_bot.core.services.model_service import load_model_with_meta
+from ibkr_trading_bot.core.services.model_service import ensure_model_sidecar_meta, load_model_with_meta
 
 DEFAULT_MODEL_DIR = Path(__file__).parent.parent / "model_outputs"
 
@@ -85,7 +85,7 @@ def _record_rank_key(r: ModelRecord) -> tuple[float, float, float, float]:
         default=float("-inf"),
     )
     sharpe = _as_float(r.metrics.get("sharpe", None), default=float("-inf"))
-    trades = _as_float(r.metrics.get("trades", None), default=0.0)
+    trades = _as_float(r.metrics.get("num_trades", r.metrics.get("trades", None)), default=0.0)
     ts = _as_timestamp(r.created, r.model_path)
     return (profit, sharpe, trades, ts)
 
@@ -128,17 +128,22 @@ def discover_models(dir_path: Path) -> list[ModelRecord]:
         meta_candidates = [p.with_name(p.stem + "_meta.json"), p.parent / "model_meta.json"]
         meta: dict[str, Any] = {}
         meta_path = None
-        for m in meta_candidates:
-            if not m.exists():
-                continue
-            try:
-                loaded = json.loads(m.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            if isinstance(loaded, dict):
-                meta = loaded
-                meta_path = m
-                break
+        sidecar_path, sidecar_meta = ensure_model_sidecar_meta(p)
+        if isinstance(sidecar_meta, dict) and sidecar_meta:
+            meta = sidecar_meta
+            meta_path = sidecar_path
+        else:
+            for m in meta_candidates:
+                if not m.exists():
+                    continue
+                try:
+                    loaded = json.loads(m.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if isinstance(loaded, dict):
+                    meta = loaded
+                    meta_path = m
+                    break
 
         classes = meta.get("model_classes")
         if not isinstance(classes, list) and isinstance(meta.get("classes"), list):

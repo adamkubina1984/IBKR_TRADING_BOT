@@ -11,10 +11,14 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
 import pandas as pd
 from ib_insync import IB, BarData, BarDataList, Contract
+
+if TYPE_CHECKING:
+    from .live import FuturesContractSpec, PaperSafeTwsClient, TwsConnectionConfig
 
 log = logging.getLogger(__name__)
 
@@ -122,6 +126,8 @@ class LiveBotService:
 
         # IB subscription
         self.bars: BarDataList | None = None
+        self._paper_tws_client: PaperSafeTwsClient | None = None
+        self._owns_paper_tws_client = False
 
         # Control
         self._stop_event = threading.Event()
@@ -130,6 +136,38 @@ class LiveBotService:
         # Freshness
         self._last_closed_ts: pd.Timestamp | None = None
         self.fresh_limit_sec = self._fresh_limit_seconds()
+
+    @classmethod
+    def from_paper_tws(
+        cls,
+        connection: TwsConnectionConfig,
+        contract_spec: FuturesContractSpec,
+        timeframe: str,
+        *,
+        broker_client: PaperSafeTwsClient | None = None,
+        ib_factory: Callable[[], Any] | None = None,
+        **kwargs: Any,
+    ) -> "LiveBotService":
+        """Bootstrap the existing stream service from the Phase 1 paper-safe TWS wrapper."""
+        from .live import PaperSafeTwsClient
+
+        paper_client = broker_client if broker_client is not None else PaperSafeTwsClient(connection, ib_factory=ib_factory)
+        if not paper_client.is_connected:
+            paper_client.connect()
+
+        service = cls(
+            ib=paper_client.ib,
+            contract=paper_client.qualify_contract(contract_spec),
+            timeframe=timeframe,
+            **kwargs,
+        )
+        service._paper_tws_client = paper_client
+        service._owns_paper_tws_client = broker_client is None
+        return service
+
+    @property
+    def paper_tws_client(self) -> PaperSafeTwsClient | None:
+        return self._paper_tws_client
 
     # ------------------------
     # Public API
@@ -147,6 +185,11 @@ class LiveBotService:
 
     def stop(self) -> None:
         self._stop_event.set()
+
+    def close(self) -> None:
+        self.stop()
+        if self._owns_paper_tws_client and self._paper_tws_client is not None:
+            self._paper_tws_client.disconnect()
 
     # ------------------------
     # Interní pomocné metody

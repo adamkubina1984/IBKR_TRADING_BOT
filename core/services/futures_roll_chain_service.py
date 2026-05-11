@@ -419,12 +419,54 @@ def update_gc_roll_chain_latest_contract(
         "no_new_data_reuse": 0,
     }
 
+    # Detect and auto-upgrade if latest expiry has ended
+    latest_expiry = str(expiries[-1])
+    latest_expiry_end = effective_download_end_for_expiry(latest_expiry, None)
+    auto_added_expiries = set()
+    if latest_expiry_end < (end_date or datetime.now()).replace(hour=0, minute=0, second=0, microsecond=0):
+        # Latest expiry has ended, auto-add next quarterly expirations for continuity
+        if callable(progress_cb):
+            progress_cb(
+                f"[ROLL][UPDATE][INFO] Poslední expiry {latest_expiry} skončila ({latest_expiry_end.date()}). "
+                f"Automaticky přidávám nové čtvrtletní expirace..."
+            )
+        curr_year = int(latest_expiry[:4])
+        curr_month = int(latest_expiry[4:])
+        # GC quarterly: 03, 06, 09, 12. Order by nearest future month first.
+        quarterly_months = [3, 6, 9, 12]
+
+        def _months_ahead(target_month: int) -> int:
+            delta = (target_month - curr_month) % 12
+            return 12 if delta == 0 else delta
+
+        next_quarters = sorted(quarterly_months, key=_months_ahead)
+        new_expiries = []
+        for target_month in next_quarters:
+            target_year = curr_year if target_month > curr_month else curr_year + 1
+            new_expiry = f"{target_year}{target_month:02d}"
+            if new_expiry not in expiries:
+                new_expiries.append(new_expiry)
+                auto_added_expiries.add(new_expiry)
+                if callable(progress_cb):
+                    progress_cb(f"[ROLL][UPDATE][INFO]   + přidávám expiry {new_expiry}")
+                if len(new_expiries) >= 1:
+                    break
+        if new_expiries:
+            expiries = expiries + new_expiries
+            if callable(progress_cb):
+                progress_cb(f"[ROLL][UPDATE][INFO] Nové expirace: {', '.join(new_expiries)}")
+
+    # Refresh latest_expiry after potential auto-upgrade
     latest_expiry = str(expiries[-1])
     step_delta = timedelta(minutes=bar_size_to_minutes(bar_size))
     overlap_delta = timedelta(minutes=bar_size_to_minutes(bar_size) * RAW_UPDATE_OVERLAP_BARS)
 
+    # Process original historical expiries (not the auto-added ones)
     for expiry in expiries[:-1]:
         expiry_text = str(expiry)
+        # Skip auto-added expirations for now, process them later as fresh downloads
+        if expiry_text in auto_added_expiries:
+            continue
         existing = _resolve_contract_csv_candidate(
             raw_root,
             symbol="GC",
@@ -446,6 +488,53 @@ def update_gc_roll_chain_latest_contract(
         contract_paths.append(str(existing["path"]))
         download_summary["reused_existing"] += 1
 
+    # Process auto-added expirations (except the latest one) as fresh downloads
+    for auto_expiry in sorted(auto_added_expiries):
+        if auto_expiry == latest_expiry:
+            # Will be handled by the latest_expiry logic below
+            continue
+        auto_start = effective_download_start_for_expiry(
+            auto_expiry,
+            start_date,
+            str(expiries[expiries.index(auto_expiry) - 1]) if expiries.index(auto_expiry) > 0 else None,
+            overlap_days=ROLL_OVERLAP_DAYS,
+        )
+        auto_end = effective_download_end_for_expiry(auto_expiry, end_date)
+        if callable(progress_cb):
+            progress_cb(
+                f"[ROLL][UPDATE] Fresh download auto-added {auto_expiry}: "
+                f"{auto_start.strftime('%Y-%m-%d')} -> {auto_end.strftime('%Y-%m-%d')}"
+            )
+        try:
+            fresh_path = download_ibkr_by_date_range(
+                symbol="GC",
+                start_date=auto_start,
+                end_date=auto_end,
+                bar_size=bar_size,
+                contract_mode="FUT",
+                expiry=auto_expiry,
+                output_dir=str(raw_root),
+                max_bars_per_batch=5000,
+                on_progress=(
+                    (lambda bn, _tb, rec, expiry_label=auto_expiry: progress_cb(
+                        f"[IBKR][{expiry_label}] Batch {bn}: {rec} baru"
+                    ))
+                    if callable(progress_cb)
+                    else None
+                ),
+            )
+            contract_paths.append(fresh_path)
+            download_summary["fresh_downloads"] += 1
+        except RuntimeError as exc:
+            if "Žádná data se nestáhla" in str(exc):
+                if callable(progress_cb):
+                    progress_cb(
+                        f"[ROLL][UPDATE] Bez dat pro auto-added {auto_expiry}, přeskakuji"
+                    )
+                download_summary["no_new_data_reuse"] += 1
+            else:
+                raise
+
     previous_expiry = str(expiries[-2])
     latest_start = effective_download_start_for_expiry(
         latest_expiry,
@@ -455,13 +544,16 @@ def update_gc_roll_chain_latest_contract(
     )
     latest_end = effective_download_end_for_expiry(latest_expiry, end_date)
     fresh_enough_end = latest_end - step_delta
-    existing_latest = _resolve_contract_csv_candidate(
-        raw_root,
-        symbol="GC",
-        expiry=latest_expiry,
-        bar_size=bar_size,
-        preferred_path=preferred.get(latest_expiry),
-    )
+    existing_latest = None
+    if latest_expiry not in auto_added_expiries:
+        # Only look for existing CSV if not auto-added
+        existing_latest = _resolve_contract_csv_candidate(
+            raw_root,
+            symbol="GC",
+            expiry=latest_expiry,
+            bar_size=bar_size,
+            preferred_path=preferred.get(latest_expiry),
+        )
 
     if callable(progress_cb):
         progress_cb(
@@ -469,7 +561,41 @@ def update_gc_roll_chain_latest_contract(
             f"{latest_start.strftime('%Y-%m-%d')} -> {latest_end.strftime('%Y-%m-%d')}"
         )
 
-    if existing_latest and existing_latest["start"] <= latest_start + step_delta and existing_latest["end"] >= fresh_enough_end:
+    # If latest_expiry is auto-added, always treat as fresh download
+    if latest_expiry in auto_added_expiries:
+        if callable(progress_cb):
+            progress_cb(
+                f"[ROLL][UPDATE] Latest fresh (auto-added) {latest_expiry}: "
+                f"stahuji od {latest_start.strftime('%Y-%m-%d %H:%M')}"
+            )
+        try:
+            latest_path = download_ibkr_by_date_range(
+                symbol="GC",
+                start_date=latest_start,
+                end_date=latest_end,
+                bar_size=bar_size,
+                contract_mode="FUT",
+                expiry=latest_expiry,
+                output_dir=str(raw_root),
+                max_bars_per_batch=5000,
+                on_progress=(
+                    (lambda bn, _tb, rec, expiry_label=latest_expiry: progress_cb(
+                        f"[IBKR][{expiry_label}] Batch {bn}: {rec} baru"
+                    ))
+                    if callable(progress_cb)
+                    else None
+                ),
+            )
+        except RuntimeError as exc:
+            if "Žádná data se nestáhla" in str(exc):
+                raise ValueError(
+                    f"Pro automaticky pridanou expiraci {latest_expiry} zatim nejsou dostupna data. "
+                    "Spust update pozdeji nebo proved plny rebuild s rucne zadanou expiraci."
+                ) from exc
+            raise
+        contract_paths.append(str(latest_path))
+        download_summary["fresh_downloads"] += 1
+    elif existing_latest and existing_latest["start"] <= latest_start + step_delta and existing_latest["end"] >= fresh_enough_end:
         if callable(progress_cb):
             progress_cb(
                 f"[ROLL][UPDATE] Latest reuse {latest_expiry}: {Path(existing_latest['path']).name} | "
@@ -504,7 +630,10 @@ def update_gc_roll_chain_latest_contract(
                 ),
             )
         except RuntimeError as exc:
-            if existing_latest and "Ĺ˝ĂˇdnĂˇ data se nestĂˇhla" in str(exc):
+            if existing_latest and (
+                "Žádná data se nestáhla" in str(exc)
+                or "Ĺ˝ĂˇdnĂˇ data se nestĂˇhla" in str(exc)
+            ):
                 if callable(progress_cb):
                     progress_cb(
                         f"[ROLL][UPDATE] Bez novych dat pro {latest_expiry}, "

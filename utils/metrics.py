@@ -11,6 +11,15 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ibkr_trading_bot.core.services.trade_executor import replay_signals_over_market_data
+from ibkr_trading_bot.utils.labeling import (
+    LabelMode,
+    infer_label_mode,
+    is_ternary_label_mode,
+    normalize_labels_for_mode,
+    ternary_predict_mapped,
+)
+
 try:
     from sklearn.pipeline import Pipeline
 except Exception:  # pragma: no cover
@@ -117,76 +126,6 @@ def _pick_price_series(df: pd.DataFrame | None) -> pd.Series | None:
                 return s.astype(float)
     return None
 
-def _positions_from_predictions(y_pred: np.ndarray) -> np.ndarray:
-    """
-    Mapování predikcí na pozici:
-      >0 => LONG (1),  0 => FLAT (0),  <0 => SHORT (-1)
-    Binární 0/1 také fungují (1 => LONG).
-    """
-    pos = np.zeros_like(y_pred, dtype=int)
-    pos[y_pred > 0] = 1
-    pos[y_pred < 0] = -1
-    return pos
-
-def _equity_from_positions(pos: np.ndarray, px: np.ndarray) -> tuple[np.ndarray, list[float], list[int], list[int]]:
-    """
-    Hrubá equity křivka při plnění na close.
-    Per-bar PnL = pos[t-1] * (px[t] - px[t-1]).
-    Vrací: equity_gross, list PnL obchodů, indexy barů uzavření obchodů.
-    """
-    n = len(px)
-    if n == 0:
-        return np.zeros(0), [], []
-    pos = np.asarray(pos, dtype=int)
-    px = np.asarray(px, dtype=float)
-
-    # Align lengths: sometimes predictions (pos) have one less element than
-    # price series (px) due to upstream shifting; handle gracefully.
-    if pos.size == px.size - 1:
-        pos = np.concatenate(([0], pos))
-    elif pos.size == px.size + 1:
-        pos = pos[:-1]
-    elif pos.size != px.size:
-        # Truncate to the minimal common length (best-effort fallback).
-        m = min(pos.size, px.size)
-        pos = pos[:m]
-        px = px[:m]
-
-    dpx = np.diff(px, prepend=px[0])
-    ret_bar = pos[:-1] * dpx[1:]  # výnos od t-1 do t
-    ret = np.zeros(n)
-    if ret_bar.size:
-        ret[1:] = ret_bar
-
-    # extrahuj obchody podle změny pozice
-    trades: list[float] = []
-    trade_idx: list[int] = []
-    trade_sides: list[int] = []
-    cur = 0
-    entry = None
-    for t in range(n):
-        p = pos[t]
-        if cur == 0 and p != 0:
-            cur = p
-            entry = px[t]
-        elif cur != 0 and p != cur:
-            exit_px = px[t]
-            pnl = (exit_px - entry) if cur == 1 else (entry - exit_px)
-            trades.append(float(pnl))
-            trade_idx.append(t)
-            trade_sides.append(int(cur))
-            cur = p
-            entry = px[t] if p != 0 else None
-    if cur != 0 and entry is not None:
-        exit_px = px[-1]
-        pnl = (exit_px - entry) if cur == 1 else (entry - exit_px)
-        trades.append(float(pnl))
-        trade_idx.append(n - 1)
-        trade_sides.append(int(cur))
-
-    equity = np.cumsum(ret)
-    return equity, trades, trade_idx, trade_sides
-
 def _max_drawdown(equity: np.ndarray) -> float:
     peak = -1e18
     mdd = 0.0
@@ -222,6 +161,16 @@ def _profit_factor(trades: list[float]) -> float:
     if loss == 0:
         return float("inf") if g > 0 else float("nan")
     return float(g / loss)
+
+
+def _winrate(trades: list[float]) -> float:
+    if not trades:
+        return float("nan")
+    return float(np.mean(np.asarray(trades, dtype=float) > 0.0))
+
+
+def _trades_for_side(trades: list[float], sides: list[int], side: int) -> list[float]:
+    return [float(pnl) for pnl, trade_side in zip(trades, sides) if int(trade_side) == int(side)]
 
 def _var(arr: list[float], p: float) -> float:
     a = np.asarray(arr, dtype=float)
@@ -260,7 +209,7 @@ def _infer_bars_per_year(df: pd.DataFrame | None) -> int | None:
 
 # ---------------- Hlavní API ----------------
 def calculate_metrics(
-    y_true: np.ndarray | pd.Series,
+    y_true: np.ndarray | pd.Series | None,
     y_pred: np.ndarray | pd.Series,
     df: pd.DataFrame | None = None,
     fee_per_trade: float = 0.0,
@@ -269,6 +218,7 @@ def calculate_metrics(
     *,
     annualize_sharpe: bool = False,
     bars_per_year: int | None = None,
+    label_mode: LabelMode = "auto",
     **kwargs,
 ) -> dict[str, Any]:
     """
@@ -283,131 +233,145 @@ def calculate_metrics(
       - bars_per_year: volitelně explicitní počet barů za rok; pokud není, pokusíme se odhadnout z df['timestamp']
       - **kwargs: ignorováno (kvůli zpětné kompatibilitě)
     """
-    yt_raw = pd.Series(y_true).astype(int)
     yp_raw = pd.Series(y_pred).astype(int)
-    yt = np.asarray(yt_raw.to_numpy())
     yp = np.asarray(yp_raw.to_numpy())
+    yt: np.ndarray | None = None
+    if y_true is not None:
+        yt_raw = pd.Series(y_true)
+        if len(yt_raw) != len(yp_raw):
+            raise ValueError("y_true a y_pred musí mít stejnou délku.")
+        yt = np.asarray(yt_raw.astype(int).to_numpy())
 
-    # Remap ternary (0,1,2) to (-1,0,1) only when class 2 is present.
-    # NOTE:
-    # - Binary 0/1 labels in this project represent SHORT/LONG and must NOT be remapped,
-    #   otherwise class 1 would become FLAT (0) and trading metrics collapse.
-    uniq_yt = set(np.unique(yt).tolist())
-    uniq_yp = set(np.unique(yp).tolist())
-    if (2 in uniq_yt) or (2 in uniq_yp):
-        # Likely mapped ternary: 0->-1, 1->0, 2->1
-        yt_remap = np.array([-1 if c == 0 else (0 if c == 1 else 1) for c in yt])
-        yp_remap = np.array([-1 if c == 0 else (0 if c == 1 else 1) for c in yp])
-        yt = yt_remap
-        yp = yp_remap
-
-    # ---------- BINÁRNÍ pohled (mapujeme >0 -> 1, FLAT/SHORT -> 0)
-    yt_bin = (yt > 0).astype(int)
-    yp_bin = (yp > 0).astype(int)
-    if _HAVE_SK:
-        acc = float(accuracy_score(yt_bin, yp_bin))
-        f1 = float(f1_score(yt_bin, yp_bin, zero_division=0))
-        prec = float(precision_score(yt_bin, yp_bin, zero_division=0))
-        rec = float(recall_score(yt_bin, yp_bin, zero_division=0))
-        tn, fp, fn, tp = confusion_matrix(yt_bin, yp_bin, labels=[0, 1]).ravel()
-    else:
-        tp = int(((yt_bin == 1) & (yp_bin == 1)).sum())
-        tn = int(((yt_bin == 0) & (yp_bin == 0)).sum())
-        fp = int(((yt_bin == 0) & (yp_bin == 1)).sum())
-        fn = int(((yt_bin == 1) & (yp_bin == 0)).sum())
-        acc = float((tp + tn) / max(1, tp + tn + fp + fn))
-        prec = float(tp / max(1, tp + fp))
-        rec = float(tp / max(1, tp + fn))
-        f1 = float(2 * prec * rec / max(1e-12, (prec + rec)))
+    resolved_label_mode = infer_label_mode(yt, yp, preferred=label_mode)
+    yp = normalize_labels_for_mode(yp, resolved_label_mode)
+    if yt is not None:
+        yt = normalize_labels_for_mode(yt, resolved_label_mode)
 
     out: dict[str, Any] = {
-        "accuracy": acc,
-        "precision": prec,
-        "recall": rec,
-        "f1": f1,
-        "tn": int(tn),
-        "fp": int(fp),
-        "fn": int(fn),
-        "tp": int(tp),
-        "signals": int((yp_bin == 1).sum()),
+        "classification_available": yt is not None,
+        "label_mode": resolved_label_mode,
     }
 
-    # ---------- 3-TŘÍDNÍ pohled (SHORT=-1, HOLD=0, LONG=1)
-    labels3 = [-1, 0, 1]
-    if _HAVE_SK:
-        cm3 = confusion_matrix(yt, yp, labels=labels3)
-        prec3, rec3, f13, supp3 = precision_recall_fscore_support(
-            yt, yp, labels=labels3, zero_division=0
-        )
-        f1_micro_3 = float(f1_score(yt, yp, labels=labels3, average="micro", zero_division=0))
-        f1_macro_3 = float(f1_score(yt, yp, labels=labels3, average="macro", zero_division=0))
-        f1_weighted_3 = float(f1_score(yt, yp, labels=labels3, average="weighted", zero_division=0))
-    else:
-        idx_map = {v: i for i, v in enumerate(labels3)}
-        cm3 = np.zeros((3, 3), dtype=int)
-        for a, b in zip(yt, yp):
-            ia = idx_map.get(int(a), None)
-            ib = idx_map.get(int(b), None)
-            if ia is not None and ib is not None:
-                cm3[ia, ib] += 1
-        prec3, rec3, f13, supp3 = [], [], [], []
-        for i in range(3):
-            tp_i = cm3[i, i]
-            fp_i = cm3[:, i].sum() - tp_i
-            fn_i = cm3[i, :].sum() - tp_i
-            supp_i = cm3[i, :].sum()
-            p_i = float(tp_i / max(1, tp_i + fp_i))
-            r_i = float(tp_i / max(1, tp_i + fn_i))
-            f_i = float(2 * p_i * r_i / max(1e-12, (p_i + r_i)))
-            prec3.append(p_i)
-            rec3.append(r_i)
-            f13.append(f_i)
-            supp3.append(int(supp_i))
-        f1_macro_3 = float(np.nanmean(f13)) if len(f13) else 0.0
-        f1_micro_3 = float(np.trace(cm3) / max(1, cm3.sum()))
-        weights = np.asarray(supp3, dtype=float)
-        w = weights / max(1, weights.sum())
-        f1_weighted_3 = float(np.nansum(np.asarray(f13) * w)) if w.size else f1_macro_3
+    if yt is not None:
+        # ---------- BINÁRNÍ pohled (mapujeme >0 -> 1, FLAT/SHORT -> 0)
+        yt_bin = (yt > 0).astype(int)
+        yp_bin = (yp > 0).astype(int)
+        if _HAVE_SK:
+            acc = float(accuracy_score(yt_bin, yp_bin))
+            f1 = float(f1_score(yt_bin, yp_bin, zero_division=0))
+            prec = float(precision_score(yt_bin, yp_bin, zero_division=0))
+            rec = float(recall_score(yt_bin, yp_bin, zero_division=0))
+            tn, fp, fn, tp = confusion_matrix(yt_bin, yp_bin, labels=[0, 1]).ravel()
+        else:
+            tp = int(((yt_bin == 1) & (yp_bin == 1)).sum())
+            tn = int(((yt_bin == 0) & (yp_bin == 0)).sum())
+            fp = int(((yt_bin == 0) & (yp_bin == 1)).sum())
+            fn = int(((yt_bin == 1) & (yp_bin == 0)).sum())
+            acc = float((tp + tn) / max(1, tp + tn + fp + fn))
+            prec = float(tp / max(1, tp + fp))
+            rec = float(tp / max(1, tp + fn))
+            f1 = float(2 * prec * rec / max(1e-12, (prec + rec)))
 
-    out["confusion3"] = {
-        "labels": labels3,
-        "matrix": [[int(x) for x in row] for row in cm3.tolist()],
-    }
-    out["per_class_3"] = {
-        str(lbl): {
-            "precision": float(prec3[i]),
-            "recall": float(rec3[i]),
-            "f1": float(f13[i]),
-            "support": int(supp3[i]),
+        out.update({
+            "accuracy": acc,
+            "precision": prec,
+            "recall": rec,
+            "f1": f1,
+            "tn": int(tn),
+            "fp": int(fp),
+            "fn": int(fn),
+            "tp": int(tp),
+            "signals": int((yp_bin == 1).sum()),
+        })
+
+        # ---------- 3-TŘÍDNÍ pohled (SHORT=-1, HOLD=0, LONG=1)
+        labels3 = [-1, 0, 1]
+        if _HAVE_SK:
+            cm3 = confusion_matrix(yt, yp, labels=labels3)
+            prec3, rec3, f13, supp3 = precision_recall_fscore_support(
+                yt, yp, labels=labels3, zero_division=0
+            )
+            f1_micro_3 = float(f1_score(yt, yp, labels=labels3, average="micro", zero_division=0))
+            f1_macro_3 = float(f1_score(yt, yp, labels=labels3, average="macro", zero_division=0))
+            f1_weighted_3 = float(f1_score(yt, yp, labels=labels3, average="weighted", zero_division=0))
+        else:
+            idx_map = {v: i for i, v in enumerate(labels3)}
+            cm3 = np.zeros((3, 3), dtype=int)
+            for a, b in zip(yt, yp):
+                ia = idx_map.get(int(a), None)
+                ib = idx_map.get(int(b), None)
+                if ia is not None and ib is not None:
+                    cm3[ia, ib] += 1
+            prec3, rec3, f13, supp3 = [], [], [], []
+            for i in range(3):
+                tp_i = cm3[i, i]
+                fp_i = cm3[:, i].sum() - tp_i
+                fn_i = cm3[i, :].sum() - tp_i
+                supp_i = cm3[i, :].sum()
+                p_i = float(tp_i / max(1, tp_i + fp_i))
+                r_i = float(tp_i / max(1, tp_i + fn_i))
+                f_i = float(2 * p_i * r_i / max(1e-12, (p_i + r_i)))
+                prec3.append(p_i)
+                rec3.append(r_i)
+                f13.append(f_i)
+                supp3.append(int(supp_i))
+            f1_macro_3 = float(np.nanmean(f13)) if len(f13) else 0.0
+            f1_micro_3 = float(np.trace(cm3) / max(1, cm3.sum()))
+            weights = np.asarray(supp3, dtype=float)
+            w = weights / max(1, weights.sum())
+            f1_weighted_3 = float(np.nansum(np.asarray(f13) * w)) if w.size else f1_macro_3
+
+        out["confusion3"] = {
+            "labels": labels3,
+            "matrix": [[int(x) for x in row] for row in cm3.tolist()],
         }
-        for i, lbl in enumerate(labels3)
-    }
-    out["f1_micro_3"] = f1_micro_3
-    out["f1_macro_3"]  = f1_macro_3
-    out["f1_weighted_3"] = f1_weighted_3
+        out["per_class_3"] = {
+            str(lbl): {
+                "precision": float(prec3[i]),
+                "recall": float(rec3[i]),
+                "f1": float(f13[i]),
+                "support": int(supp3[i]),
+            }
+            for i, lbl in enumerate(labels3)
+        }
+        out["f1_micro_3"] = f1_micro_3
+        out["f1_macro_3"] = f1_macro_3
+        out["f1_weighted_3"] = f1_weighted_3
+        out["rec_short"] = float((out["per_class_3"].get("-1") or {}).get("recall", np.nan))
+        out["rec_long"] = float((out["per_class_3"].get("1") or {}).get("recall", np.nan))
 
-    # For ternary tasks expose true 3-class metrics as primary keys.
-    uniq3 = set(np.unique(np.concatenate([yt, yp])).tolist())
-    is_ternary_task = uniq3.issubset({-1, 0, 1}) and len(uniq3) >= 3
-    if is_ternary_task:
-        out["accuracy_binary"] = out["accuracy"]
-        out["precision_binary"] = out["precision"]
-        out["recall_binary"] = out["recall"]
-        out["f1_binary"] = out["f1"]
-        out["accuracy"] = float((yt == yp).mean())
-        out["precision"] = float(np.nanmean(np.asarray(prec3, dtype=float)))
-        out["recall"] = float(np.nanmean(np.asarray(rec3, dtype=float)))
-        out["f1"] = float(f1_macro_3)
-        out["signals"] = int((yp != 0).sum())
+        # For ternary tasks expose true 3-class metrics as primary keys.
+        uniq3 = set(np.unique(np.concatenate([yt, yp])).tolist())
+        is_ternary_task = is_ternary_label_mode(resolved_label_mode) or (
+            uniq3.issubset({-1, 0, 1}) and len(uniq3) >= 3
+        )
+        out["classification_mode"] = "ternary" if is_ternary_task else "binary"
+        if is_ternary_task:
+            out["accuracy_binary"] = out["accuracy"]
+            out["precision_binary"] = out["precision"]
+            out["recall_binary"] = out["recall"]
+            out["f1_binary"] = out["f1"]
+            out["accuracy"] = float((yt == yp).mean())
+            out["precision"] = float(np.nanmean(np.asarray(prec3, dtype=float)))
+            out["recall"] = float(np.nanmean(np.asarray(rec3, dtype=float)))
+            out["f1"] = float(f1_macro_3)
+            out["signals"] = int((yp != 0).sum())
 
     # ---------- trading metriky (pokud máme ceny)
     px = _pick_price_series(df)
     sharpe_ann = None
     sharpe_net_ann = None
     if px is not None:
-        # Use full 3-state predictions for positions (SHORT/HOLD/LONG)
-        pos = _positions_from_predictions(yp)
-        equity_gross, trades_gross, trade_idx, trade_sides = _equity_from_positions(pos, px.values)
+        replay = replay_signals_over_market_data(
+            signals=yp,
+            prices=px.values,
+            timestamps=(df["timestamp"].tolist() if df is not None and "timestamp" in df.columns else None),
+            force_close=True,
+        )
+        equity_gross = np.asarray(replay.get("equity_curve") or [], dtype=float)
+        trades_gross = [float(x) for x in (replay.get("trade_pnls") or [])]
+        trade_sides = [int(x) for x in (replay.get("trade_sides") or [])]
+        closed_count_curve = np.asarray(replay.get("closed_count_curve") or [], dtype=float)
 
         n_trades = len(trades_gross)
         # approximate per-trade slippage as proportional to mean price
@@ -415,9 +379,8 @@ def calculate_metrics(
         per_trade_fee = float(fee_per_trade)
         trade_pnls_net = [float(p - per_trade_fee - per_trade_slip) for p in trades_gross]
 
-        slip_cost = per_trade_slip * n_trades
-        fee_cost = per_trade_fee * n_trades
-        equity_net = equity_gross - (slip_cost + fee_cost)
+        roundtrip_cost = per_trade_fee + per_trade_slip
+        equity_net = equity_gross - (closed_count_curve * roundtrip_cost)
 
         ret_gross = np.diff(equity_gross, prepend=equity_gross[0])
         ret_net = np.diff(equity_net, prepend=equity_net[0])
@@ -434,12 +397,32 @@ def calculate_metrics(
 
         num_trades_long = int(sum(1 for s in trade_sides if s == 1))
         num_trades_short = int(sum(1 for s in trade_sides if s == -1))
+        gross_long = _trades_for_side(trades_gross, trade_sides, 1)
+        gross_short = _trades_for_side(trades_gross, trade_sides, -1)
+        net_long = _trades_for_side(trade_pnls_net, trade_sides, 1)
+        net_short = _trades_for_side(trade_pnls_net, trade_sides, -1)
 
         out.update({
             "profit_gross": float(equity_gross[-1]) if equity_gross.size else 0.0,
             "profit_net": float(equity_net[-1]) if equity_net.size else 0.0,
             "trade_pnls_gross": list(trades_gross),
             "trade_pnls_net": list(trade_pnls_net),
+            "trade_pnls": list(trade_pnls_net),
+            "trades": [
+                {
+                    "entry_time": trade.entry_time,
+                    "exit_time": trade.exit_time,
+                    "direction": "LONG" if int(trade.side) > 0 else "SHORT",
+                    "entry_price": float(trade.entry_price),
+                    "exit_price": float(trade.exit_price),
+                    "pnl": float(trade.pnl),
+                    "pnl_net": float(net_pnl),
+                    "exit_reason": trade.exit_reason,
+                }
+                for trade, net_pnl in zip(replay.get("closed_trades") or [], trade_pnls_net)
+            ],
+            "equity_curve": equity_gross.tolist(),
+            "equity_curve_net": equity_net.tolist(),
             "sharpe": sharpe_val,
             "sharpe_net": sharpe_net_val,
             "sharpe_ann": sharpe_ann,
@@ -451,12 +434,32 @@ def calculate_metrics(
             "num_trades": int(n_trades),
             "num_trades_long": num_trades_long,
             "num_trades_short": num_trades_short,
-            "winrate": float(np.mean([t > 0 for t in trades_gross])) if n_trades else float("nan"),
+            "winrate": _winrate(trades_gross),
+            "winrate_gross": _winrate(trades_gross),
+            "winrate_net": _winrate(trade_pnls_net),
             "profit_factor": _profit_factor(trades_gross),
+            "profit_factor_gross": _profit_factor(trades_gross),
+            "profit_factor_net": _profit_factor(trade_pnls_net),
             "avg_pnl_trade": float(np.nanmean(trades_gross)) if n_trades else float("nan"),
+            "avg_pnl_trade_net": float(np.nanmean(trade_pnls_net)) if n_trades else float("nan"),
             "median_pnl_trade": float(np.nanmedian(trades_gross)) if n_trades else float("nan"),
+            "median_pnl_trade_net": float(np.nanmedian(trade_pnls_net)) if n_trades else float("nan"),
             "var_95": _var(trades_gross, 0.95),
             "cvar_95": _cvar(trades_gross, 0.95),
+            "var_95_net": _var(trade_pnls_net, 0.95),
+            "cvar_95_net": _cvar(trade_pnls_net, 0.95),
+            "long_trades": num_trades_long,
+            "short_trades": num_trades_short,
+            "long_net_trades": num_trades_long,
+            "short_net_trades": num_trades_short,
+            "long_winrate": _winrate(gross_long),
+            "short_winrate": _winrate(gross_short),
+            "long_net_winrate": _winrate(net_long),
+            "short_net_winrate": _winrate(net_short),
+            "long_profit_factor": _profit_factor(gross_long),
+            "short_profit_factor": _profit_factor(gross_short),
+            "long_net_profit_factor": _profit_factor(net_long),
+            "short_net_profit_factor": _profit_factor(net_short),
         })
 
         if n_trades and rolling_window > 1:
@@ -471,6 +474,7 @@ def calculate_metrics(
 
     # ---------- aliasy pro kompatibilitu (pokud někde UI očekává starší názvy)
     out.setdefault("sharpe_ratio", out.get("sharpe"))
+    out.setdefault("sharpe_ratio_net", out.get("sharpe_net"))
     out.setdefault("max_dd", out.get("max_drawdown"))
     out.setdefault("trades", out.get("num_trades"))
     out.setdefault("pf", out.get("profit_factor"))

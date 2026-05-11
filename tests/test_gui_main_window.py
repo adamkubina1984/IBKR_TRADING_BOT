@@ -109,3 +109,107 @@ def test_model_training_tab_propagates_search_backend_profile(monkeypatch, qapp)
         assert profile["optuna_timeout_seconds"] == 222
     finally:
         tab.close()
+
+
+def test_model_training_tab_logs_holdout_chunk_summary(qapp):
+    tab = ModelTrainingTab()
+    try:
+        tab._log_holdout_key_metrics(
+            {
+                "metrics": {
+                    "profit_net": 12.5,
+                    "num_trades": 10,
+                    "num_trades_short": 4,
+                    "num_trades_long": 6,
+                    "pf": 1.1,
+                    "max_dd": -5.0,
+                    "per_class_3": {
+                        "-1": {"recall": 0.20},
+                        "1": {"recall": 0.30},
+                    },
+                },
+                "quality_gate": {
+                    "holdout_chunks": [
+                        {
+                            "chunk_index": 1,
+                            "profit_net": -4.0,
+                            "num_trades": 3,
+                            "prediction_balance": {"n_short": 3, "n_long": 0},
+                        },
+                        {
+                            "chunk_index": 2,
+                            "profit_net": 1.5,
+                            "num_trades": 2,
+                            "prediction_balance": {"n_short": 1, "n_long": 1},
+                        },
+                        {
+                            "chunk_index": 3,
+                            "profit_net": 15.0,
+                            "num_trades": 5,
+                            "prediction_balance": {"n_short": 0, "n_long": 5},
+                        },
+                    ]
+                },
+            }
+        )
+
+        text = tab.log.toPlainText()
+        assert "INFO Holdout chunks:" in text
+        assert "c1 pnl=-4.00 trades=3 S/L=3/0" in text
+        assert "c3 pnl=15.00 trades=5 S/L=0/5" in text
+    finally:
+        tab.close()
+
+
+def test_model_training_tab_logs_reject_holdout_chunk_summary(tmp_path, qapp):
+    tab = ModelTrainingTab()
+    try:
+        diag_path = tmp_path / "diag.json"
+        diag_path.write_text(
+            __import__("json").dumps(
+                {
+                    "metrics_holdout": {
+                        "profit_net": -12.0,
+                        "sharpe": -0.2,
+                        "num_trades": 8,
+                        "num_trades_short": 7,
+                        "num_trades_long": 1,
+                        "per_class_3": {
+                            "-1": {"recall": 0.4},
+                            "1": {"recall": 0.1},
+                        },
+                    },
+                    "quality_gate": {
+                        "reasons": ["long_prediction_share_too_low(0.0500<0.1000)"],
+                        "holdout_chunks": [
+                            {
+                                "chunk_index": 1,
+                                "profit_net": -8.0,
+                                "num_trades": 4,
+                                "prediction_balance": {"n_short": 4, "n_long": 0},
+                            },
+                            {
+                                "chunk_index": 2,
+                                "profit_net": -4.0,
+                                "num_trades": 4,
+                                "prediction_balance": {"n_short": 3, "n_long": 1},
+                            },
+                        ],
+                    },
+                    "mc_summary": {"sharpe": {"p50": -0.15}},
+                    "threshold_tuning": {"selected_mode": "holdout_recent"},
+                    "ternary_threshold_short": 0.55,
+                    "ternary_threshold_long": 0.60,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        tab._log_reject_summary_from_diag_meta(f"QUALITY_GATE_REJECT: failed | diag_meta={diag_path.as_posix()}")
+
+        text = tab.log.toPlainText()
+        assert "INFO Reject summary:" in text
+        assert "INFO Reject holdout chunks:" in text
+        assert "c1 pnl=-8.00 trades=4 S/L=4/0" in text
+    finally:
+        tab.close()

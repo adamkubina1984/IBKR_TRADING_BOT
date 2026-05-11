@@ -10,6 +10,7 @@ from sklearn.metrics import f1_score, precision_score, recall_score
 
 from ibkr_trading_bot.features.feature_engineering import prepare_dataset_with_targets
 from ibkr_trading_bot.utils.io_helpers import load_dataframe
+from ibkr_trading_bot.utils.labeling import infer_label_mode, ternary_predict_signed
 from ibkr_trading_bot.utils.metrics import calculate_metrics
 
 
@@ -78,7 +79,7 @@ def _predict_with_thresholds(model, X: pd.DataFrame, bundle: dict | None = None)
     if hasattr(model, "predict_proba"):
         pr = model.predict_proba(X)
         if isinstance(pr, np.ndarray) and pr.ndim == 2 and pr.shape[1] >= 3:
-            return np.where(pr[:, 2] >= thr_long, 2, np.where(pr[:, 0] >= thr_short, 0, 1)).astype(int)
+            return ternary_predict_signed(pr[:, 0], pr[:, 2], thr_short, thr_long)
         if isinstance(pr, np.ndarray) and pr.ndim == 2 and pr.shape[1] >= 2:
             return (pr[:, 1] >= thr).astype(int)
     if hasattr(model, "decision_function"):
@@ -152,6 +153,7 @@ def evaluate_model(model_path: str, data_path: str) -> dict:
 
     y_true = dataset["target"].astype(int)
     y_pred = _predict_with_thresholds(model, X, bundle_or_model if isinstance(bundle_or_model, dict) else None)
+    label_mode = infer_label_mode(y_true, y_pred)
 
     f1, precision, recall, _ = _classification_metrics(y_true, y_pred)
 
@@ -162,7 +164,8 @@ def evaluate_model(model_path: str, data_path: str) -> dict:
         fee_per_trade=0.0,
         slippage_bps=0.0,
         rolling_window=200,
-        annualize_sharpe=False
+        annualize_sharpe=False,
+        label_mode=label_mode,
     )
 
     profit    = metrics.get("profit_net", metrics.get("profit_gross", metrics.get("profit", 0.0)))
@@ -247,6 +250,7 @@ def evaluate_model_once(
     if y_pred is None:
         raise TypeError("Načtený objekt modelu nemá metodu .predict()")
     y_hat = _predict_with_thresholds(model, X, bundle_or_model if isinstance(bundle_or_model, dict) else None)
+    label_mode = infer_label_mode(y_true, y_hat)
 
     # 6) metriky
     f1, precision, recall, accuracy = _classification_metrics(y_true, y_hat)
@@ -259,7 +263,8 @@ def evaluate_model_once(
         fee_per_trade=0.0,
         slippage_bps=0.0,
         rolling_window=200,
-        annualize_sharpe=False
+        annualize_sharpe=False,
+        label_mode=label_mode,
     )
 
     profit    = metrics.get("profit_net", metrics.get("profit_gross", metrics.get("profit", 0.0)))

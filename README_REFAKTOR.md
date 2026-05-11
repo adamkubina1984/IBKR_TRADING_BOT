@@ -24,3 +24,10 @@ Postupně lze přesouvat kód do služeb 1:1 (beze změny signatur).
 - Odstraněna duplicitní varianta souboru `gui/tab_live_bot - kopie.py`.
 - Přidán `gui/timeframe.py` s jednotnými volbami timeframe. GUI taby mohou použít `TIMEFRAME_OPTIONS`.
 - Poznámka: Další přesun logiky (plotting, evaluation, live) do služeb je připraven v `core/`, zachování chování zůstává prioritou.
+
+## Fáze 3 – sjednocení labelů a metrik
+- Přidán sdílený modul `utils/labeling.py` jako jediný převodník mezi `binary_01`, `binary_signed`, `ternary_signed` a `ternary_mapped`.
+- `utils/metrics.py` je jediný kanonický zdroj klasifikačních a trading metrik.
+- `utils/model_io.py` už není druhá implementace metrik; zůstal jen jako kompatibilitní shim.
+- Training, CLI evaluace, GUI evaluace i eval service nyní předávají explicitní nebo odvozený `label_mode`, takže se nemíchají mapped labely `0/1/2` se signed labely `-1/0/1`.
+- Live diagnostika zůstává trading-only, pokud není k dispozici ground truth.

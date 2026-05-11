@@ -47,7 +47,7 @@ def download_ibkr_by_date_range(
     output_dir: str = "data/raw",
     max_bars_per_batch: int = 5000,
     host: str = "127.0.0.1",
-    port: int = 7496,
+    port: int = 7497,
     client_id: int = 1,
     on_progress=None,
 ) -> str:
@@ -84,7 +84,58 @@ def download_ibkr_by_date_range(
     
     # Připojení
     ib = IB()
-    ib.connect(host, port, clientId=client_id)
+    attempted_ports: list[int] = []
+    connect_errors: list[str] = []
+    candidate_ports: list[int] = [int(port)]
+    candidate_client_ids: list[int] = [int(client_id), int(client_id) + 1, int(client_id) + 2, 11, 21]
+    candidate_client_ids = list(dict.fromkeys(cid for cid in candidate_client_ids if cid >= 0))
+    # Allow historical data download in both paper and live API modes.
+    # TWS: paper=7497, live=7496 | IB Gateway: paper=4002, live=4001.
+    candidate_ports.extend([7497, 4002, 7496, 4001])
+
+    def _format_connect_error(exc: Exception) -> str:
+        text = str(exc).strip()
+        if not text:
+            args = getattr(exc, "args", ())
+            args_text = ", ".join(repr(a) for a in args if a is not None)
+            text = f"args={args_text}" if args_text else repr(exc)
+        return f"{type(exc).__name__}: {text}"
+
+    seen_ports: set[int] = set()
+    used_port: int | None = None
+    used_client_id: int | None = None
+    for candidate in candidate_ports:
+        if candidate in seen_ports:
+            continue
+        seen_ports.add(candidate)
+        attempted_ports.append(candidate)
+        for candidate_client_id in candidate_client_ids:
+            try:
+                if ib.isConnected():
+                    ib.disconnect()
+                ib.connect(host, candidate, clientId=candidate_client_id, timeout=4)
+                used_port = candidate
+                used_client_id = candidate_client_id
+                break
+            except Exception as exc:
+                connect_errors.append(f"{candidate}/{candidate_client_id}: {_format_connect_error(exc)}")
+        if used_port is not None:
+            break
+
+    if used_port is None or not ib.isConnected():
+        attempted = ", ".join(str(p) for p in attempted_ports)
+        details = " | ".join(connect_errors) if connect_errors else "bez detailu"
+        raise ConnectionError(
+            "IBKR API pripojeni selhalo. "
+            f"Host={host}, zkousene porty=[{attempted}], clientId={client_id}, fallbackClientIds={candidate_client_ids}. "
+            "Zkontroluj TWS/Gateway API nastaveni (Enable ActiveX and Socket Clients, Trusted IP) "
+            "a ze bezi API port (paper: 7497/4002, live: 7496/4001). "
+            f"Detaily: {details}"
+        )
+    if used_client_id is not None and used_client_id != int(client_id):
+        print(
+            f"ℹ️  IBKR connect fallback: pozadovany clientId={client_id}, pouzit clientId={used_client_id} na portu {used_port}."
+        )
     
     try:
         # Definice kontraktu

@@ -106,7 +106,11 @@ def write_model(tmp_path: Path, name: str, *, ranking=None, profit_net: float = 
         "metrics_holdout": {"profit_net": profit_net},
     }
     if ranking is not None:
-        meta[model_eval_runtime.TAB5_HOLDOUT_RANKING_KEY] = ranking
+        model_eval_runtime.set_tab5_holdout_ranking(
+            meta,
+            ranking,
+            exit_policy=str(ranking.get("exit_policy") or "hold_until_opposite"),
+        )
     meta_path = model_path.with_name(model_path.stem + "_meta.json")
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return model_path
@@ -116,6 +120,7 @@ def ranking_payload(csv_path: Path, *, fee: float, profit_h: float, trades_h: fl
     return model_eval_runtime.build_tab5_holdout_ranking_payload(
         data_path=csv_path,
         fee_per_trade=fee,
+        exit_policy="hold_until_opposite",
         entry_threshold=0.55,
         exit_threshold=0.60,
         metrics={"profit_net": profit_h, "max_dd": -10.0, "trades": trades_h},

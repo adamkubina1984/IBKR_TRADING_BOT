@@ -22,7 +22,14 @@ ALLOWED_CANDIDATE_CRITERIA = {
 
 def normalize_training_mode(mode: str | None) -> str:
     txt = str(mode or "").strip().lower()
-    return txt if txt in {"quick", "standard", "strict"} else "standard"
+    alias_map = {
+        "fast": "refine",
+        "full": "explore",
+        "weekly": "refresh",
+    }
+    if txt in {"quick", "standard", "strict", "explore", "refine", "refresh"}:
+        return txt
+    return alias_map.get(txt, "standard")
 
 
 def normalize_candidate_criterion(value: str | None, *, default: str = "balanced") -> str:
@@ -37,6 +44,7 @@ def training_profile_for_mode(mode: str | None) -> dict[str, Any]:
     normalized = normalize_training_mode(mode)
     if normalized == "quick":
         return {
+            "profile_name": "quick",
             "n_splits": 3,
             "top_k_features": 8,
             "feature_stability_threshold": None,
@@ -49,8 +57,10 @@ def training_profile_for_mode(mode: str | None) -> dict[str, Any]:
             "mc_iters": 80,
             "quality_gate_enabled": False,
             "quality_gate_hard_reject": False,
-            "quality_min_trades": 6,
+            "quality_min_trades": 20,
             "quality_min_side_recall": 0.005,
+            "quality_min_side_prediction_share": 0.0,
+            "quality_min_side_prediction_count": 0,
             "quality_require_mc_nonnegative": False,
             "quality_min_mc_sharpe_p50": -0.05,
             "quality_min_profit_net": -50.0,
@@ -60,8 +70,40 @@ def training_profile_for_mode(mode: str | None) -> dict[str, Any]:
             "candidate_top_n": 5,
             "candidate_fresh_ratio": 0.30,
         }
+    if normalized == "explore":
+        return {
+            "profile_name": "explore",
+            "n_splits": 4,
+            "top_k_features": 10,
+            "feature_stability_threshold": 0.30,
+            "max_param_candidates": 80,
+            "param_sample_seed": 42,
+            "search_backend": "grid",
+            "optuna_trials": 16,
+            "optuna_timeout_seconds": 180,
+            "mc_enabled": False,
+            "mc_iters": 100,
+            "quality_gate_enabled": True,
+            "quality_gate_hard_reject": True,
+            "quality_min_trades": 80,
+            "quality_preferred_trade_min": 150,
+            "quality_preferred_trade_max": 300,
+            "quality_suspend_trade_limit": 420,
+            "quality_min_side_recall": 0.01,
+            "quality_min_side_prediction_share": 0.05,
+            "quality_min_side_prediction_count": 8,
+            "quality_require_mc_nonnegative": False,
+            "quality_min_mc_sharpe_p50": -0.05,
+            "quality_min_profit_net": 20.0,
+            "quality_min_holdout_sharpe": 0.002,
+            "candidate_chain_enabled": True,
+            "candidate_selection_criterion": "balanced",
+            "candidate_top_n": 12,
+            "candidate_fresh_ratio": 0.30,
+        }
     if normalized == "strict":
         return {
+            "profile_name": "strict",
             "n_splits": 6,
             "top_k_features": 14,
             "feature_stability_threshold": 0.50,
@@ -74,18 +116,83 @@ def training_profile_for_mode(mode: str | None) -> dict[str, Any]:
             "mc_iters": 300,
             "quality_gate_enabled": True,
             "quality_gate_hard_reject": True,
-            "quality_min_trades": 8,
+            "quality_min_trades": 60,
             "quality_min_side_recall": 0.01,
+            "quality_min_side_prediction_share": 0.05,
+            "quality_min_side_prediction_count": 10,
             "quality_require_mc_nonnegative": True,
             "quality_min_mc_sharpe_p50": -0.01,
             "quality_min_profit_net": 110.0,
             "quality_min_holdout_sharpe": 0.008,
             "candidate_chain_enabled": True,
             "candidate_selection_criterion": "balanced",
-            "candidate_top_n": 5,
+            "candidate_top_n": 10,
+            "candidate_fresh_ratio": 0.30,
+        }
+    if normalized == "refresh":
+        return {
+            "profile_name": "refresh",
+            "n_splits": 5,
+            "top_k_features": 12,
+            "feature_stability_threshold": 0.35,
+            "max_param_candidates": 12,
+            "param_sample_seed": 42,
+            "search_backend": "grid",
+            "optuna_trials": 0,
+            "optuna_timeout_seconds": 0,
+            "mc_enabled": True,
+            "mc_iters": 150,
+            "quality_gate_enabled": True,
+            "quality_gate_hard_reject": True,
+            "quality_min_trades": 100,
+            "quality_preferred_trade_min": 150,
+            "quality_preferred_trade_max": 300,
+            "quality_suspend_trade_limit": 420,
+            "quality_min_side_recall": 0.015,
+            "quality_min_side_prediction_share": 0.05,
+            "quality_min_side_prediction_count": 10,
+            "quality_require_mc_nonnegative": True,
+            "quality_min_mc_sharpe_p50": -0.02,
+            "quality_min_profit_net": 40.0,
+            "quality_min_holdout_sharpe": 0.003,
+            "candidate_chain_enabled": False,
+            "candidate_selection_criterion": "balanced",
+            "candidate_top_n": 1,
+            "candidate_fresh_ratio": 0.30,
+        }
+    if normalized == "refine":
+        return {
+            "profile_name": "refine",
+            "n_splits": 6,
+            "top_k_features": 12,
+            "feature_stability_threshold": 0.40,
+            "max_param_candidates": 120,
+            "param_sample_seed": 42,
+            "search_backend": "grid",
+            "optuna_trials": 32,
+            "optuna_timeout_seconds": 420,
+            "mc_enabled": True,
+            "mc_iters": 250,
+            "quality_gate_enabled": True,
+            "quality_gate_hard_reject": True,
+            "quality_min_trades": 100,
+            "quality_preferred_trade_min": 150,
+            "quality_preferred_trade_max": 300,
+            "quality_suspend_trade_limit": 420,
+            "quality_min_side_recall": 0.015,
+            "quality_min_side_prediction_share": 0.05,
+            "quality_min_side_prediction_count": 10,
+            "quality_require_mc_nonnegative": True,
+            "quality_min_mc_sharpe_p50": -0.01,
+            "quality_min_profit_net": 80.0,
+            "quality_min_holdout_sharpe": 0.005,
+            "candidate_chain_enabled": True,
+            "candidate_selection_criterion": "balanced",
+            "candidate_top_n": 8,
             "candidate_fresh_ratio": 0.30,
         }
     return {
+        "profile_name": "refine",
         "n_splits": 5,
         "top_k_features": 12,
         "feature_stability_threshold": 0.40,
@@ -98,8 +205,10 @@ def training_profile_for_mode(mode: str | None) -> dict[str, Any]:
         "mc_iters": 300,
         "quality_gate_enabled": True,
         "quality_gate_hard_reject": True,
-        "quality_min_trades": 8,
+        "quality_min_trades": 60,
         "quality_min_side_recall": 0.01,
+        "quality_min_side_prediction_share": 0.05,
+        "quality_min_side_prediction_count": 10,
         "quality_require_mc_nonnegative": True,
         "quality_min_mc_sharpe_p50": -0.03,
         "quality_min_profit_net": 60.0,
@@ -320,6 +429,8 @@ def run_training_job(
             quality_gate_hard_reject=bool(profile.get("quality_gate_hard_reject", True)),
             quality_min_trades=int(profile.get("quality_min_trades", 8)),
             quality_min_side_recall=float(profile.get("quality_min_side_recall", 0.01)),
+            quality_min_side_prediction_share=float(profile.get("quality_min_side_prediction_share", 0.0)),
+            quality_min_side_prediction_count=int(profile.get("quality_min_side_prediction_count", 0)),
             quality_require_mc_nonnegative=bool(profile.get("quality_require_mc_nonnegative", True)),
             quality_min_mc_sharpe_p50=float(profile.get("quality_min_mc_sharpe_p50", -0.02)),
             quality_min_profit_net=float(profile.get("quality_min_profit_net", 0.0)),
@@ -367,6 +478,14 @@ def run_training_job(
     quality_gate = (meta_obj.get("quality_gate") or {}) if isinstance(meta_obj, dict) else {}
     qg_reasons = list(quality_gate.get("reasons") or []) if isinstance(quality_gate, dict) else []
 
+    trade_count = metrics.get("num_trades")
+    if trade_count is None:
+        raw_trades = metrics.get("trades")
+        if isinstance(raw_trades, list):
+            trade_count = len(raw_trades)
+        else:
+            trade_count = raw_trades
+
     return {
         "phase": phase_norm,
         "model": estimator_norm,
@@ -386,7 +505,7 @@ def run_training_job(
         "profit_net": metrics.get("profit_net"),
         "sharpe": metrics.get("sharpe"),
         "pf": metrics.get("pf"),
-        "trades": metrics.get("trades", metrics.get("num_trades")),
+        "trades": trade_count,
         "num_trades_short": metrics.get("num_trades_short"),
         "num_trades_long": metrics.get("num_trades_long"),
         "qg_reasons": qg_reasons,

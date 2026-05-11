@@ -21,6 +21,7 @@ venv/
 .codex_test_tmp/
 .pytest_tmp/
 _pytest_tmp/
+.smoke_live_service*/
 tmp*/
 
 # Generated market data

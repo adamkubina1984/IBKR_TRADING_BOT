@@ -302,6 +302,11 @@ def _candidate_priority_score(row: dict[str, Any], criterion: str) -> float:
         )
     if n_short <= 0.0 or n_long <= 0.0:
         score -= 0.50
+    elif n_dir > 0.0:
+        min_side_share = float(np.clip(min(n_short, n_long) / max(n_dir, 1e-9), 0.0, 0.5))
+        side_share_floor = 0.20
+        if min_side_share < side_share_floor:
+            score -= 0.35 * ((side_share_floor - min_side_share) / side_share_floor)
     return float(score)
 
 
@@ -975,12 +980,136 @@ def _directional_f1_from_metrics(metrics: dict[str, Any]) -> float:
     return float("nan")
 
 
+def _prediction_side_balance_summary(y_pred: np.ndarray | None) -> dict[str, float | int]:
+    arr = np.asarray(y_pred if y_pred is not None else [], dtype=int).reshape(-1)
+    if arr.size <= 0:
+        return {
+            "n_short": 0,
+            "n_long": 0,
+            "n_hold": 0,
+            "n_directional": 0,
+            "short_share": float("nan"),
+            "long_share": float("nan"),
+        }
+
+    n_short = int(np.sum(arr < 0))
+    n_long = int(np.sum(arr > 0))
+    n_hold = int(np.sum(arr == 0))
+    n_directional = int(n_short + n_long)
+    short_share = (float(n_short) / float(n_directional)) if n_directional > 0 else float("nan")
+    long_share = (float(n_long) / float(n_directional)) if n_directional > 0 else float("nan")
+    return {
+        "n_short": int(n_short),
+        "n_long": int(n_long),
+        "n_hold": int(n_hold),
+        "n_directional": int(n_directional),
+        "short_share": float(short_share),
+        "long_share": float(long_share),
+    }
+
+
+def _build_holdout_chunk_diagnostics(
+    y_true: np.ndarray | None,
+    y_pred: np.ndarray | None,
+    df_hold: pd.DataFrame | None,
+    *,
+    fee_per_trade: float,
+    slippage_bps: float,
+    annualize_sharpe: bool,
+    max_chunks: int = 3,
+) -> list[dict[str, Any]]:
+    arr_true = np.asarray(y_true if y_true is not None else [], dtype=int).reshape(-1)
+    arr_pred = np.asarray(y_pred if y_pred is not None else [], dtype=int).reshape(-1)
+    if df_hold is None or len(df_hold) <= 0 or arr_true.size <= 0 or arr_pred.size <= 0:
+        return []
+
+    n_rows = int(min(len(df_hold), arr_true.size, arr_pred.size))
+    if n_rows <= 0:
+        return []
+
+    frame = df_hold.iloc[:n_rows].reset_index(drop=True).copy()
+    arr_true = arr_true[:n_rows]
+    arr_pred = arr_pred[:n_rows]
+    n_chunks = int(max(1, min(int(max_chunks), n_rows)))
+    row_slices = np.array_split(np.arange(n_rows, dtype=int), n_chunks)
+    ts_col = next((col for col in ("timestamp", "time", "date") if col in frame.columns), None)
+
+    def _ts_value(idx: int) -> str | None:
+        if ts_col is None:
+            return None
+        try:
+            ts = pd.to_datetime(frame.iloc[int(idx)][ts_col], utc=True, errors="coerce")
+            return None if pd.isna(ts) else str(ts.isoformat())
+        except Exception:
+            return None
+
+    def _safe_float(value: Any) -> float | None:
+        try:
+            fv = float(value)
+            return float(fv) if np.isfinite(fv) else None
+        except Exception:
+            return None
+
+    chunks: list[dict[str, Any]] = []
+    for idx, rows in enumerate(row_slices, start=1):
+        rows_arr = np.asarray(rows, dtype=int)
+        if rows_arr.size <= 0:
+            continue
+        start = int(rows_arr[0])
+        stop = int(rows_arr[-1]) + 1
+        y_true_chunk = arr_true[start:stop]
+        y_pred_chunk = arr_pred[start:stop]
+        df_chunk = frame.iloc[start:stop].reset_index(drop=True)
+        metrics_chunk: dict[str, Any] = {}
+        if HAS_CALC_METRICS and len(df_chunk) > 0:
+            try:
+                metrics_chunk = calculate_metrics(
+                    y_true=y_true_chunk,
+                    y_pred=y_pred_chunk,
+                    df=df_chunk,
+                    fee_per_trade=fee_per_trade,
+                    slippage_bps=slippage_bps,
+                    annualize_sharpe=annualize_sharpe,
+                )
+            except Exception:
+                metrics_chunk = {}
+        if not metrics_chunk:
+            metrics_chunk = {
+                "accuracy": float((y_true_chunk == y_pred_chunk).mean()) if y_true_chunk.size > 0 else None,
+                "num_trades": int(np.sum(y_pred_chunk != 0)),
+                "num_trades_short": int(np.sum(y_pred_chunk < 0)),
+                "num_trades_long": int(np.sum(y_pred_chunk > 0)),
+            }
+        chunks.append(
+            {
+                "chunk_index": int(idx),
+                "n_rows": int(len(df_chunk)),
+                "start_row": int(start),
+                "end_row": int(stop - 1),
+                "start_timestamp": _ts_value(start),
+                "end_timestamp": _ts_value(stop - 1),
+                "prediction_balance": _prediction_side_balance_summary(y_pred_chunk),
+                "profit_net": _safe_float(metrics_chunk.get("profit_net")),
+                "sharpe": _safe_float(metrics_chunk.get("sharpe", metrics_chunk.get("sharpe_ann"))),
+                "accuracy": _safe_float(metrics_chunk.get("accuracy")),
+                "num_trades": int(metrics_chunk.get("num_trades", 0) or 0),
+                "num_trades_short": int(metrics_chunk.get("num_trades_short", 0) or 0),
+                "num_trades_long": int(metrics_chunk.get("num_trades_long", 0) or 0),
+                "directional_f1": _safe_float(_directional_f1_from_metrics(metrics_chunk)),
+            }
+        )
+    return chunks
+
+
 def _quality_gate_vs_baseline_ternary(
     holdout_metrics: dict[str, Any],
     baseline_metrics: dict[str, Any],
     *,
     min_f1_lift: float = 0.01,
     min_trades: int = 8,
+    y_pred: np.ndarray | None = None,
+    min_side_prediction_share: float = 0.0,
+    min_side_prediction_count: int = 0,
 ) -> tuple[bool, list[str]]:
     """Gate model quality against trivial all-HOLD baseline on holdout."""
     reasons: list[str] = []
@@ -1008,6 +1137,33 @@ def _quality_gate_vs_baseline_ternary(
         reasons.append("no_short_trades")
     if n_long == 0:
         reasons.append("no_long_trades")
+
+    pred_balance = _prediction_side_balance_summary(y_pred)
+    pred_short = int(pred_balance.get("n_short", 0) or 0)
+    pred_long = int(pred_balance.get("n_long", 0) or 0)
+    pred_directional = int(pred_balance.get("n_directional", 0) or 0)
+    pred_short_share = float(pred_balance.get("short_share", np.nan))
+    pred_long_share = float(pred_balance.get("long_share", np.nan))
+    min_pred_share = float(max(0.0, min_side_prediction_share))
+    min_pred_count = int(max(0, min_side_prediction_count))
+
+    if pred_directional <= 0 and (min_pred_share > 0.0 or min_pred_count > 0):
+        reasons.append("no_directional_predictions")
+    else:
+        if pred_short == 0:
+            reasons.append("no_short_predictions")
+        if pred_long == 0:
+            reasons.append("no_long_predictions")
+        if min_pred_count > 0:
+            if pred_short < min_pred_count:
+                reasons.append(f"short_predictions_too_few({pred_short}<{min_pred_count})")
+            if pred_long < min_pred_count:
+                reasons.append(f"long_predictions_too_few({pred_long}<{min_pred_count})")
+        if min_pred_share > 0.0:
+            if np.isfinite(pred_short_share) and pred_short_share < min_pred_share:
+                reasons.append(f"short_prediction_share_too_low({pred_short_share:.4f}<{min_pred_share:.4f})")
+            if np.isfinite(pred_long_share) and pred_long_share < min_pred_share:
+                reasons.append(f"long_prediction_share_too_low({pred_long_share:.4f}<{min_pred_share:.4f})")
     return (len(reasons) == 0), reasons
 
 def _choose_threshold_from_oof(y_true: np.ndarray, oof_proba: np.ndarray, df_oof: pd.DataFrame | None,
@@ -1869,6 +2025,8 @@ def train_and_evaluate_model(
     quality_gate_hard_reject: bool = bool(kwargs.pop("quality_gate_hard_reject", False))
     quality_min_directional_f1: float = float(kwargs.pop("quality_min_directional_f1", 0.03))
     quality_min_side_recall: float = float(kwargs.pop("quality_min_side_recall", 0.01))
+    quality_min_side_prediction_share: float = float(kwargs.pop("quality_min_side_prediction_share", 0.0))
+    quality_min_side_prediction_count: int = int(kwargs.pop("quality_min_side_prediction_count", 0))
     quality_require_mc_nonnegative: bool = bool(kwargs.pop("quality_require_mc_nonnegative", True))
     quality_min_mc_sharpe_p50: float = float(kwargs.pop("quality_min_mc_sharpe_p50", -0.02))
     quality_min_profit_net: float = float(kwargs.pop("quality_min_profit_net", 0.0))
@@ -3342,6 +3500,7 @@ def train_and_evaluate_model(
 
     holdout_metrics, train_metrics, mc_summary = {}, {}, {}
     baseline_holdout_metrics: dict[str, Any] = {}
+    holdout_chunk_diagnostics: list[dict[str, Any]] = []
     quality_gate: dict[str, Any] = {
         "enabled": bool(quality_gate_enabled),
         "hard_reject": bool(quality_gate_hard_reject),
@@ -3352,11 +3511,15 @@ def train_and_evaluate_model(
         "min_trades": int(quality_min_trades),
         "min_directional_f1": float(quality_min_directional_f1),
         "min_side_recall": float(quality_min_side_recall),
+        "min_side_prediction_share": float(quality_min_side_prediction_share),
+        "min_side_prediction_count": int(quality_min_side_prediction_count),
         "require_mc_nonnegative": bool(quality_require_mc_nonnegative),
         "min_mc_sharpe_p50": float(quality_min_mc_sharpe_p50),
         "min_profit_net": float(quality_min_profit_net),
         "min_holdout_sharpe": float(quality_min_holdout_sharpe),
         "baseline_metrics": {},
+        "holdout_prediction_balance": {},
+        "holdout_chunks": [],
     }
     n_signals_holdout: int | None = None
     n_signals_train: int | None = None
@@ -3471,12 +3634,25 @@ def train_and_evaluate_model(
                         fee_per_trade=fee_per_trade, slippage_bps=slippage_bps,
                         annualize_sharpe=annualize_sharpe,
                     )
+                    holdout_chunk_diagnostics = _build_holdout_chunk_diagnostics(
+                        yh_eval,
+                        ypred_eval,
+                        df_hold,
+                        fee_per_trade=fee_per_trade,
+                        slippage_bps=slippage_bps,
+                        annualize_sharpe=annualize_sharpe,
+                    )
+                    quality_gate["holdout_chunks"] = list(holdout_chunk_diagnostics)
                     if quality_gate_enabled:
+                        quality_gate["holdout_prediction_balance"] = _prediction_side_balance_summary(ypred_eval)
                         gate_ok, gate_reasons = _quality_gate_vs_baseline_ternary(
                             holdout_metrics=holdout_metrics,
                             baseline_metrics=baseline_holdout_metrics,
                             min_f1_lift=quality_min_f1_lift,
                             min_trades=quality_min_trades,
+                            y_pred=ypred_eval,
+                            min_side_prediction_share=quality_min_side_prediction_share,
+                            min_side_prediction_count=quality_min_side_prediction_count,
                         )
                         quality_gate["evaluated"] = True
                         quality_gate["passed"] = bool(gate_ok)

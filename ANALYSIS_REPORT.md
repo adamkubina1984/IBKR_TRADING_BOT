@@ -1,5 +1,19 @@
 # 📊 Kompletní Analýza Projektu ibkr_trading_bot
 
+## Update 20. dubna 2026
+
+Po této původní analýze proběhla konsolidace metrik a label konvencí. Aktuální stav projektu je v těchto bodech odlišný od níže uvedeného historického reportu:
+
+- Kanonická implementace metrik je pouze v `ibkr_trading_bot.utils.metrics`.
+- `utils/model_io.py` už není aktivní druhý výpočetní modul; slouží jen jako kompatibilitní shim.
+- Pro ternární klasifikaci je kanonická významová vrstva `-1/0/1 = short/flat/long`.
+- Mapped labely `0/1/2` jsou pouze interní reprezentace pro některé sklearn-compatible training flow.
+- CLI evaluace, GUI evaluace a sdílené eval služby už normalizují labely přes `ibkr_trading_bot.utils.labeling`.
+- Live degradace a jiné trading-only obrazovky už nevyrábějí umělé klasifikační metriky bez reálného `y_true`.
+- Ranking bias vyhodnocuje jen signed directional class recall pro short a long.
+
+Níže uvedený dokument ber jako historický audit architektury a kvality kódu; pro aktuální sémantiku labelů a metrik je směrodatný `README.md` a implementace v `utils/labeling.py` a `utils/metrics.py`.
+
 **Datum analýzy:** 17. února 2026  
 **Vykonána kontrola znesení:** Řídící kontrola repozitáře  
 **Stav:** ✅ Funkční, testovatelný projekt s dobrou kódovou kvalitou

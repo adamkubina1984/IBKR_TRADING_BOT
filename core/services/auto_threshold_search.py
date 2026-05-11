@@ -41,7 +41,7 @@ def is_better_auto_threshold_candidate(
     best_exit: float,
     current_entry: float,
     current_exit: float,
-    pick_metric: Callable[[dict[str, Any] | None, str], Any],
+    pick_metric: Callable[..., Any],
 ) -> bool:
     if cand_score > (best_score + 1e-9):
         return True
@@ -64,8 +64,8 @@ def is_better_auto_threshold_candidate(
     if best_dist < (cand_dist - 1e-12):
         return False
 
-    cand_trades = _as_finite_float(pick_metric(cand_metrics, "trades"), fallback=0.0)
-    best_trades = _as_finite_float(pick_metric(best_metrics, "trades"), fallback=0.0)
+    cand_trades = _as_finite_float(pick_metric(cand_metrics, "num_trades", "trades"), fallback=0.0)
+    best_trades = _as_finite_float(pick_metric(best_metrics, "num_trades", "trades"), fallback=0.0)
     return cand_trades > best_trades
 
 
@@ -74,7 +74,7 @@ def run_auto_threshold_search(
     current_entry: float,
     current_exit: float,
     evaluate_pair: Callable[[float, float], tuple[float, dict[str, Any]]],
-    pick_metric: Callable[[dict[str, Any] | None, str], Any],
+    pick_metric: Callable[..., Any],
     progress_cb: Callable[[str], None] | None = None,
     should_run: Callable[[], bool] | None = None,
 ) -> AutoThresholdSearchResult:

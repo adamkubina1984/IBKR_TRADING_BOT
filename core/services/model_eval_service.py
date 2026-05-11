@@ -11,6 +11,16 @@ import pandas as pd
 
 from ibkr_trading_bot.core.services.auto_threshold_search import run_auto_threshold_search
 from ibkr_trading_bot.core.services.evaluation_service import EvaluationService
+from ibkr_trading_bot.core.services.signal_policy import (
+    DEFAULT_EXIT_POLICY,
+    apply_confidence_entry_threshold,
+    apply_entry_exit_thresholds,
+    apply_exit_confidence_threshold,
+    extract_directional_probabilities,
+    normalize_signal_array,
+    resolve_exit_policy_setting,
+    ternary_proba_to_signal,
+)
 from ibkr_trading_bot.core.services.model_service import (
     build_sklearn_version_warning,
     merge_model_metadata,
@@ -20,6 +30,8 @@ from ibkr_trading_bot.features.feature_engineering import prepare_dataset_with_t
 
 
 TAB5_HOLDOUT_RANKING_KEY = "tab5_holdout_ranking"
+TAB5_HOLDOUT_RANKING_BY_POLICY_KEY = "tab5_holdout_ranking_by_policy"
+TAB5_HOLDOUT_RANKING_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -46,6 +58,7 @@ class EvaluationPayload:
     thr_long: float
     entry_threshold: float
     exit_threshold: float
+    exit_policy: str
 
 
 @dataclass
@@ -95,6 +108,8 @@ def pick_metric(metrics: dict[str, Any] | None, *keys: str) -> Any:
         if key in source:
             value = source.get(key)
             if value is not None:
+                if isinstance(value, (list, tuple, dict, set, np.ndarray, pd.Series, pd.DataFrame)):
+                    continue
                 return value
     return None
 
@@ -408,37 +423,15 @@ def resolve_ternary_thresholds_eval(metadata: dict[str, Any]) -> tuple[float, fl
 
 
 def apply_confidence_threshold_eval(raw_pred, confidence, threshold):
-    arr = np.asarray(raw_pred).copy()
-    conf = np.asarray(confidence).reshape(-1)
-    thr = float(threshold)
-    mask_low = conf < thr
-    try:
-        arr[mask_low] = 0
-    except Exception:
-        tmp = np.array(arr, dtype=object)
-        tmp[mask_low] = 0
-        arr = tmp
-    return arr
+    return apply_confidence_entry_threshold(raw_pred, confidence, threshold)
 
 
 def apply_exit_threshold_eval(y_pred: np.ndarray, confidence: np.ndarray, exit_thr: float) -> np.ndarray:
-    arr = np.asarray(y_pred).copy()
-    conf = np.asarray(confidence).reshape(-1)
-    mask_low = conf < float(exit_thr)
-    open_pos = np.abs(arr) > 0.5
-    arr[mask_low & open_pos] = 0
-    return arr
+    return apply_exit_confidence_threshold(y_pred, confidence, exit_thr)
 
 
 def normalize_pred_eval(arr) -> np.ndarray:
-    a = np.asarray(arr, dtype=object)
-    out = np.zeros(a.shape, dtype=float)
-    num_mask = np.array([isinstance(x, (int, float, np.number)) for x in a], dtype=bool)
-    out[num_mask] = np.sign(a[num_mask].astype(float))
-    txt = np.char.lower(a.astype(str))
-    out[(txt == "long") | (txt == "buy") | (txt == "up") | (txt == "1") | (txt == "+1")] = 1.0
-    out[(txt == "short") | (txt == "sell") | (txt == "down") | (txt == "-1")] = -1.0
-    return out
+    return normalize_signal_array(arr)
 
 
 def safe_close_series_eval(df: pd.DataFrame | None):
@@ -460,6 +453,7 @@ def run_model_evaluation(
     fee_per_trade: float,
     entry_threshold: float,
     exit_threshold: float,
+    exit_policy: str | None = None,
     progress_cb=None,
 ) -> EvaluationPayload:
     if model is None:
@@ -493,10 +487,14 @@ def run_model_evaluation(
     if proba is None or proba.ndim != 2 or int(proba.shape[1]) != 3:
         raise ValueError("Tab 3 vyzaduje ternarni model s predict_proba (3 tridy: short/neutral/long).")
 
-    prob_long = proba[:, 2]
-    prob_short = proba[:, 0]
-    y_pred_raw = np.where(prob_long >= thr_long, 1, np.where(prob_short >= thr_short, -1, 0))
+    prob_short, _prob_hold, prob_long = extract_directional_probabilities(
+        proba,
+        getattr(model, "classes_", None),
+        label_map=(metadata or {}).get("class_to_dir"),
+    )
+    y_pred_raw = ternary_proba_to_signal(prob_short, prob_long, thr_short, thr_long)
     confidence_arr = np.max(proba, axis=1)
+    policy_name = resolve_exit_policy_setting(exit_policy if exit_policy is not None else (metadata or {}), default=DEFAULT_EXIT_POLICY)
     y_pred_used, results = recalculate_metrics_from_predictions(
         y_pred_raw=np.asarray(y_pred_raw),
         confidence_arr=np.asarray(confidence_arr),
@@ -505,6 +503,7 @@ def run_model_evaluation(
         fee_per_trade=float(fee_per_trade),
         entry_threshold=float(entry_threshold),
         exit_threshold=float(exit_threshold),
+        exit_policy=policy_name,
         progress_cb=progress_cb,
     )
 
@@ -523,6 +522,7 @@ def run_model_evaluation(
         thr_long=float(thr_long),
         entry_threshold=float(entry_threshold),
         exit_threshold=float(exit_threshold),
+        exit_policy=policy_name,
     )
 
 
@@ -535,15 +535,18 @@ def recalculate_metrics_from_predictions(
     fee_per_trade: float,
     entry_threshold: float,
     exit_threshold: float,
+    exit_policy: str = DEFAULT_EXIT_POLICY,
     progress_cb=None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     if callable(progress_cb):
         progress_cb("Prepocitavam metriky...")
-    y_pred_used = apply_confidence_threshold_eval(y_pred_raw, confidence_arr, entry_threshold)
-    y_pred_used = normalize_pred_eval(y_pred_used)
-    if float(exit_threshold) > 0.0:
-        y_pred_used = apply_exit_threshold_eval(y_pred_used, confidence_arr, exit_threshold)
-        y_pred_used = normalize_pred_eval(y_pred_used)
+    y_pred_used = apply_entry_exit_thresholds(
+        y_pred_raw,
+        confidence_arr,
+        entry_threshold,
+        exit_threshold,
+        exit_policy=exit_policy,
+    )
 
     results = EvaluationService(None, None, None).calculate_metrics(
         y_true=np.asarray(y_true_current),
@@ -568,15 +571,18 @@ def run_auto_threshold_search_from_context(
     fee_per_trade: float,
     current_entry: float,
     current_exit: float,
+    exit_policy: str = DEFAULT_EXIT_POLICY,
     progress_cb=None,
     should_run=None,
 ) -> AutoThresholdPayload:
     def evaluate_pair(entry_thr: float, exit_thr: float) -> tuple[float, dict[str, Any]]:
-        y = apply_confidence_threshold_eval(y_pred_raw, confidence_arr, float(entry_thr))
-        y = normalize_pred_eval(y)
-        if float(exit_thr) > 0.0:
-            y = apply_exit_threshold_eval(y, confidence_arr, float(exit_thr))
-            y = normalize_pred_eval(y)
+        y = apply_entry_exit_thresholds(
+            y_pred_raw,
+            confidence_arr,
+            float(entry_thr),
+            float(exit_thr),
+            exit_policy=exit_policy,
+        )
         metrics = EvaluationService(None, None, None).calculate_metrics(
             y_true=np.asarray(y_true_current),
             y_pred=y,
@@ -590,12 +596,13 @@ def run_auto_threshold_search_from_context(
         score = safe_float(profit)
         return (score if score is not None else float("-inf")), metrics
 
-    def pick_metric_for_search(metrics: dict[str, Any] | None, metric_name: str):
-        if metric_name == "max_dd":
+    def pick_metric_for_search(metrics: dict[str, Any] | None, *metric_names: str):
+        metric_name_set = {str(name) for name in metric_names}
+        if "max_dd" in metric_name_set:
             return pick_metric(metrics, "max_dd", "max_drawdown_net", "max_drawdown")
-        if metric_name == "trades":
-            return pick_metric(metrics, "trades", "num_trades")
-        raise KeyError(metric_name)
+        if metric_name_set.intersection({"trades", "num_trades"}):
+            return pick_metric(metrics, "num_trades", "trades")
+        raise KeyError(", ".join(str(name) for name in metric_names))
 
     result = run_auto_threshold_search(
         current_entry=float(current_entry),
@@ -617,6 +624,7 @@ def build_tab5_holdout_ranking_payload(
     *,
     data_path: str | Path,
     fee_per_trade: float,
+    exit_policy: str = DEFAULT_EXIT_POLICY,
     entry_threshold: float | None,
     exit_threshold: float | None,
     metrics: dict[str, Any] | None = None,
@@ -626,7 +634,9 @@ def build_tab5_holdout_ranking_payload(
     normalized_path = normalize_path(data_path)
     csv_stat = Path(normalized_path).stat()
     out: dict[str, Any] = {
+        "schema_version": TAB5_HOLDOUT_RANKING_SCHEMA_VERSION,
         "status": str(status),
+        "exit_policy": resolve_exit_policy_setting(exit_policy, default=DEFAULT_EXIT_POLICY),
         "csv_path": normalized_path,
         "csv_size": int(csv_stat.st_size),
         "csv_mtime_ns": int(csv_stat.st_mtime_ns),
@@ -636,7 +646,7 @@ def build_tab5_holdout_ranking_payload(
         "exit_threshold": finite_or_none(exit_threshold),
         "profit_h": finite_or_none(pick_metric(metrics, "profit_net", "profit_gross", "profit")),
         "max_dd_h": finite_or_none(pick_metric(metrics, "max_dd", "max_drawdown_net", "max_drawdown")),
-        "trades_h": finite_or_none(pick_metric(metrics, "trades", "num_trades")),
+        "trades_h": finite_or_none(pick_metric(metrics, "num_trades", "trades")),
         "evaluated_at": utc_now_iso(),
     }
     if error:
@@ -644,11 +654,54 @@ def build_tab5_holdout_ranking_payload(
     return out
 
 
-def get_tab5_holdout_ranking(meta: dict[str, Any] | None) -> dict[str, Any] | None:
+def set_tab5_holdout_ranking(
+    meta: dict[str, Any] | None,
+    ranking: dict[str, Any] | None,
+    *,
+    exit_policy: str = DEFAULT_EXIT_POLICY,
+) -> dict[str, Any] | None:
+    if not isinstance(meta, dict) or not isinstance(ranking, dict):
+        return None
+    policy_name = resolve_exit_policy_setting(
+        exit_policy if exit_policy is not None else ranking,
+        default=DEFAULT_EXIT_POLICY,
+    )
+    payload = dict(ranking)
+    payload["exit_policy"] = policy_name
+    by_policy = meta.get(TAB5_HOLDOUT_RANKING_BY_POLICY_KEY)
+    if not isinstance(by_policy, dict):
+        by_policy = {}
+    by_policy = dict(by_policy)
+    by_policy[policy_name] = payload
+    meta[TAB5_HOLDOUT_RANKING_BY_POLICY_KEY] = by_policy
+    meta[TAB5_HOLDOUT_RANKING_KEY] = payload
+    return payload
+
+
+def get_tab5_holdout_ranking(
+    meta: dict[str, Any] | None,
+    *,
+    exit_policy: str | None = None,
+) -> dict[str, Any] | None:
     if not isinstance(meta, dict):
         return None
+    requested_policy = None
+    if exit_policy is not None:
+        requested_policy = resolve_exit_policy_setting(exit_policy, default=DEFAULT_EXIT_POLICY)
+        by_policy = meta.get(TAB5_HOLDOUT_RANKING_BY_POLICY_KEY)
+        if isinstance(by_policy, dict):
+            ranking = by_policy.get(requested_policy)
+            if isinstance(ranking, dict):
+                return ranking
     ranking = meta.get(TAB5_HOLDOUT_RANKING_KEY)
-    return ranking if isinstance(ranking, dict) else None
+    if not isinstance(ranking, dict):
+        return None
+    if requested_policy is None:
+        return ranking
+    ranking_policy = ranking.get("exit_policy")
+    if ranking_policy is None:
+        return ranking if requested_policy == DEFAULT_EXIT_POLICY else None
+    return ranking if resolve_exit_policy_setting(ranking_policy, default=DEFAULT_EXIT_POLICY) == requested_policy else None
 
 
 def is_tab5_holdout_ranking_stale(
@@ -656,11 +709,18 @@ def is_tab5_holdout_ranking_stale(
     *,
     data_path: str | Path,
     fee_per_trade: float,
+    exit_policy: str = DEFAULT_EXIT_POLICY,
     model_path: str | Path | None = None,
     meta_path: str | Path | None = None,
 ) -> bool:
-    ranking = get_tab5_holdout_ranking(meta)
+    requested_policy = resolve_exit_policy_setting(exit_policy, default=DEFAULT_EXIT_POLICY)
+    ranking = get_tab5_holdout_ranking(meta, exit_policy=requested_policy)
     if not isinstance(ranking, dict):
+        return True
+    ranking_policy = resolve_exit_policy_setting(ranking.get("exit_policy"), default=DEFAULT_EXIT_POLICY)
+    if ranking_policy != requested_policy:
+        return True
+    if int(ranking.get("schema_version", 0) or 0) != TAB5_HOLDOUT_RANKING_SCHEMA_VERSION:
         return True
     normalized_path = normalize_path(data_path)
     csv_stat = Path(normalized_path).stat()
