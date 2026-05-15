@@ -14,11 +14,29 @@ class AutoThresholdSearchResult:
     best_metrics: dict[str, Any] | None
 
 
+def _pick_metric_compat(
+    metrics: dict[str, Any] | None,
+    pick_metric: Callable[..., Any],
+    *keys: str,
+) -> Any:
+    try:
+        return pick_metric(metrics, *keys)
+    except TypeError:
+        for key in keys:
+            try:
+                value = pick_metric(metrics, key)
+            except KeyError:
+                continue
+            if value is not None:
+                return value
+    return None
+
+
 def _metric_abs_dd(
     metrics: dict[str, Any] | None,
     pick_metric: Callable[[dict[str, Any] | None, str], Any],
 ) -> float:
-    return abs(_as_finite_float(pick_metric(metrics, "max_dd"), fallback=np.inf))
+    return abs(_as_finite_float(_pick_metric_compat(metrics, pick_metric, "max_dd"), fallback=np.inf))
 
 
 def _as_finite_float(value: Any, fallback: float = np.nan) -> float:
@@ -50,8 +68,8 @@ def is_better_auto_threshold_candidate(
     if not np.isclose(cand_score, best_score, atol=1e-9):
         return False
 
-    cand_dd = abs(_as_finite_float(pick_metric(cand_metrics, "max_dd"), fallback=np.inf))
-    best_dd = abs(_as_finite_float(pick_metric(best_metrics, "max_dd"), fallback=np.inf))
+    cand_dd = abs(_as_finite_float(_pick_metric_compat(cand_metrics, pick_metric, "max_dd"), fallback=np.inf))
+    best_dd = abs(_as_finite_float(_pick_metric_compat(best_metrics, pick_metric, "max_dd"), fallback=np.inf))
     if cand_dd < (best_dd - 1e-9):
         return True
     if best_dd < (cand_dd - 1e-9):
@@ -64,8 +82,14 @@ def is_better_auto_threshold_candidate(
     if best_dist < (cand_dist - 1e-12):
         return False
 
-    cand_trades = _as_finite_float(pick_metric(cand_metrics, "num_trades", "trades"), fallback=0.0)
-    best_trades = _as_finite_float(pick_metric(best_metrics, "num_trades", "trades"), fallback=0.0)
+    cand_trades = _as_finite_float(
+        _pick_metric_compat(cand_metrics, pick_metric, "num_trades", "trades"),
+        fallback=0.0,
+    )
+    best_trades = _as_finite_float(
+        _pick_metric_compat(best_metrics, pick_metric, "num_trades", "trades"),
+        fallback=0.0,
+    )
     return cand_trades > best_trades
 
 

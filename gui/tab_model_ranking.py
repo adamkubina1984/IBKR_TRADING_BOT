@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-import re
 import traceback
 from typing import Any
 
@@ -28,6 +27,13 @@ from PySide6.QtWidgets import (
 
 from ibkr_trading_bot.core.services import model_eval_service as model_eval_runtime
 from ibkr_trading_bot.core.services.model_service import model_sidecar_meta_path, read_sidecar_model_meta, write_sidecar_model_meta
+from ibkr_trading_bot.core.services.model_training_service import (
+    candidate_selection_criterion_from_meta,
+    dataset_snapshot_signature_from_csv,
+    dataset_snapshot_signature_from_meta,
+    run_training_job,
+    training_profile_for_mode,
+)
 from ibkr_trading_bot.gui.components.workers import TaskWorker
 from ibkr_trading_bot.model.feature_stability import compute_feature_stability_score
 
@@ -264,6 +270,90 @@ class RankingRecord:
     @property
     def ranking(self) -> dict[str, Any] | None:
         return model_eval_runtime.get_tab5_holdout_ranking(self.meta)
+
+
+@dataclass
+class StrictCandidate:
+    record: RankingRecord
+    source_rank_position: int
+    dataset_signature: tuple[str, str, str, int]
+    estimator_name: str
+    criterion: str
+    horizon: int
+    tp_bps: float
+    sl_bps: float
+    tier: int
+    optimized_profit: float
+    base_profit: float
+    sharpe: float
+    trades: float
+    trades_band_score: float
+    created_ts: float
+
+    @property
+    def tier_label(self) -> str:
+        return "A" if self.tier >= 2 else "B"
+
+    @property
+    def source_metrics(self) -> dict[str, Any]:
+        return {
+            "profit_h_opt": float(self.optimized_profit),
+            "profit_h": float(self.base_profit),
+            "sharpe_h": float(self.sharpe),
+            "trades_h": float(self.trades),
+            "tier": self.tier_label,
+        }
+
+    def sort_key(self) -> tuple[int, float, float, float, float, float, float]:
+        return (
+            int(self.tier),
+            float(self.trades_band_score),
+            float(self.optimized_profit),
+            float(self.base_profit),
+            float(self.sharpe),
+            float(self.trades),
+            float(self.created_ts),
+        )
+
+    def dedupe_key(self) -> tuple[Any, ...]:
+        return (
+            str(self.estimator_name).strip().lower(),
+            int(self.horizon),
+            float(self.tp_bps),
+            float(self.sl_bps),
+            self.dataset_signature,
+        )
+
+
+@dataclass
+class StrictRejection:
+    record: RankingRecord
+    reason: str
+
+
+def _trade_count_preference_score(
+    n_trades: float,
+    *,
+    hard_min: float = 60.0,
+    preferred_low: float = 150.0,
+    preferred_high: float = 300.0,
+    soft_max: float = 450.0,
+) -> float:
+    try:
+        value = float(n_trades)
+    except Exception:
+        return 0.0
+    if not np.isfinite(value) or value < hard_min:
+        return 0.0
+    if value <= preferred_low:
+        span = max(preferred_low - hard_min, 1.0)
+        return float(np.clip((value - hard_min) / span, 0.0, 1.0))
+    if value <= preferred_high:
+        return 1.0
+    if value <= soft_max:
+        span = max(soft_max - preferred_high, 1.0)
+        return float(np.clip(1.0 - ((value - preferred_high) / span), 0.0, 1.0))
+    return 0.0
 
 
 @dataclass(frozen=True)
@@ -512,15 +602,21 @@ def ranking_record_sort_key(record: RankingRecord) -> tuple[int, float, float, f
     sharpe = _as_float(record.metrics.get("sharpe"), default=float("-inf"))
     ts = _as_timestamp(record.created, record.model_path)
     if status == "ok":
-        optimized_profit = _as_float(ranking.get("profit_h"), default=float("-inf"))
+        optimized_payload = model_eval_runtime.get_tab5_holdout_optimized_payload(ranking)
+        optimized_profit = _as_float(optimized_payload.get("profit_h"), default=float("-inf"))
         return (2, optimized_profit, sharpe, ts)
     if status in {"unsupported", "error"}:
         return (0, float("-inf"), sharpe, ts)
-    base_profit = _as_float(
-        record.metrics.get("profit_net", record.metrics.get("profit_gross")),
-        default=float("-inf"),
-    )
+    base_payload = model_eval_runtime.get_tab5_holdout_base_payload(ranking, fallback_metrics=record.metrics)
+    base_profit = _as_float(base_payload.get("profit_h"), default=float("-inf"))
     return (1, base_profit, sharpe, ts)
+
+
+def _payload_value_with_flat_fallback(payload: dict[str, Any], ranking: dict[str, Any], key: str) -> Any:
+    value = payload.get(key)
+    if value is not None:
+        return value
+    return ranking.get(key)
 
 
 class ModelRankingTab(QWidget):
@@ -532,7 +628,10 @@ class ModelRankingTab(QWidget):
         self.dir_edit.setText(str(DEFAULT_MODEL_DIR))
         self.btn_browse = QPushButton("Zvolit slozku s modely...", self)
         self.btn_refresh = QPushButton("Refresh", self)
-        self.btn_recompute = QPushButton("Prepocitat Profit(H)", self)
+        self.btn_recompute_all = QPushButton("Prepocitat Profit(H) pro vsechny", self)
+        self.btn_recompute_filtered = QPushButton("Prepocitat Profit(H) pro filtrovane", self)
+        self.btn_recompute_checked = QPushButton("Prepocitat Profit(H) pro zatrzene", self)
+        self.btn_strict_top5 = QPushButton("Spustit strict Top 10", self)
         self.btn_delete = QPushButton("Smazat vybrane", self)
         self.btn_load = QPushButton("Nacist vybrany model", self)
         self.cmb_stability_filter = QComboBox(self)
@@ -591,7 +690,10 @@ class ModelRankingTab(QWidget):
         top.addWidget(self.cmb_bias_filter)
 
         actions = QHBoxLayout()
-        actions.addWidget(self.btn_recompute)
+        actions.addWidget(self.btn_recompute_all)
+        actions.addWidget(self.btn_recompute_filtered)
+        actions.addWidget(self.btn_recompute_checked)
+        actions.addWidget(self.btn_strict_top5)
         actions.addStretch(1)
 
         layout = QVBoxLayout(self)
@@ -608,14 +710,18 @@ class ModelRankingTab(QWidget):
         self._last_context_fingerprint: tuple[Any, ...] | None = None
         self._ranking_worker: TaskWorker | None = None
         self._ranking_request_id = 0
+        self._strict_worker: TaskWorker | None = None
+        self._strict_request_id = 0
         self._checked_model_paths: set[str] = set()
         self._records_by_key: dict[str, RankingRecord] = {}
-        self._last_added_record_keys: set[str] = set()
         self._delete_in_progress = False
 
         self.btn_browse.clicked.connect(self._on_browse)
         self.btn_refresh.clicked.connect(self._on_refresh_clicked)
-        self.btn_recompute.clicked.connect(self._on_recompute_clicked)
+        self.btn_recompute_all.clicked.connect(self._on_recompute_all_clicked)
+        self.btn_recompute_filtered.clicked.connect(self._on_recompute_filtered_clicked)
+        self.btn_recompute_checked.clicked.connect(self._on_recompute_checked_clicked)
+        self.btn_strict_top5.clicked.connect(self._on_strict_top5_clicked)
         self.btn_delete.clicked.connect(self._on_delete_selected)
         self.btn_load.clicked.connect(self._on_load_selected)
         self.cmb_stability_filter.currentIndexChanged.connect(self._on_stability_filter_changed)
@@ -723,12 +829,9 @@ class ModelRankingTab(QWidget):
         snapshot = _directory_snapshot(models_dir)
         if not force and snapshot == self._last_snapshot:
             return False
-        previous_keys = set(self._records_by_key.keys())
         self._last_snapshot = snapshot
         self.records = discover_ranking_models(models_dir)
         self._records_by_key = {self._record_key(record): record for record in self.records}
-        current_keys = set(self._records_by_key.keys())
-        self._last_added_record_keys = current_keys - previous_keys
         self._render_table()
         self._update_context_label()
         return True
@@ -828,18 +931,18 @@ class ModelRankingTab(QWidget):
         self.tbl.setRowCount(len(visible_records))
         for row, record in enumerate(visible_records):
             ranking = record.ranking or {}
+            base_payload = model_eval_runtime.get_tab5_holdout_base_payload(ranking, fallback_metrics=record.metrics)
+            optimized_payload = model_eval_runtime.get_tab5_holdout_optimized_payload(ranking)
             stability_detail = _feature_stability_detail_from_meta(record.meta)
             training_mode = _training_mode_label(record.meta)
             note = _ranking_note_from_meta(record.meta)
             bias_score, rec_short, rec_long = _bias_score_from_meta(record.meta)
             status = str(ranking.get("status") or ("meta" if record.metrics else "-")).strip().lower()
-            optimized_profit = model_eval_runtime.safe_float(ranking.get("profit_h"))
-            base_profit = model_eval_runtime.safe_float(
-                model_eval_runtime.pick_metric(record.metrics, "profit_net", "profit_gross", "profit")
-            )
-            entry = model_eval_runtime.safe_float(ranking.get("entry_threshold"))
-            exit_thr = model_eval_runtime.safe_float(ranking.get("exit_threshold"))
-            trades = model_eval_runtime.safe_float(ranking.get("trades_h"))
+            optimized_profit = model_eval_runtime.safe_float(optimized_payload.get("profit_h"))
+            base_profit = model_eval_runtime.safe_float(base_payload.get("profit_h"))
+            entry = model_eval_runtime.safe_float(_payload_value_with_flat_fallback(optimized_payload, ranking, "entry_threshold"))
+            exit_thr = model_eval_runtime.safe_float(_payload_value_with_flat_fallback(optimized_payload, ranking, "exit_threshold"))
+            trades = model_eval_runtime.safe_float(_payload_value_with_flat_fallback(optimized_payload, ranking, "trades_h"))
             sharpe = model_eval_runtime.safe_float(record.metrics.get("sharpe"))
 
             model_item = _table_item(record.model_path.name)
@@ -1079,7 +1182,236 @@ class ModelRankingTab(QWidget):
         self.lbl_selected.setText(f"Vybrano: {record.model_path.name} | status={status}{suffix}")
 
     def _is_busy(self) -> bool:
-        return self._ranking_worker is not None
+        return self._ranking_worker is not None or self._strict_worker is not None
+
+    def _current_training_context(self) -> dict[str, Any] | None:
+        win = self.window()
+        if win is None:
+            return None
+        try:
+            ensure_tab_loaded = getattr(win, "_ensure_tab_loaded", None)
+            if callable(ensure_tab_loaded):
+                ensure_tab_loaded(1)
+        except Exception:
+            pass
+
+        tab_train = getattr(win, "tab_train", None)
+        if tab_train is None:
+            return None
+
+        csv_path = getattr(tab_train, "csv_path", None)
+        dataset = getattr(tab_train, "dataset", None)
+        if not csv_path or dataset is None:
+            return None
+
+        try:
+            normalized_path = model_eval_runtime.normalize_path(csv_path)
+        except Exception:
+            normalized_path = str(Path(csv_path).expanduser().resolve())
+
+        try:
+            n_total_bars = int(len(dataset))
+        except Exception:
+            return None
+
+        snapshot_signature = dataset_snapshot_signature_from_csv(normalized_path, n_total_bars)
+        if snapshot_signature is None:
+            return None
+
+        strict_profile = training_profile_for_mode("strict")
+        candidate_top_n = int(strict_profile.get("candidate_top_n", 5) or 5)
+        candidate_fresh_ratio = float(strict_profile.get("candidate_fresh_ratio", 0.30) or 0.30)
+
+        try:
+            if hasattr(tab_train, "_current_candidate_top_n"):
+                candidate_top_n = int(max(1, tab_train._current_candidate_top_n()))
+        except Exception:
+            pass
+        try:
+            if hasattr(tab_train, "_current_candidate_fresh_ratio"):
+                candidate_fresh_ratio = float(np.clip(tab_train._current_candidate_fresh_ratio(), 0.05, 0.80))
+        except Exception:
+            pass
+
+        return {
+            "csv_path": normalized_path,
+            "snapshot_signature": snapshot_signature,
+            "holdout_pct": float(getattr(tab_train, "holdout_pct_default", 0.10) or 0.10),
+            "holdout_min_bars": int(getattr(tab_train, "holdout_min_bars_default", 1000) or 1000),
+            "holdout_max_bars": int(getattr(tab_train, "holdout_max_bars_default", 6000) or 6000),
+            "candidate_top_n": int(candidate_top_n),
+            "candidate_fresh_ratio": float(candidate_fresh_ratio),
+        }
+
+    @staticmethod
+    def _strict_tier(base_profit: float, sharpe: float) -> int:
+        if base_profit > 0.0 and sharpe > 0.0:
+            return 2
+        if (base_profit > 0.0) != (sharpe > 0.0):
+            return 1
+        return 0
+
+    @classmethod
+    def _build_strict_shortlist(
+        cls,
+        *,
+        records: list[RankingRecord],
+        context: dict[str, Any],
+        current_snapshot_signature: tuple[str, str, str, int],
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        selected_candidates: list[StrictCandidate] = []
+        rejections: list[StrictRejection] = []
+        data_path = str(context.get("data_path") or "")
+        fee_per_trade = float(context.get("fee_per_trade", 0.0) or 0.0)
+
+        for rank_position, record in enumerate(records, start=1):
+            ranking = record.ranking or {}
+            status = str(ranking.get("status") or "").strip().lower()
+            if status != "ok":
+                rejections.append(StrictRejection(record=record, reason="ranking nema status ok"))
+                continue
+
+            training_mode = str(record.meta.get("training_mode") or "").strip().lower()
+            if training_mode == "strict":
+                rejections.append(StrictRejection(record=record, reason="model uz je strict"))
+                continue
+
+            try:
+                stale = model_eval_runtime.is_tab5_holdout_ranking_stale(
+                    record.meta,
+                    data_path=data_path,
+                    fee_per_trade=fee_per_trade,
+                    model_path=record.model_path,
+                    meta_path=record.meta_path,
+                )
+            except OSError:
+                stale = True
+            if stale:
+                rejections.append(StrictRejection(record=record, reason="ranking je stale pro aktualni CSV/fee"))
+                continue
+
+            dataset_signature = dataset_snapshot_signature_from_meta(record.meta)
+            if dataset_signature != current_snapshot_signature:
+                rejections.append(StrictRejection(record=record, reason="model nepatri do aktualniho dataset snapshotu"))
+                continue
+
+            base_payload = model_eval_runtime.get_tab5_holdout_base_payload(ranking, fallback_metrics=record.metrics)
+            optimized_payload = model_eval_runtime.get_tab5_holdout_optimized_payload(ranking)
+            optimized_profit = model_eval_runtime.safe_float(optimized_payload.get("profit_h"))
+            if optimized_profit is None or optimized_profit <= 0.0:
+                rejections.append(StrictRejection(record=record, reason="Profit(H opt) musi byt kladny"))
+                continue
+
+            base_profit = model_eval_runtime.safe_float(base_payload.get("profit_h"))
+            sharpe = model_eval_runtime.safe_float(record.metrics.get("sharpe"))
+            if base_profit is None:
+                base_profit = float("-inf")
+            if sharpe is None:
+                sharpe = float("-inf")
+            if base_profit < 0.0 and sharpe <= 0.0:
+                rejections.append(StrictRejection(record=record, reason="Profit(H) < 0 a Sharpe(H) <= 0"))
+                continue
+
+            tier = cls._strict_tier(float(base_profit), float(sharpe))
+            if tier <= 0:
+                rejections.append(StrictRejection(record=record, reason="model neprosel tier A/B filtrem"))
+                continue
+
+            estimator_name = str(record.meta.get("estimator_name") or "").strip().lower()
+            try:
+                horizon = int(record.meta.get("label_horizon_bars"))
+                tp_bps = float(record.meta.get("label_take_profit_bps"))
+                sl_bps = float(record.meta.get("label_stop_loss_bps"))
+            except Exception:
+                horizon = 0
+                tp_bps = 0.0
+                sl_bps = 0.0
+            if not estimator_name or horizon <= 0 or tp_bps <= 0.0 or sl_bps <= 0.0:
+                rejections.append(StrictRejection(record=record, reason="chybi estimator nebo label metadata"))
+                continue
+
+            trades = model_eval_runtime.safe_float(_payload_value_with_flat_fallback(optimized_payload, ranking, "trades_h"))
+            trades_value = float(trades if trades is not None else 0.0)
+            if trades is None or trades_value < 60.0:
+                rejections.append(StrictRejection(record=record, reason="Trades(H) je pod minimem 60 pro strict shortlist"))
+                continue
+            created_ts = _as_timestamp(record.created, record.model_path)
+            selected_candidates.append(
+                StrictCandidate(
+                    record=record,
+                    source_rank_position=rank_position,
+                    dataset_signature=current_snapshot_signature,
+                    estimator_name=estimator_name,
+                    criterion=candidate_selection_criterion_from_meta(record.meta, default="balanced"),
+                    horizon=int(horizon),
+                    tp_bps=float(tp_bps),
+                    sl_bps=float(sl_bps),
+                    tier=int(tier),
+                    optimized_profit=float(optimized_profit),
+                    base_profit=float(base_profit),
+                    sharpe=float(sharpe),
+                    trades=trades_value,
+                    trades_band_score=_trade_count_preference_score(trades_value),
+                    created_ts=float(created_ts),
+                )
+            )
+
+        selected_candidates.sort(key=lambda candidate: candidate.sort_key(), reverse=True)
+
+        deduped: list[StrictCandidate] = []
+        seen_keys: dict[tuple[Any, ...], StrictCandidate] = {}
+        for candidate in selected_candidates:
+            dedupe_key = candidate.dedupe_key()
+            existing = seen_keys.get(dedupe_key)
+            if existing is not None:
+                rejections.append(
+                    StrictRejection(
+                        record=candidate.record,
+                        reason=f"duplicitni konfigurace, ponechan {existing.record.model_path.name}",
+                    )
+                )
+                continue
+            seen_keys[dedupe_key] = candidate
+            deduped.append(candidate)
+
+        shortlist = deduped[: max(1, int(limit))]
+        for candidate in deduped[len(shortlist) :]:
+            rejections.append(StrictRejection(record=candidate.record, reason=f"mimo Top {int(max(1, int(limit)))} po serazeni"))
+
+        return {
+            "selected": shortlist,
+            "rejected": rejections,
+        }
+
+    @staticmethod
+    def _strict_preview_text(selected: list[StrictCandidate], rejected: list[StrictRejection]) -> str:
+        lines = ["Vybrane strict kandidaty:"]
+        if not selected:
+            lines.append("- zadny kandidat")
+        else:
+            for idx, candidate in enumerate(selected, start=1):
+                lines.append(
+                    f"{idx}. {candidate.record.model_path.name} | tier={candidate.tier_label} "
+                    f"| Profit(H opt)={candidate.optimized_profit:.2f} | Profit(H)={candidate.base_profit:.2f} "
+                    f"| Sharpe(H)={candidate.sharpe:.3f} | Trades(H)={candidate.trades:.0f} "
+                    f"| {candidate.estimator_name} h={candidate.horizon} tp={candidate.tp_bps:.0f} sl={candidate.sl_bps:.0f}"
+                )
+
+        lines.append("")
+        lines.append("Vyrazene modely:")
+        if not rejected:
+            lines.append("- zadny")
+        else:
+            for rejection in rejected[:15]:
+                lines.append(f"- {rejection.record.model_path.name}: {rejection.reason}")
+            more = len(rejected) - 15
+            if more > 0:
+                lines.append(f"- ... a dalsich {more}")
+
+        lines.append("")
+        lines.append(f"Spustit strict batch pro {len(selected)} modelu?")
+        return "\n".join(lines)
 
     def _records_requiring_ranking_from(
         self,
@@ -1109,15 +1441,6 @@ class ModelRankingTab(QWidget):
     def _records_requiring_ranking(self, context: dict[str, Any]) -> list[RankingRecord]:
         return self._records_requiring_ranking_from(list(self.records), context)
 
-    def _newly_added_records(self) -> list[RankingRecord]:
-        if not self._last_added_record_keys:
-            return []
-        added: list[RankingRecord] = []
-        for record in self.records:
-            if self._record_key(record) in self._last_added_record_keys:
-                added.append(record)
-        return added
-
     def _trigger_recompute_for_records(
         self,
         *,
@@ -1140,11 +1463,6 @@ class ModelRankingTab(QWidget):
             return
         self._start_batch_worker(records=pending, context=context, full_recompute=False)
 
-    def _has_active_filters(self) -> bool:
-        stability_mode = str(self.cmb_stability_filter.currentData() or STABILITY_FILTER_ALL)
-        bias_mode = str(self.cmb_bias_filter.currentData() or BIAS_FILTER_ALL)
-        return stability_mode != STABILITY_FILTER_ALL or bias_mode != BIAS_FILTER_ALL
-
     def _refresh_pending_hint(self) -> None:
         if self._is_busy():
             return
@@ -1159,37 +1477,33 @@ class ModelRankingTab(QWidget):
         else:
             self.lbl_status.setText("Status: ranking je aktualni pro aktualni CSV kontext")
 
-    def _start_incremental_if_needed(self, *, candidate_records: list[RankingRecord] | None = None) -> None:
+    def _start_incremental_if_needed(self) -> None:
         context = self._current_eval_context()
         if not isinstance(context, dict):
             return
-        source_records = list(self.records) if candidate_records is None else list(candidate_records)
-        pending = self._records_requiring_ranking_from(source_records, context)
+        pending = self._records_requiring_ranking(context)
         if pending:
             self._start_batch_worker(records=pending, context=context, full_recompute=False)
 
-    def _on_recompute_clicked(self) -> None:
-        checked_records = self._checked_records()
-        if checked_records:
-            self._trigger_recompute_for_records(
-                candidate_records=checked_records,
-                empty_message="Status: zadne zatrzene modely k prepocitu",
-                up_to_date_message="Status: zatrzene modely uz maji aktualni Profit(H)",
-            )
-            return
-
-        if self._has_active_filters():
-            self._trigger_recompute_for_records(
-                candidate_records=self._filtered_records(),
-                empty_message="Status: zadne filtrovane modely k prepocitu",
-                up_to_date_message="Status: filtrovane modely uz maji aktualni Profit(H)",
-            )
-            return
-
+    def _on_recompute_all_clicked(self) -> None:
         self._trigger_recompute_for_records(
             candidate_records=list(self.records),
             empty_message="Status: zadne modely k prepocitu",
             up_to_date_message="Status: vsechny modely uz maji aktualni Profit(H)",
+        )
+
+    def _on_recompute_filtered_clicked(self) -> None:
+        self._trigger_recompute_for_records(
+            candidate_records=self._filtered_records(),
+            empty_message="Status: zadne filtrovane modely k prepocitu",
+            up_to_date_message="Status: filtrovane modely uz maji aktualni Profit(H)",
+        )
+
+    def _on_recompute_checked_clicked(self) -> None:
+        self._trigger_recompute_for_records(
+            candidate_records=self._checked_records(),
+            empty_message="Status: zadne zatrzene modely k prepocitu",
+            up_to_date_message="Status: zatrzene modely uz maji aktualni Profit(H)",
         )
 
     def _tick(self) -> None:
@@ -1204,9 +1518,7 @@ class ModelRankingTab(QWidget):
         if self._is_busy():
             return
         if changed:
-            added_records = self._newly_added_records()
-            if added_records:
-                self._start_incremental_if_needed(candidate_records=added_records)
+            self._start_incremental_if_needed()
         elif context_changed:
             self._refresh_pending_hint()
 
@@ -1232,7 +1544,10 @@ class ModelRankingTab(QWidget):
         self.lbl_status.setText(
             f"Status: {'plny' if full_recompute else 'inkrementalni'} prepocet {len(records)} modelu..."
         )
-        self.btn_recompute.setEnabled(False)
+        self.btn_recompute_all.setEnabled(False)
+        self.btn_recompute_filtered.setEnabled(False)
+        self.btn_recompute_checked.setEnabled(False)
+        self.btn_strict_top5.setEnabled(False)
 
         worker = TaskWorker(
             self._task_compute_rankings,
@@ -1262,7 +1577,7 @@ class ModelRankingTab(QWidget):
         progress_cb=None,
         should_run=None,
     ) -> dict[str, Any]:
-        prepared = model_eval_runtime.load_prepared_evaluation_data(data_path, progress_cb=progress_cb)
+        prepared_cache: dict[tuple[Any, ...], model_eval_runtime.PreparedEvaluationData] = {}
         updated = 0
         failures = 0
         total = len(model_paths)
@@ -1276,6 +1591,15 @@ class ModelRankingTab(QWidget):
             meta = read_sidecar_model_meta(model_path)
             try:
                 loaded = model_eval_runtime.load_predictor_with_merged_meta(model_path)
+                prepared_key = model_eval_runtime.prepared_evaluation_cache_key(data_path, loaded.metadata)
+                prepared = prepared_cache.get(prepared_key)
+                if prepared is None:
+                    prepared = model_eval_runtime.load_prepared_evaluation_data(
+                        data_path,
+                        metadata=loaded.metadata,
+                        progress_cb=progress_cb,
+                    )
+                    prepared_cache[prepared_key] = prepared
                 evaluation = model_eval_runtime.run_model_evaluation(
                     model=loaded.predictor,
                     metadata=loaded.metadata,
@@ -1304,28 +1628,43 @@ class ModelRankingTab(QWidget):
                     entry_threshold=float(search.best_entry),
                     exit_threshold=float(search.best_exit),
                 )
-                meta[model_eval_runtime.TAB5_HOLDOUT_RANKING_KEY] = model_eval_runtime.build_tab5_holdout_ranking_payload(
+                ranking_payload = model_eval_runtime.build_tab5_holdout_ranking_payload(
                     data_path=data_path,
                     fee_per_trade=float(fee_per_trade),
+                    metadata=loaded.metadata,
+                    exit_policy=evaluation.exit_policy,
+                    base_entry_threshold=float(current_entry),
+                    base_exit_threshold=float(current_exit),
+                    base_metrics=evaluation.results,
+                    optimized_entry_threshold=float(search.best_entry),
+                    optimized_exit_threshold=float(search.best_exit),
+                    optimized_metrics=optimized_metrics,
                     entry_threshold=float(search.best_entry),
                     exit_threshold=float(search.best_exit),
                     metrics=optimized_metrics,
                     status="ok",
+                )
+                model_eval_runtime.set_tab5_holdout_ranking(
+                    meta,
+                    ranking_payload,
+                    exit_policy=evaluation.exit_policy,
                 )
                 write_sidecar_model_meta(model_path, meta)
                 updated += 1
             except Exception as exc:
                 failures += 1
                 status = model_eval_runtime.ranking_status_from_error_message(str(exc))
-                meta[model_eval_runtime.TAB5_HOLDOUT_RANKING_KEY] = model_eval_runtime.build_tab5_holdout_ranking_payload(
+                ranking_payload = model_eval_runtime.build_tab5_holdout_ranking_payload(
                     data_path=data_path,
                     fee_per_trade=float(fee_per_trade),
+                    metadata=meta,
                     entry_threshold=None,
                     exit_threshold=None,
                     metrics=None,
                     status=status,
                     error=str(exc),
                 )
+                model_eval_runtime.set_tab5_holdout_ranking(meta, ranking_payload)
                 write_sidecar_model_meta(model_path, meta)
 
         return {
@@ -1353,7 +1692,239 @@ class ModelRankingTab(QWidget):
         if req_id != self._ranking_request_id:
             return
         self._ranking_worker = None
-        self.btn_recompute.setEnabled(True)
+        self.btn_recompute_all.setEnabled(True)
+        self.btn_recompute_filtered.setEnabled(True)
+        self.btn_recompute_checked.setEnabled(True)
+        self.btn_strict_top5.setEnabled(True)
+
+    def _on_strict_top5_clicked(self) -> None:
+        if self._is_busy():
+            return
+        context = self._current_eval_context()
+        if not isinstance(context, dict):
+            QMessageBox.warning(self, "Model Ranking", "V Tab 4 musi byt nactene CSV s historickymi daty.")
+            return
+
+        training_context = self._current_training_context()
+        if not isinstance(training_context, dict):
+            QMessageBox.warning(
+                self,
+                "Model Ranking",
+                "Pro strict Top 10 musi byt v Tab 2 nactene odpovidajici treninkove CSV.",
+            )
+            return
+
+        eval_csv = str(context.get("data_path") or "")
+        train_csv = str(training_context.get("csv_path") or "")
+        if not eval_csv or not train_csv:
+            QMessageBox.warning(self, "Model Ranking", "Chybi CSV kontext pro ranking nebo trenink.")
+            return
+
+        try:
+            eval_csv_norm = model_eval_runtime.normalize_path(eval_csv)
+            train_csv_norm = model_eval_runtime.normalize_path(train_csv)
+        except Exception:
+            eval_csv_norm = eval_csv
+            train_csv_norm = train_csv
+        if eval_csv_norm != train_csv_norm:
+            QMessageBox.warning(
+                self,
+                "Model Ranking",
+                "Strict Top 10 lze spustit jen kdyz Tab 2 a Tab 4 pouzivaji stejny CSV snapshot.",
+            )
+            return
+
+        shortlist = self._build_strict_shortlist(
+            records=list(self.records),
+            context=context,
+            current_snapshot_signature=training_context["snapshot_signature"],
+            limit=10,
+        )
+        selected = list(shortlist.get("selected") or [])
+        rejected = list(shortlist.get("rejected") or [])
+        if not selected:
+            QMessageBox.warning(
+                self,
+                "Model Ranking",
+                "Pro strict Top 10 se nenasel zadny vhodny kandidat v aktualnim ranking kontextu.",
+            )
+            return
+
+        preview = self._strict_preview_text(selected, rejected)
+        reply = QMessageBox.question(
+            self,
+            "Strict Top 10",
+            preview,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self._start_strict_worker(selected=selected, training_context=training_context)
+
+    def _start_strict_worker(self, *, selected: list[StrictCandidate], training_context: dict[str, Any]) -> None:
+        if self._is_busy():
+            return
+        if not selected:
+            self.lbl_status.setText("Status: strict shortlist je prazdny")
+            return
+
+        self._strict_request_id += 1
+        req_id = self._strict_request_id
+        batch_id = f"strict_{datetime.utcnow().strftime('%Y%m%dT%H%M%S%f')}"
+        self.lbl_status.setText(f"Status: strict batch start pro {len(selected)} modelu...")
+        self.btn_recompute_all.setEnabled(False)
+        self.btn_recompute_filtered.setEnabled(False)
+        self.btn_recompute_checked.setEnabled(False)
+        self.btn_strict_top5.setEnabled(False)
+        self.btn_delete.setEnabled(False)
+        self.btn_load.setEnabled(False)
+
+        jobs = []
+        for candidate in selected:
+            jobs.append(
+                {
+                    "source_model_path": str(candidate.record.model_path),
+                    "source_rank_position": int(candidate.source_rank_position),
+                    "estimator_name": str(candidate.estimator_name),
+                    "criterion": str(candidate.criterion),
+                    "horizon": int(candidate.horizon),
+                    "tp_bps": float(candidate.tp_bps),
+                    "sl_bps": float(candidate.sl_bps),
+                    "strict_source_metrics": dict(candidate.source_metrics),
+                }
+            )
+
+        worker = TaskWorker(
+            self._task_run_strict_batch,
+            jobs=jobs,
+            training_csv_path=str(training_context.get("csv_path") or ""),
+            holdout_pct=float(training_context.get("holdout_pct", 0.10) or 0.10),
+            holdout_min_bars=int(training_context.get("holdout_min_bars", 1000) or 1000),
+            holdout_max_bars=int(training_context.get("holdout_max_bars", 6000) or 6000),
+            candidate_top_n=int(training_context.get("candidate_top_n", 5) or 5),
+            candidate_fresh_ratio=float(training_context.get("candidate_fresh_ratio", 0.30) or 0.30),
+            batch_id=batch_id,
+        )
+        self._strict_worker = worker
+        worker.progress_text.connect(lambda text: self.lbl_status.setText(f"Status: {text}"))
+        worker.result.connect(lambda result, rid=req_id: self._on_strict_result(rid, result))
+        worker.error.connect(lambda msg, rid=req_id: self._on_strict_error(rid, msg))
+        worker.finished.connect(lambda rid=req_id: self._on_strict_finished(rid))
+        worker.start()
+
+    @staticmethod
+    def _task_run_strict_batch(
+        *,
+        jobs: list[dict[str, Any]],
+        training_csv_path: str,
+        holdout_pct: float,
+        holdout_min_bars: int,
+        holdout_max_bars: int,
+        candidate_top_n: int,
+        candidate_fresh_ratio: float,
+        batch_id: str,
+        progress_cb=None,
+        should_run=None,
+    ) -> dict[str, Any]:
+        created = 0
+        rejected = 0
+        failures = 0
+        results: list[dict[str, Any]] = []
+        total = len(jobs)
+
+        for idx, job in enumerate(jobs, start=1):
+            if callable(should_run) and not should_run():
+                break
+            if callable(progress_cb):
+                progress_cb(f"Strict {idx}/{total}: {Path(str(job.get('source_model_path') or '')).name}")
+
+            provenance = {
+                "training_mode": "strict",
+                "strict_source_model_path": str(job.get("source_model_path") or ""),
+                "strict_source_rank_position": int(job.get("source_rank_position", idx) or idx),
+                "strict_batch_id": str(batch_id),
+                "strict_trigger": "ranking_top10",
+                "strict_source_metrics": dict(job.get("strict_source_metrics") or {}),
+            }
+
+            strict_profile = training_profile_for_mode("strict")
+            result = run_training_job(
+                csv_path=str(training_csv_path),
+                holdout_pct=float(holdout_pct),
+                holdout_min_bars=int(holdout_min_bars),
+                holdout_max_bars=int(holdout_max_bars),
+                phase="strict",
+                estimator_name=str(job.get("estimator_name") or ""),
+                criterion=str(job.get("criterion") or "balanced"),
+                horizon=int(job.get("horizon", 12) or 12),
+                tp_bps=float(job.get("tp_bps", 50.0) or 50.0),
+                sl_bps=float(job.get("sl_bps", 50.0) or 50.0),
+                candidate_top_n=int(max(1, candidate_top_n)),
+                candidate_fresh_ratio=float(np.clip(candidate_fresh_ratio, 0.05, 0.80)),
+                training_profile=dict(strict_profile),
+                extra_meta=provenance,
+            )
+
+            model_path = str(result.get("model_path") or "")
+            if model_path:
+                meta = read_sidecar_model_meta(model_path)
+                if isinstance(meta, dict):
+                    meta.update(provenance)
+                    write_sidecar_model_meta(model_path, meta)
+
+            status = str(result.get("status") or "").strip().lower()
+            if status == "ok" and model_path:
+                created += 1
+            elif status == "rejected":
+                rejected += 1
+            else:
+                failures += 1
+
+            row = dict(result)
+            row.update(provenance)
+            results.append(row)
+
+        return {
+            "requested": int(total),
+            "created": int(created),
+            "rejected": int(rejected),
+            "failures": int(failures),
+            "results": results,
+            "batch_id": str(batch_id),
+        }
+
+    def _on_strict_result(self, req_id: int, result: dict[str, Any]) -> None:
+        if req_id != self._strict_request_id:
+            return
+        self._refresh_list(force=True)
+        created = int(result.get("created", 0) or 0)
+        rejected = int(result.get("rejected", 0) or 0)
+        failures = int(result.get("failures", 0) or 0)
+        self.lbl_status.setText(
+            f"Status: strict batch hotov | created={created}, rejected={rejected}, failures={failures}"
+        )
+        if created > 0:
+            self._start_incremental_if_needed()
+
+    def _on_strict_error(self, req_id: int, msg: str) -> None:
+        if req_id != self._strict_request_id:
+            return
+        self.lbl_status.setText(f"Status: chyba strict batch: {msg}")
+
+    def _on_strict_finished(self, req_id: int) -> None:
+        if req_id != self._strict_request_id:
+            return
+        self._strict_worker = None
+        self.btn_recompute_all.setEnabled(True)
+        self.btn_recompute_filtered.setEnabled(True)
+        self.btn_recompute_checked.setEnabled(True)
+        self.btn_strict_top5.setEnabled(True)
+        self.btn_delete.setEnabled(True)
+        self.btn_load.setEnabled(True)
+        self._refresh_list(force=True)
+        self._start_incremental_if_needed()
 
     def _propagate_model_path(
         self,
@@ -1391,8 +1962,13 @@ class ModelRankingTab(QWidget):
                 pass
             else:
                 ranking = record.ranking or {}
-                entry_threshold = model_eval_runtime.safe_float(ranking.get("entry_threshold"))
-                exit_threshold = model_eval_runtime.safe_float(ranking.get("exit_threshold"))
+                optimized_payload = model_eval_runtime.get_tab5_holdout_optimized_payload(ranking)
+                entry_threshold = model_eval_runtime.safe_float(
+                    _payload_value_with_flat_fallback(optimized_payload, ranking, "entry_threshold")
+                )
+                exit_threshold = model_eval_runtime.safe_float(
+                    _payload_value_with_flat_fallback(optimized_payload, ranking, "exit_threshold")
+                )
                 try:
                     if entry_threshold is not None and hasattr(tab_eval, "et_spin"):
                         tab_eval.et_spin.setValue(float(entry_threshold))

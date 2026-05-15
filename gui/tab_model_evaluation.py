@@ -13,12 +13,11 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
-import joblib
 import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from PySide6.QtCore import Qt, QSettings, QTimer
+from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -52,10 +51,7 @@ from ibkr_trading_bot.core.services.evaluation_service import EvaluationService
 from ibkr_trading_bot.core.services.trade_executor import replay_signals_over_market_data
 from ibkr_trading_bot.core.services.model_service import (
     build_sklearn_version_warning,
-    merge_model_metadata,
-    read_sidecar_model_meta,
 )
-from ibkr_trading_bot.features.feature_engineering import prepare_dataset_with_targets
 from ibkr_trading_bot.gui.components.workers import TaskWorker
 
 # Import zůstává (pro případ budoucího přepnutí), ale grafy kreslíme lokálně
@@ -73,6 +69,7 @@ from ibkr_trading_bot.gui.timeframe import DEFAULT_TIMEFRAME, TIMEFRAME_OPTIONS
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MODEL_DIR   = PROJECT_ROOT / "model_outputs"
 RAW_DIR     = PROJECT_ROOT / "data" / "raw"
+LAST_DATA_CSV_PATH_KEY = "last_data_csv_path"
 
 
 @dataclass
@@ -130,30 +127,6 @@ def _feature_names_for_model_eval(model) -> list[str] | None:
     except Exception:
         pass
     return None
-
-
-def _extract_X_y_eval(prepared):
-    if isinstance(prepared, (tuple, list)):
-        if len(prepared) >= 2:
-            return prepared[0], prepared[1]
-        return prepared[0], None
-    if isinstance(prepared, dict):
-        X = prepared.get("X") or prepared.get("features") or prepared.get("data") or prepared.get("df")
-        y = prepared.get("y") or prepared.get("target") or prepared.get("y_true")
-        if X is None:
-            raise ValueError("V dictu chybi klic 'X'/'features'/'data'.")
-        return X, y
-    if isinstance(prepared, pd.DataFrame):
-        X, y = prepared, None
-        for cand in ["target", "y", "label"]:
-            if cand in prepared.columns:
-                y = prepared[cand].values
-                X = prepared.drop(columns=[cand])
-                break
-        return X, y
-    if isinstance(prepared, np.ndarray):
-        return prepared, None
-    raise ValueError("Neocekavany navratovy typ z prepare_dataset_with_targets(df).")
 
 
 def _tail_rows_eval(obj, n_rows: int):
@@ -372,9 +345,6 @@ class MplCanvas(FigureCanvas):
 # ---------------- Hlavní widget záložky ----------------
 class ModelEvaluationTab(QWidget):
     _eval_service = EvaluationService(None, None, None)
-    _SETTINGS_ORG = "ibkr_trading_bot"
-    _SETTINGS_APP = "model_evaluation_tab"
-    _SETTINGS_DATA_KEYS = ("last_data_csv_path", "data_csv_path", "csv_path")
 
     def _open_folder(self, path: Path) -> None:
         try:
@@ -393,7 +363,6 @@ class ModelEvaluationTab(QWidget):
         super().__init__()
 
         # --- stavové proměnné ---
-        self._ui_settings = QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
         self.model_path = None
         self.data_path = None
         self.loaded_model = None
@@ -411,7 +380,6 @@ class ModelEvaluationTab(QWidget):
         self.last_metrics = None       # poslední metriky (po filtru a nákladech)
         self.eval_scope_info = {"mode": "holdout", "applied_rows": 0, "total_rows": 0}
         self._last_ternary_threshold_source = "model"
-        self._selected_exit_policy = DEFAULT_EXIT_POLICY
         self._eval_worker: TaskWorker | None = None
         self._params_worker: TaskWorker | None = None
         self._auto_threshold_worker: TaskWorker | None = None
@@ -421,6 +389,7 @@ class ModelEvaluationTab(QWidget):
         self._auto_request_id = 0
         self._pending_auto_threshold_search = False
         self._pending_auto_threshold_dialog: AutoThresholdPayload | None = None
+        self._ui_settings = QSettings("ibkr_trading_bot", "model_evaluation_tab")
 
         # --- UI layouty ---
         main_layout = QVBoxLayout(self)
@@ -537,14 +506,6 @@ class ModelEvaluationTab(QWidget):
         self.ext_spin.setToolTip("Minimální confidence pro zavření pozice (0=vypnuto). Pokud confidence klesne pod tuto hodnotu, pozice se zavře.")
         self.ext_spin.valueChanged.connect(self._on_model_settings_changed)
 
-        # Exit policy
-        exit_policy_label = QLabel("Exit Policy:")
-        self.exit_policy_combo = QComboBox()
-        self.exit_policy_combo.addItem("Stateful (hold until opposite)", userData="hold_until_opposite")
-        self.exit_policy_combo.addItem("Legacy flat exit", userData="legacy_flat_exit")
-        self.exit_policy_combo.setCurrentIndex(0)
-        self.exit_policy_combo.currentIndexChanged.connect(self._on_exit_policy_changed)
-
         self.lbl_threshold_preview = QLabel("T(model): short=— long=— | T(active): short=— long=— src=model | Entry=0.600 Exit=0.700")
         self.lbl_threshold_preview.setToolTip(
             "T(model) = prahy ulozene v metadatech modelu.\n"
@@ -567,9 +528,6 @@ class ModelEvaluationTab(QWidget):
         model_settings_layout.addSpacing(12)
         model_settings_layout.addWidget(ext_label)
         model_settings_layout.addWidget(self.ext_spin)
-        model_settings_layout.addSpacing(12)
-        model_settings_layout.addWidget(exit_policy_label)
-        model_settings_layout.addWidget(self.exit_policy_combo)
         model_settings_layout.addSpacing(12)
         model_settings_layout.addWidget(self.lbl_threshold_preview, 1)
         model_settings_layout.addSpacing(12)
@@ -646,61 +604,8 @@ class ModelEvaluationTab(QWidget):
         self._params_timer.setSingleShot(True)
         self._params_timer.setInterval(150)
         self._params_timer.timeout.connect(self._run_params_recalc)
-        self._restore_last_data_path()
         self._refresh_threshold_preview()
-
-    def _save_last_data_path(self, path: str | None) -> None:
-        try:
-            normalized = str(Path(str(path)).expanduser().resolve()) if path else ""
-        except Exception:
-            normalized = str(path or "")
-        try:
-            self._ui_settings.setValue("last_data_csv_path", normalized)
-            self._ui_settings.sync()
-        except Exception:
-            pass
-
-    def _restore_last_data_path(self) -> None:
-        raw_value = ""
-        for key in self._SETTINGS_DATA_KEYS:
-            try:
-                candidate = str(self._ui_settings.value(key, "") or "").strip()
-            except Exception:
-                candidate = ""
-            if candidate:
-                raw_value = candidate
-                break
-        if not raw_value:
-            return
-
-        try:
-            normalized = str(Path(raw_value).expanduser().resolve())
-        except Exception:
-            normalized = raw_value
-
-        if not Path(normalized).is_file():
-            return
-
-        self.data_path = normalized
-        self.data_label.setText(f"Data (CSV): {normalized}")
-        self._set_status("Data (CSV) obnovena z posledni ulozene cesty.")
-
-    def set_data_path(self, file_path: str) -> None:
-        if not file_path:
-            return
-        if not os.path.isfile(file_path):
-            self._error("Soubor neexistuje.")
-            return
-
-        try:
-            normalized_path = str(Path(file_path).expanduser().resolve())
-        except Exception:
-            normalized_path = str(file_path)
-
-        self.data_path = normalized_path
-        self.data_label.setText(f"Data (CSV): {normalized_path}")
-        self._save_last_data_path(normalized_path)
-        self._set_status("Data pripravena.")
+        self._restore_last_data_path()
 
     # ---------------- Event handlery ----------------
     def on_open_model_clicked(self):
@@ -710,9 +615,12 @@ class ModelEvaluationTab(QWidget):
         except Exception:
             project_root = Path(os.getcwd())
         model_dir_dyn = project_root / "model_outputs"
+        model_dir_abs = Path(r"C:\Users\adamk\Můj disk\Trader\ibkr_trading_bot\model_outputs")
 
         if model_dir_dyn.is_dir():
             start_dir = str(model_dir_dyn)
+        elif model_dir_abs.is_dir():
+            start_dir = str(model_dir_abs)
         else:
             start_dir = str(project_root)
 
@@ -722,31 +630,6 @@ class ModelEvaluationTab(QWidget):
         if not file_path:
             return
         self.set_model_path(file_path)
-        return
-        try:
-            obj = joblib.load(file_path)
-            predictor, metadata = self._extract_predictor_from_object(obj)
-            self.loaded_model = predictor
-            embedded_meta = metadata if isinstance(metadata, dict) else {}
-            sidecar_meta = self._load_sidecar_model_metadata(Path(file_path))
-            self.model_metadata = self._merge_model_metadata(embedded_meta, sidecar_meta)
-            if isinstance(self.model_metadata, dict):
-                _, tshort, tlong = self._meta_threshold_values()
-                if not isinstance(tshort, (int, float)) or not isinstance(tlong, (int, float)):
-                    raise ValueError(
-                        "Model neobsahuje ternarni prahy (ternary_threshold_short/long). "
-                        "Tab 3 je nyni pouze pro ternarni modely."
-                    )
-            self.model_path = file_path
-            self.model_label.setText(f"Model: {file_path}")
-            self._refresh_threshold_preview()
-            self._set_status("Model načten.")
-        except Exception as e:
-            self._error(f"Nepodařilo se získat estimator z načteného souboru:\n{e}")
-
-    @staticmethod
-    def _merge_model_metadata(embedded: dict | None, sidecar: dict | None) -> dict:
-        return merge_model_metadata(embedded, sidecar)
 
     @staticmethod
     def _safe_float(value):
@@ -772,9 +655,6 @@ class ModelEvaluationTab(QWidget):
                 tlong = self._safe_float(user.get("ternary_threshold_long_eval"))
         return None, tshort, tlong
 
-    def _load_sidecar_model_metadata(self, model_path: Path) -> dict:
-        return read_sidecar_model_meta(model_path)
-
     def _refresh_threshold_preview(self) -> None:
         if not hasattr(self, "lbl_threshold_preview"):
             return
@@ -790,39 +670,17 @@ class ModelEvaluationTab(QWidget):
             return f"{float(value):.3f}"
 
         src = getattr(self, "_last_ternary_threshold_source", "model")
-        exit_policy = self._current_exit_policy()
         entry = self._safe_float(self.et_spin.value()) if hasattr(self, "et_spin") else None
         exit_thr = self._safe_float(self.ext_spin.value()) if hasattr(self, "ext_spin") else None
         self.lbl_threshold_preview.setText(
             f"T(model): short={_fmt(tshort_model)} long={_fmt(tlong_model)} | "
             f"T(active): short={_fmt(thr_short)} long={_fmt(thr_long)} src={src} | "
-            f"Entry={_fmt(entry)} Exit={_fmt(exit_thr)} | exit_policy={exit_policy}"
+            f"Entry={_fmt(entry)} Exit={_fmt(exit_thr)}"
         )
 
-    def _current_exit_policy(self) -> str:
-        if hasattr(self, "exit_policy_combo"):
-            data = self.exit_policy_combo.currentData()
-            if data:
-                return resolve_exit_policy_setting(data, default=DEFAULT_EXIT_POLICY)
-        return resolve_exit_policy_setting(getattr(self, "_selected_exit_policy", None), default=DEFAULT_EXIT_POLICY)
-
-    def _set_exit_policy_combo(self, policy: str) -> None:
-        resolved = resolve_exit_policy_setting(policy, default=DEFAULT_EXIT_POLICY)
-        if not hasattr(self, "exit_policy_combo"):
-            self._selected_exit_policy = resolved
-            return
-        idx = self.exit_policy_combo.findData(resolved)
-        if idx < 0:
-            idx = self.exit_policy_combo.findData(DEFAULT_EXIT_POLICY)
-        self.exit_policy_combo.blockSignals(True)
-        self.exit_policy_combo.setCurrentIndex(max(0, idx))
-        self.exit_policy_combo.blockSignals(False)
-        self._selected_exit_policy = self._current_exit_policy()
-
-    def _on_exit_policy_changed(self, *_):
-        self._selected_exit_policy = self._current_exit_policy()
-        self._refresh_threshold_preview()
-        self.on_params_changed()
+    def _active_exit_policy(self) -> str:
+        metadata = self.model_metadata if isinstance(self.model_metadata, dict) else {}
+        return resolve_exit_policy_setting(metadata, default=DEFAULT_EXIT_POLICY)
 
     def on_open_data_clicked(self):
         # Dynamický a záložní start dir (po změně kořene projektu)
@@ -831,9 +689,12 @@ class ModelEvaluationTab(QWidget):
         except Exception:
             project_root = Path(os.getcwd())
         processed_dir_dyn = project_root / "data" / "processed"
+        processed_dir_abs = Path(r"C:\Users\adamk\Můj disk\Trader\ibkr_trading_bot\data\processed")
 
         if processed_dir_dyn.is_dir():
             start_dir = str(processed_dir_dyn)
+        elif processed_dir_abs.is_dir():
+            start_dir = str(processed_dir_abs)
         else:
             start_dir = str(project_root)
 
@@ -842,7 +703,35 @@ class ModelEvaluationTab(QWidget):
         )
         if not file_path:
             return
+        if not os.path.isfile(file_path):
+            self._error("Soubor neexistuje.")
+            return
+
         self.set_data_path(file_path)
+
+    def set_data_path(self, file_path: str | Path, *, update_status: bool = True) -> None:
+        normalized = str(Path(file_path).expanduser().resolve())
+        self.data_path = normalized
+        self.data_label.setText(f"Data (CSV): {normalized}")
+        try:
+            self._ui_settings.setValue(LAST_DATA_CSV_PATH_KEY, normalized)
+            self._ui_settings.sync()
+        except Exception:
+            pass
+        if update_status:
+            self._set_status("Data připravena.")
+
+    def _restore_last_data_path(self) -> None:
+        try:
+            saved = self._ui_settings.value(LAST_DATA_CSV_PATH_KEY, "")
+        except Exception:
+            saved = ""
+        candidate = str(saved or "").strip()
+        if not candidate:
+            return
+        path = Path(candidate).expanduser()
+        if path.exists():
+            self.set_data_path(path, update_status=False)
 
     def _on_eval_scope_changed(self, *_):
         mode = self._eval_scope_mode()
@@ -965,219 +854,6 @@ class ModelEvaluationTab(QWidget):
         self.eval_scope_info = scope_info
         return X_eval, y_eval, df_eval, scope_info
 
-    def on_evaluate_clicked(self):
-        if self.loaded_model is None or self.model_path is None:
-            self._warn("Nejprve vyber model (.pkl).")
-            return
-        if self.data_path is None:
-            self._warn("Nejprve vyber CSV s historickými daty.")
-            return
-
-        # 1) CSV
-        try:
-            df = pd.read_csv(self.data_path, encoding="utf-8", engine="python")
-        except Exception as e:
-            self._error(f"Chyba při načítání CSV:\n{e}")
-            return
-
-        # 2) Dataset
-        try:
-            prepared = prepare_dataset_with_targets(df)
-            X, y_true = self._extract_X_y(prepared)
-            df_for_metrics = prepared if isinstance(prepared, pd.DataFrame) else df
-            X, y_true, df_for_metrics, scope_info = self._apply_eval_scope(X, y_true, df_for_metrics)
-            X = self._coerce_features_for_model(X)
-            if y_true is None:
-                raise ValueError("Po přípravě datasetu chybí cílová proměnná (target/y).")
-            self.X_current = X
-            self.y_true_current = np.asarray(y_true)
-            self.df_current = df_for_metrics
-            self.close_series = self._safe_close_series(df_for_metrics)
-        except Exception as e:
-            self._error(f"Chyba při přípravě datasetu:\n{e}")
-            return
-
-        # 3) Predikce
-        try:
-            if not hasattr(self.loaded_model, "predict"):
-                raise AttributeError("Načtený objekt nemá metodu `.predict`.")
-
-            # Predikce z modelu + aplikace T-short/T-long + Entry/Exit threshold
-            proba = None
-            X_pred = self._align_X_for_loaded_model(self.X_current)
-            if hasattr(self.loaded_model, "predict_proba"):
-                try:
-                    proba = self.loaded_model.predict_proba(X_pred)
-                except Exception:
-                    proba = None
-
-            thr_short, thr_long = self._resolve_ternary_thresholds()
-            if proba is None or proba.ndim != 2 or int(proba.shape[1]) != 3:
-                raise ValueError(
-                    "Tab 3 vyzaduje ternarni model s predict_proba (3 tridy: short/neutral/long)."
-                )
-
-            prob_long = proba[:, 2]
-            prob_short = proba[:, 0]
-            y_pred_by_threshold = np.where(prob_long >= thr_long, 1,
-                                           np.where(prob_short >= thr_short, -1, 0))
-            self.confidence_arr = np.max(proba, axis=1)
-
-            self.y_pred_raw = np.asarray(y_pred_by_threshold)
-            entry_threshold = float(self.et_spin.value())
-            self.y_pred_used = self._apply_confidence_threshold(
-                raw_pred=self.y_pred_raw,
-                confidence=self.confidence_arr,
-                threshold=entry_threshold
-            )
-            self.y_pred_used = self._normalize_pred(self.y_pred_used)
-
-            exit_threshold = float(self.ext_spin.value())
-            if exit_threshold > 0:
-                self.y_pred_used = self._apply_exit_threshold(
-                    y_pred=self.y_pred_used,
-                    confidence=self.confidence_arr,
-                    exit_thr=exit_threshold
-                )
-                self.y_pred_used = self._normalize_pred(self.y_pred_used)
-
-            self._set_status(
-                f"Predikce OK. T-short={thr_short:.2f}, T-long={thr_long:.2f}, "
-                f"T-src={self._last_ternary_threshold_source}, "
-                f"Entry={entry_threshold:.2f}, Exit={exit_threshold:.2f}, "
-                f"Scope={scope_info.get('mode')} ({scope_info.get('applied_rows')}/{scope_info.get('total_rows')})."
-            )
-        except Exception as e:
-            self._error(f"Chyba při predikci modelem:\n{e}")
-            return
-
-        # 4–5) Metriky vč. nákladů/obchod
-        try:
-            results = self._eval_service.calculate_metrics(
-                y_true=self.y_true_current,
-                y_pred=self.y_pred_used,
-                df=self.df_current,
-                fee_per_trade=float(self.cost_spin.value()),
-                slippage_bps=0.0,
-                rolling_window=200,
-                annualize_sharpe=False
-            )
-        except Exception as e:
-            self._error(f"Chyba při výpočtu metrik:\n{e}")
-            return
-
-        if not isinstance(results, dict) or not results:
-            self._error("Výpočet metrik vrátil prázdný výsledek.")
-            return
-
-        # 6) UI výstup
-        self.last_metrics = results
-
-        self.trades_df = self._extract_trades_df(results)
-        self.btn_export_trades.setEnabled(
-        isinstance(self.trades_df, pd.DataFrame) and not self.trades_df.empty
-        )
-        self._populate_metrics_table(results)
-        self._draw_equity_chart(results)
-        trade_pnls_plot = self._trade_pnls_for_plot(results)
-
-        self._draw_histogram(trade_pnls_plot)
-        self._draw_rolling_chart(trade_pnls_plot)
-        key_line = self._format_key_metrics_line(results)
-
-        self._set_status(
-            f"Hotovo. Vyhodnocení dokončeno (náklady/obchod {self.cost_spin.value():.3f}, "
-            f"T-src={self._last_ternary_threshold_source}, "
-            f"scope={scope_info.get('mode')} {scope_info.get('applied_rows')}/{scope_info.get('total_rows')}, "
-            f"{key_line})."
-        )
-
-    def on_params_changed(self, *_):
-        if self.X_current is None or self.confidence_arr is None or self.df_current is None:
-            return
-
-        # Prahy z modelu
-        thr_short, thr_long = self._resolve_ternary_thresholds()
-        entry_threshold = float(self.et_spin.value())
-        
-        # Znovu vypočítat raw predikce s novými Entry/Exit prahy
-        proba = None
-        X_pred = self._align_X_for_loaded_model(self.X_current)
-        if hasattr(self.loaded_model, "predict_proba"):
-            try:
-                proba = self.loaded_model.predict_proba(X_pred)
-            except Exception:
-                proba = None
-
-        if proba is None or proba.ndim != 2 or int(proba.shape[1]) != 3:
-            self._error("Tab 3 vyzaduje ternarni model s predict_proba (3 tridy: short/neutral/long).")
-            return
-        prob_long = proba[:, 2]
-        prob_short = proba[:, 0]
-        y_pred_by_threshold = np.where(prob_long >= thr_long, 1,
-                                       np.where(prob_short >= thr_short, -1, 0))
-
-        self.y_pred_raw = np.asarray(y_pred_by_threshold)
-
-        # Aplikuj Entry Threshold (minimální confidence pro obchod)
-        self.y_pred_used = self._apply_confidence_threshold(
-            raw_pred=self.y_pred_raw,
-            confidence=self.confidence_arr,
-            threshold=entry_threshold
-        )
-        self.y_pred_used = self._normalize_pred(self.y_pred_used)
-
-        # Aplikuj Exit Threshold (zavčení pozic když confidence klesne)
-        exit_threshold = float(self.ext_spin.value())
-        if exit_threshold > 0:
-            self.y_pred_used = self._apply_exit_threshold(
-                y_pred=self.y_pred_used,
-                confidence=self.confidence_arr,
-                exit_thr=exit_threshold
-            )
-            self.y_pred_used = self._normalize_pred(self.y_pred_used)
-
-        try:
-            results = self._eval_service.calculate_metrics(
-                y_true=self.y_true_current,
-                y_pred=self.y_pred_used,
-                df=self.df_current,
-                fee_per_trade=float(self.cost_spin.value()),
-                slippage_bps=0.0,
-                rolling_window=200,
-                annualize_sharpe=False
-            )
-        except Exception as e:
-            self._error(f"Chyba při výpočtu metrik (po změně parametrů):\n{e}")
-            return
-
-        if not isinstance(results, dict) or not results:
-            self._error("Výpočet metrik vrátil prázdný výsledek (po změně parametrů).")
-            return
-
-        self.last_metrics = results
-        self.trades_df = self._extract_trades_df(results)
-        self.btn_export_trades.setEnabled(
-            isinstance(self.trades_df, pd.DataFrame) and not self.trades_df.empty
-        )
-        self._populate_metrics_table(results)
-        self._draw_equity_chart(results)
-        trade_pnls_plot = self._trade_pnls_for_plot(results)
-        self._draw_histogram(trade_pnls_plot)
-        self._draw_rolling_chart(trade_pnls_plot)
-
-        exit_threshold = float(self.ext_spin.value())
-        scope_info = self.eval_scope_info if isinstance(self.eval_scope_info, dict) else {}
-        key_line = self._format_key_metrics_line(results)
-        self._set_status(
-            f"Přepočteno (T-short={thr_short:.2f}, T-long={thr_long:.2f}, "
-            f"T-src={self._last_ternary_threshold_source}, "
-            f"Entry={entry_threshold:.2f}, Exit={exit_threshold:.2f}, "
-            f"náklady/obchod {self.cost_spin.value():.3f}, "
-            f"scope={scope_info.get('mode')} {scope_info.get('applied_rows')}/{scope_info.get('total_rows')}, "
-            f"{key_line})"
-        )
-
     @staticmethod
     def _pick_metric(metrics: dict, *keys):
         for key in keys:
@@ -1235,112 +911,6 @@ class ModelEvaluationTab(QWidget):
             )
         self._last_ternary_threshold_source = "model"
         return float(tshort), float(tlong)
-
-    # ---------------- Helpery: model / dataset ----------------
-    def _extract_predictor_from_object(self, obj):
-        """Vrátí (model, metadata_dict_nebo_None). Podporuje estimator, dict, tuple/list."""
-        if hasattr(obj, "predict"):
-            return obj, None
-        if isinstance(obj, dict):
-            for k in ["model", "estimator", "pipeline", "clf", "best_estimator_", "sk_model", "predictor"]:
-                if k in obj and hasattr(obj[k], "predict"):
-                    return obj[k], obj
-            # případně projdeme hodnoty
-            for _, v in obj.items():
-                if hasattr(v, "predict"):
-                    return v, obj
-            raise ValueError("Ve slovníku není žádný objekt s `.predict`.")
-        if isinstance(obj, (tuple, list)):
-            for v in obj:
-                if hasattr(v, "predict"):
-                    return v, None
-            raise ValueError("V tuple/listu není žádná položka s `.predict`.")
-        raise ValueError(f"Neočekávaný typ uloženého modelu: {type(obj).__name__}.")
-
-    def _extract_X_y(self, prepared):
-        if isinstance(prepared, (tuple, list)):
-            if len(prepared) >= 2:
-                return prepared[0], prepared[1]
-            return prepared[0], None
-        if isinstance(prepared, dict):
-            X = prepared.get("X") or prepared.get("features") or prepared.get("data") or prepared.get("df")
-            y = prepared.get("y") or prepared.get("target") or prepared.get("y_true")
-            if X is None:
-                raise ValueError("V dictu chybí klíč 'X'/'features'/'data'.")
-            return X, y
-        if isinstance(prepared, pd.DataFrame):
-            X, y = prepared, None
-            for cand in ["target", "y", "label"]:
-                if cand in prepared.columns:
-                    y = prepared[cand].values
-                    X = prepared.drop(columns=[cand])
-                    break
-            return X, y
-        if isinstance(prepared, np.ndarray):
-            return prepared, None
-        raise ValueError("Neočekávaný návratový typ z prepare_dataset_with_targets(df).")
-
-    def _coerce_features_for_model(self, X):
-        """Připraví X podle očekávání modelu (číselné typy, doplnění chybějících, pořadí).
-           1) Pokud metadata obsahují expected_features, použijí se přednostně (v daném pořadí).
-           2) Jinak se použije feature_names_in_ (pokud je k dispozici).
-        """
-        if not isinstance(X, pd.DataFrame):
-            return X
-
-        dfX = X.copy()
-
-        # 0) Převody typů: datumy → int, stringy zkus na datetime → int (jinak ponech)
-        for col in dfX.columns:
-            if pd.api.types.is_datetime64_any_dtype(dfX[col]):
-                dfX[col] = dfX[col].astype("int64") // 10**6
-            elif dfX[col].dtype == "object":
-                try:
-                    parsed = pd.to_datetime(dfX[col], errors="raise")
-                    dfX[col] = parsed.astype("int64") // 10**6
-                except Exception:
-                    pass
-
-        # 1) Zahodit jasně nenumerické sloupce (ponecháme bool a čísla)
-        for c in list(dfX.columns):
-            if (not pd.api.types.is_bool_dtype(dfX[c])) and (not pd.api.types.is_numeric_dtype(dfX[c])):
-                dfX.drop(columns=[c], inplace=True, errors="ignore")
-
-        # 2) METADATA expected_features (pokud jsou k dispozici v dictu modelu)
-        try:
-            if isinstance(self.model_metadata, dict):
-                exp = self.model_metadata.get("expected_features") or self.model_metadata.get("features")
-                if isinstance(exp, (list, tuple)) and all(isinstance(k, str) for k in exp):
-                    for k in exp:
-                        if k not in dfX.columns:
-                            dfX[k] = 0.0
-                    dfX = dfX[list(exp)]
-                    med = dfX.median(numeric_only=True)
-                    dfX = dfX.fillna(med).fillna(0.0)
-                    for c in dfX.columns:
-                        if not pd.api.types.is_bool_dtype(dfX[c]):
-                            dfX[c] = dfX[c].astype("float32", copy=False)
-                    return dfX
-        except Exception:
-            # když metadata nejsou nebo jsou jiného tvaru, pokračujeme původní cestou
-            pass
-
-        # 3) Pokud model zná feature_names_in_, zarovnáme pořadí a doplníme chybějící
-        names = getattr(self.loaded_model, "feature_names_in_", None)
-        if names is not None:
-            names = [str(x) for x in list(names)]
-            for k in names:
-                if k not in dfX.columns:
-                    dfX[k] = 0.0
-            dfX = dfX[names]
-
-        # 4) doplnění NaN a typů
-        med = dfX.median(numeric_only=True)
-        dfX = dfX.fillna(med).fillna(0.0)
-        for c in dfX.columns:
-            if not pd.api.types.is_bool_dtype(dfX[c]):
-                dfX[c] = dfX[c].astype("float32", copy=False)
-        return dfX
 
     def _feature_names_for_loaded_model(self) -> list[str] | None:
         try:
@@ -1571,12 +1141,6 @@ class ModelEvaluationTab(QWidget):
         self.canvas_rolling.draw_idle()
 
     # ---------------- Helpery: equity/baseline, DD, close ----------------
-    def _safe_close_series(self, df: pd.DataFrame):
-        for c in ["close", "Close", "CLOSE", "adj_close", "Adj Close"]:
-            if c in df.columns:
-                return pd.to_numeric(df[c], errors="coerce")
-        return None
-
     @staticmethod
     def _max_drawdown(equity):
         peak = -np.inf
@@ -1777,10 +1341,7 @@ class ModelEvaluationTab(QWidget):
 
         lines = [
             "Metrika\tHodnota",
-            "# Ternarni semantika: -1=SHORT, 0=FLAT, 1=LONG.",
             f"scope\t{scope_mode} ({scope_rows}/{scope_total})",
-            f"label_mode\t{_fmt(_pick('label_mode'))}",
-            f"classification_mode\t{_fmt(_pick('classification_mode'))}",
             f"profit_net\t{_fmt(_pick('profit_net', 'profit_gross', 'profit'))}",
             f"sharpe\t{_fmt(_pick('sharpe_ann', 'sharpe_net_ann', 'sharpe', 'sharpe_net', 'sharpe_ratio'))}",
             f"profit_factor\t{_fmt(_pick('pf', 'profit_factor', 'profit_factor_net'))}",
@@ -1793,62 +1354,6 @@ class ModelEvaluationTab(QWidget):
         ]
         QApplication.clipboard().setText("\n".join(lines))
         self._set_status("Zkopirovany klicove metriky do schranky.")
-
-    def _evaluation_exports_dir(self) -> Path:
-        out_dir = Path(__file__).resolve().parents[1] / "model_outputs" / "evals"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        return out_dir
-
-    def _write_evaluation_report_files(self, out_dir: Path | str | None = None) -> tuple[Path, Path]:
-        if out_dir is None:
-            base_dir = self._evaluation_exports_dir()
-        else:
-            base_dir = Path(out_dir)
-            base_dir.mkdir(parents=True, exist_ok=True)
-
-        model_name = "model"
-        if self.model_path:
-            try:
-                model_name = Path(self.model_path).stem
-            except Exception:
-                model_name = str(self.model_path)
-
-        ts = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
-        txt_path = base_dir / f"{model_name}__evaluation_{ts}.txt"
-        html_path = base_dir / f"{model_name}__evaluation_{ts}.html"
-
-        metrics = self.last_metrics if isinstance(self.last_metrics, dict) else {}
-        text_lines = [
-            f"Evaluation report: {model_name}",
-            "Ternarni semantika: -1=SHORT, 0=FLAT, 1=LONG.",
-            "",
-            "Key metrics:",
-        ]
-        for key, value in metrics.items():
-            if isinstance(value, (int, float, np.number)) and np.isfinite(float(value)):
-                text_lines.append(f"{key}: {float(value):.4f}")
-            else:
-                text_lines.append(f"{key}: {value}")
-        txt_path.write_text("\n".join(text_lines) + "\n", encoding="utf-8")
-
-        html_lines = [
-            "<html>",
-            "<head><meta charset=\"utf-8\"><title>Evaluation report</title></head>",
-            "<body>",
-            f"<h1>Evaluation report: {model_name}</h1>",
-            "<p>Ternarni semantika: -1=SHORT, 0=FLAT, 1=LONG.</p>",
-            "<ul>",
-        ]
-        for key, value in metrics.items():
-            if isinstance(value, (int, float, np.number)) and np.isfinite(float(value)):
-                rendered = f"{float(value):.4f}"
-            else:
-                rendered = str(value)
-            html_lines.append(f"<li><strong>{key}</strong>: {rendered}</li>")
-        html_lines.extend(["</ul>", "</body>", "</html>"])
-        html_path.write_text("\n".join(html_lines) + "\n", encoding="utf-8")
-
-        return txt_path, html_path
 
     @staticmethod
     def _pretty_metric_name(key: str) -> str:
@@ -2088,234 +1593,6 @@ class ModelEvaluationTab(QWidget):
         except Exception as e:
             self._error(f"Chyba při uložení nastavení:\n{e}")
 
-    def _on_model_settings_changed(self) -> None:
-        """
-        Zavolá se když se změní nějaký parametr v 'Nastavení modelu'.
-        Zopakuje evaluaci s novými parametry bez překompilování modelu.
-        """
-        self._refresh_threshold_preview()
-        # Jednoduše zavolej existující metodu, která aktualizuje metriky
-        self.on_params_changed()
-
-    def _evaluate_entry_exit_pair_legacy(self, entry_thr: float, exit_thr: float) -> tuple[float, dict]:
-        y = self._apply_confidence_threshold(
-            raw_pred=self.y_pred_raw,
-            confidence=self.confidence_arr,
-            threshold=float(entry_thr),
-        )
-        y = self._normalize_pred(y)
-        if float(exit_thr) > 0.0:
-            y = self._apply_exit_threshold(
-                y_pred=y,
-                confidence=self.confidence_arr,
-                exit_thr=float(exit_thr),
-            )
-            y = self._normalize_pred(y)
-
-        metrics = self._eval_service.calculate_metrics(
-            y_true=self.y_true_current,
-            y_pred=y,
-            df=self.df_current,
-            fee_per_trade=float(self.cost_spin.value()),
-            slippage_bps=0.0,
-            rolling_window=200,
-            annualize_sharpe=False,
-        )
-        profit = self._pick_metric(metrics, "profit_net", "profit_gross", "profit")
-        try:
-            score = float(profit)
-        except Exception:
-            score = float("-inf")
-        if not np.isfinite(score):
-            score = float("-inf")
-        return score, metrics
-
-    def _on_auto_thresholds_clicked_legacy_sync(self) -> None:
-        if self.loaded_model is None or self.model_path is None:
-            self._warn("Nejprve vyber model (.pkl).")
-            return
-        if self.data_path is None:
-            self._warn("Nejprve vyber CSV s historickými daty.")
-            return
-        # Zajisti pripraveny y_pred_raw/confidence na aktualnim scope.
-        if self.y_pred_raw is None or self.confidence_arr is None or self.df_current is None:
-            self.on_evaluate_clicked()
-            if self.y_pred_raw is None or self.confidence_arr is None or self.df_current is None:
-                return
-
-        self._set_status("Auto Entry/Exit: hledám nejlepší kombinaci pro max profit_net...")
-        # moved to background worker
-
-        coarse_vals = np.round(np.arange(0.00, 0.96, 0.05), 2)
-        cur_entry = float(self.et_spin.value())
-        cur_exit = float(self.ext_spin.value())
-
-        best_entry = float(cur_entry)
-        best_exit = float(cur_exit)
-        best_score = float("-inf")
-        best_metrics = None
-
-        def _as_float(v, fallback=np.nan):
-            try:
-                fv = float(v)
-                return float(fv) if np.isfinite(fv) else float(fallback)
-            except Exception:
-                return float(fallback)
-
-        def _is_better_candidate(
-            cand_score: float,
-            cand_metrics: dict,
-            cand_entry: float,
-            cand_exit: float,
-            best_score_local: float,
-            best_metrics_local: dict | None,
-            best_entry_local: float,
-            best_exit_local: float,
-        ) -> bool:
-            if cand_score > (best_score_local + 1e-9):
-                return True
-            if not (np.isfinite(cand_score) and np.isfinite(best_score_local)):
-                return False
-            if not np.isclose(cand_score, best_score_local, atol=1e-9):
-                return False
-
-            # Tie-break 1: lower absolute drawdown.
-            cand_dd = abs(
-                _as_float(
-                    self._pick_metric(cand_metrics or {}, "max_dd", "max_drawdown_net", "max_drawdown"),
-                    fallback=np.inf,
-                )
-            )
-            best_dd = abs(
-                _as_float(
-                    self._pick_metric(best_metrics_local or {}, "max_dd", "max_drawdown_net", "max_drawdown"),
-                    fallback=np.inf,
-                )
-            )
-            if cand_dd < (best_dd - 1e-9):
-                return True
-            if best_dd < (cand_dd - 1e-9):
-                return False
-
-            # Tie-break 2: keep close to current thresholds (avoid drifting to 0.00/0.00 on plateaus).
-            cand_dist = abs(float(cand_entry) - float(cur_entry)) + abs(float(cand_exit) - float(cur_exit))
-            best_dist = abs(float(best_entry_local) - float(cur_entry)) + abs(float(best_exit_local) - float(cur_exit))
-            if cand_dist < (best_dist - 1e-12):
-                return True
-            if best_dist < (cand_dist - 1e-12):
-                return False
-
-            # Tie-break 3: then prefer more trades.
-            cand_trades = _as_float(self._pick_metric(cand_metrics or {}, "trades", "num_trades"), fallback=0.0)
-            best_trades = _as_float(self._pick_metric(best_metrics_local or {}, "trades", "num_trades"), fallback=0.0)
-            return cand_trades > best_trades
-
-        # Evaluate current setting first so it remains anchor on flat objective surfaces.
-        try:
-            best_score, best_metrics = self._evaluate_entry_exit_pair_legacy(best_entry, best_exit)
-        except Exception:
-            best_score = float("-inf")
-            best_metrics = None
-
-        # 1) Coarse search
-        coarse_total = int(len(coarse_vals) * len(coarse_vals))
-        coarse_done = 0
-        for entry in coarse_vals:
-            for exit_thr in coarse_vals:
-                coarse_done += 1
-                try:
-                    score, metrics = self._evaluate_entry_exit_pair_legacy(entry, exit_thr)
-                except Exception:
-                    continue
-                if _is_better_candidate(
-                    cand_score=float(score),
-                    cand_metrics=metrics,
-                    cand_entry=float(entry),
-                    cand_exit=float(exit_thr),
-                    best_score_local=float(best_score),
-                    best_metrics_local=best_metrics,
-                    best_entry_local=float(best_entry),
-                    best_exit_local=float(best_exit),
-                ):
-                    best_score = score
-                    best_entry = float(entry)
-                    best_exit = float(exit_thr)
-                    best_metrics = metrics
-                if (coarse_done % 40) == 0:
-                    self._set_status(
-                        "Auto Entry/Exit: hrube hledani "
-                        f"{coarse_done}/{coarse_total}, best_profit={best_score:.2f} "
-                        f"(Entry={best_entry:.2f}, Exit={best_exit:.2f})"
-                    )
-                    # moved to background worker
-
-        # 2) Local refine around best
-        e_min = max(0.0, best_entry - 0.06)
-        e_max = min(0.95, best_entry + 0.06)
-        x_min = max(0.0, best_exit - 0.06)
-        x_max = min(0.95, best_exit + 0.06)
-        fine_entry = np.round(np.arange(e_min, e_max + 1e-9, 0.01), 2)
-        fine_exit = np.round(np.arange(x_min, x_max + 1e-9, 0.01), 2)
-
-        fine_total = int(len(fine_entry) * len(fine_exit))
-        fine_done = 0
-        for entry in fine_entry:
-            for exit_thr in fine_exit:
-                fine_done += 1
-                try:
-                    score, metrics = self._evaluate_entry_exit_pair_legacy(entry, exit_thr)
-                except Exception:
-                    continue
-                if _is_better_candidate(
-                    cand_score=float(score),
-                    cand_metrics=metrics,
-                    cand_entry=float(entry),
-                    cand_exit=float(exit_thr),
-                    best_score_local=float(best_score),
-                    best_metrics_local=best_metrics,
-                    best_entry_local=float(best_entry),
-                    best_exit_local=float(best_exit),
-                ):
-                    best_score = score
-                    best_entry = float(entry)
-                    best_exit = float(exit_thr)
-                    best_metrics = metrics
-                if (fine_done % 30) == 0:
-                    self._set_status(
-                        "Auto Entry/Exit: jemne hledani "
-                        f"{fine_done}/{fine_total}, best_profit={best_score:.2f} "
-                        f"(Entry={best_entry:.2f}, Exit={best_exit:.2f})"
-                    )
-                    # moved to background worker
-
-        if best_metrics is None:
-            self._warn("Auto hledání prahů selhalo: nepodařilo se vyhodnotit žádnou kombinaci.")
-            return
-
-        # Nastav nalezene prahy bez mezivypoctu na kazdy krok.
-        self.et_spin.blockSignals(True)
-        self.ext_spin.blockSignals(True)
-        self.et_spin.setValue(best_entry)
-        self.ext_spin.setValue(best_exit)
-        self.et_spin.blockSignals(False)
-        self.ext_spin.blockSignals(False)
-
-        self._refresh_threshold_preview()
-        self.on_params_changed()
-
-        shown_metrics = self.last_metrics if isinstance(self.last_metrics, dict) else best_metrics
-        best_profit = self._pick_metric(shown_metrics, "profit_net", "profit_gross", "profit")
-        best_trades = self._pick_metric(shown_metrics, "trades", "num_trades")
-        QMessageBox.information(
-            self,
-            "Auto Entry/Exit hotovo",
-            "Nalezeny prahy pro max profit_net:\n\n"
-            f"Entry Threshold: {best_entry:.2f}\n"
-            f"Exit Threshold: {best_exit:.2f}\n"
-            f"profit_net: {best_profit}\n"
-            f"trades: {best_trades}",
-        )
-
     def _track_retired_worker(self, worker: TaskWorker) -> None:
         if worker in self._retired_workers:
             return
@@ -2417,7 +1694,7 @@ class ModelEvaluationTab(QWidget):
             fee_per_trade=float(self.cost_spin.value()),
             entry_threshold=float(self.et_spin.value()),
             exit_threshold=float(self.ext_spin.value()),
-            exit_policy=self._current_exit_policy(),
+            exit_policy=self._active_exit_policy(),
         )
         self._eval_worker = worker
         worker.progress_text.connect(self._set_status)
@@ -2436,7 +1713,7 @@ class ModelEvaluationTab(QWidget):
         fee_per_trade: float,
         entry_threshold: float,
         exit_threshold: float,
-        exit_policy: str,
+        exit_policy: str | None = None,
         progress_cb=None,
     ) -> EvaluationPayload:
         return model_eval_runtime.run_model_evaluation(
@@ -2447,7 +1724,7 @@ class ModelEvaluationTab(QWidget):
             fee_per_trade=float(fee_per_trade),
             entry_threshold=float(entry_threshold),
             exit_threshold=float(exit_threshold),
-            exit_policy=resolve_exit_policy_setting(exit_policy, default=DEFAULT_EXIT_POLICY),
+            exit_policy=exit_policy,
             progress_cb=progress_cb,
         )
 
@@ -2502,7 +1779,7 @@ class ModelEvaluationTab(QWidget):
         fee_per_trade: float,
         entry_threshold: float,
         exit_threshold: float,
-        exit_policy: str,
+        exit_policy: str = DEFAULT_EXIT_POLICY,
         progress_cb=None,
     ) -> tuple[np.ndarray, dict]:
         return model_eval_runtime.recalculate_metrics_from_predictions(
@@ -2513,7 +1790,7 @@ class ModelEvaluationTab(QWidget):
             fee_per_trade=float(fee_per_trade),
             entry_threshold=float(entry_threshold),
             exit_threshold=float(exit_threshold),
-            exit_policy=resolve_exit_policy_setting(exit_policy, default=DEFAULT_EXIT_POLICY),
+            exit_policy=exit_policy,
             progress_cb=progress_cb,
         )
 
@@ -2533,7 +1810,7 @@ class ModelEvaluationTab(QWidget):
             fee_per_trade=float(self.cost_spin.value()),
             entry_threshold=float(self.et_spin.value()),
             exit_threshold=float(self.ext_spin.value()),
-            exit_policy=self._current_exit_policy(),
+            exit_policy=self._active_exit_policy(),
         )
         self._params_worker = worker
         worker.progress_text.connect(self._set_status)
@@ -2604,7 +1881,7 @@ class ModelEvaluationTab(QWidget):
         fee_per_trade: float,
         current_entry: float,
         current_exit: float,
-        exit_policy: str,
+        exit_policy: str = DEFAULT_EXIT_POLICY,
         progress_cb=None,
         should_run=None,
     ) -> AutoThresholdPayload:
@@ -2616,7 +1893,7 @@ class ModelEvaluationTab(QWidget):
             fee_per_trade=float(fee_per_trade),
             current_entry=float(current_entry),
             current_exit=float(current_exit),
-            exit_policy=resolve_exit_policy_setting(exit_policy, default=DEFAULT_EXIT_POLICY),
+            exit_policy=exit_policy,
             progress_cb=progress_cb,
             should_run=should_run,
         )
@@ -2636,7 +1913,7 @@ class ModelEvaluationTab(QWidget):
             fee_per_trade=float(self.cost_spin.value()),
             current_entry=float(self.et_spin.value()),
             current_exit=float(self.ext_spin.value()),
-            exit_policy=self._current_exit_policy(),
+            exit_policy=self._active_exit_policy(),
         )
         self._auto_threshold_worker = worker
         worker.progress_text.connect(self._set_status)
@@ -2698,7 +1975,6 @@ class ModelEvaluationTab(QWidget):
             loaded = model_eval_runtime.load_predictor_with_merged_meta(normalized_path)
             self.loaded_model = loaded.predictor
             self.model_metadata = loaded.metadata
-            self._set_exit_policy_combo(resolve_exit_policy_setting(self.model_metadata or {}, default=DEFAULT_EXIT_POLICY))
             if isinstance(self.model_metadata, dict):
                 _, tshort, tlong = self._meta_threshold_values()
                 if not isinstance(tshort, (int, float)) or not isinstance(tlong, (int, float)):
@@ -2706,29 +1982,6 @@ class ModelEvaluationTab(QWidget):
                         "Model neobsahuje ternarni prahy (ternary_threshold_short/long). "
                         "Tab 3 je nyni pouze pro ternarni modely."
                     )
-
-                if self.data_path:
-                    try:
-                        stale = model_eval_runtime.is_tab5_holdout_ranking_stale(
-                            self.model_metadata,
-                            data_path=self.data_path,
-                            fee_per_trade=float(self.cost_spin.value()),
-                            exit_policy=self._current_exit_policy(),
-                        )
-                    except Exception:
-                        stale = True
-                    if not stale:
-                        ranking = model_eval_runtime.get_tab5_holdout_ranking(
-                            self.model_metadata,
-                            exit_policy=self._current_exit_policy(),
-                        )
-                        if isinstance(ranking, dict):
-                            entry_threshold = self._safe_float(ranking.get("entry_threshold"))
-                            exit_threshold = self._safe_float(ranking.get("exit_threshold"))
-                            if entry_threshold is not None:
-                                self.et_spin.setValue(float(entry_threshold))
-                            if exit_threshold is not None:
-                                self.ext_spin.setValue(float(exit_threshold))
             self.model_path = normalized_path
             self.model_label.setText(f"Model: {normalized_path}")
             self._refresh_threshold_preview()

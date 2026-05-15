@@ -59,38 +59,97 @@ def test_model_evaluation_extracts_trade_dataframe_from_shared_results(qapp):
         tab.close()
 
 
-def test_model_evaluation_restores_last_data_csv_path(monkeypatch, qapp, tmp_path):
-    class _DummySettings:
-        _store: dict[str, str] = {}
+def test_model_evaluation_task_wrappers_forward_exit_policy(monkeypatch):
+    calls: dict[str, dict] = {}
 
-        def __init__(self, *args, **kwargs):
-            pass
+    monkeypatch.setattr(
+        tab_model_evaluation_module.model_eval_runtime,
+        "run_model_evaluation",
+        lambda **kwargs: calls.setdefault("eval", kwargs),
+    )
+    monkeypatch.setattr(
+        tab_model_evaluation_module.model_eval_runtime,
+        "recalculate_metrics_from_predictions",
+        lambda **kwargs: calls.setdefault("recalc", kwargs),
+    )
+    monkeypatch.setattr(
+        tab_model_evaluation_module.model_eval_runtime,
+        "run_auto_threshold_search_from_context",
+        lambda **kwargs: calls.setdefault("search", kwargs),
+    )
 
-        def value(self, key, default=None):
-            return self._store.get(str(key), default)
+    ModelEvaluationTab._task_run_full_evaluation(
+        model=object(),
+        metadata={},
+        data_path="demo.csv",
+        scope_mode="holdout",
+        fee_per_trade=0.0,
+        entry_threshold=0.6,
+        exit_threshold=0.7,
+        exit_policy="legacy_flat_exit",
+    )
+    ModelEvaluationTab._task_recalculate_metrics(
+        y_pred_raw=[1],
+        confidence_arr=[0.9],
+        y_true_current=[1],
+        df_current=pd.DataFrame({"close": [100.0]}),
+        fee_per_trade=0.0,
+        entry_threshold=0.6,
+        exit_threshold=0.7,
+        exit_policy="legacy_flat_exit",
+    )
+    ModelEvaluationTab._task_auto_threshold_search(
+        y_pred_raw=[1],
+        confidence_arr=[0.9],
+        y_true_current=[1],
+        df_current=pd.DataFrame({"close": [100.0]}),
+        fee_per_trade=0.0,
+        current_entry=0.6,
+        current_exit=0.7,
+        exit_policy="legacy_flat_exit",
+    )
 
-        def setValue(self, key, value):
-            self._store[str(key)] = str(value)
+    assert calls["eval"]["exit_policy"] == "legacy_flat_exit"
+    assert calls["recalc"]["exit_policy"] == "legacy_flat_exit"
+    assert calls["search"]["exit_policy"] == "legacy_flat_exit"
 
-        def sync(self):
+
+def test_model_evaluation_workers_use_active_exit_policy(monkeypatch, qapp):
+    created: list[dict[str, object]] = []
+
+    class _DummySignal:
+        def connect(self, _callback):
             return None
 
-    _DummySettings._store = {}
-    monkeypatch.setattr(tab_model_evaluation_module, "QSettings", _DummySettings)
+    class _StubTaskWorker:
+        def __init__(self, _fn, **kwargs):
+            created.append(kwargs)
+            self.progress_text = _DummySignal()
+            self.result = _DummySignal()
+            self.error = _DummySignal()
+            self.finished = _DummySignal()
 
-    csv_path = tmp_path / "dataset.csv"
-    csv_path.write_text("timestamp,open,high,low,close,volume\n1,1,1,1,1,1\n", encoding="utf-8")
+        def start(self):
+            return None
 
-    first = ModelEvaluationTab()
+    monkeypatch.setattr(tab_model_evaluation_module, "TaskWorker", _StubTaskWorker)
+
+    tab = ModelEvaluationTab()
     try:
-        first.set_data_path(str(csv_path))
-        assert first.data_path is not None
-    finally:
-        first.close()
+        tab.model_metadata = {"user_settings": {"exit_policy": "legacy_flat"}}
+        tab.loaded_model = object()
+        tab.model_path = "demo.pkl"
+        tab.data_path = "demo.csv"
+        tab.y_pred_raw = pd.Series([1]).to_numpy()
+        tab.confidence_arr = pd.Series([0.9]).to_numpy()
+        tab.y_true_current = pd.Series([1]).to_numpy()
+        tab.df_current = pd.DataFrame({"close": [100.0]})
 
-    second = ModelEvaluationTab()
-    try:
-        assert second.data_path == str(csv_path.resolve())
-        assert str(csv_path.resolve()) in second.data_label.text()
+        tab._start_evaluation_worker()
+        tab._run_params_recalc()
+        tab._start_auto_threshold_worker()
+
+        assert len(created) == 3
+        assert all(kwargs["exit_policy"] == "legacy_flat_exit" for kwargs in created)
     finally:
-        second.close()
+        tab.close()

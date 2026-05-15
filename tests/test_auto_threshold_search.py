@@ -8,12 +8,13 @@ from ibkr_trading_bot.core.services.auto_threshold_search import (
 from ibkr_trading_bot.core.services.model_eval_service import run_auto_threshold_search_from_context
 
 
-def _pick_metric(metrics, *keys: str):
+def _pick_metric(metrics, name: str):
     metrics = metrics or {}
-    for key in keys:
-        if key in metrics:
-            return metrics[key]
-    return None
+    if name == "max_dd":
+        return metrics.get("max_dd")
+    if name == "trades":
+        return metrics.get("trades")
+    raise KeyError(name)
 
 
 def test_auto_threshold_search_is_deterministic():
