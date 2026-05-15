@@ -428,6 +428,55 @@ def test_live_bot_layout_avoids_model_wrapper_and_clarifies_ibkr_account(monkeyp
         tab.close()
 
 
+def test_live_prepare_x_for_model_static_rejects_missing_features():
+    from ibkr_trading_bot.gui.tab_live_bot import _prepare_X_for_model_static
+
+    with pytest.raises(ValueError, match="feat_b"):
+        _prepare_X_for_model_static(
+            pd.DataFrame({"feat_a": [1.0], "close": [100.0]}),
+            ["feat_a", "feat_b"],
+        )
+
+
+def test_live_load_models_rejects_mixed_feature_contracts(monkeypatch, qapp, tmp_path):
+    import json
+    import joblib
+
+    from ibkr_trading_bot.gui import tab_live_bot as tab_live_bot_module
+
+    def _write_model(path, features):
+        joblib.dump(DummyTernaryPredictor(), path)
+        meta = {
+            "created_at": "2026-03-06T12:00:00",
+            "created_at_iso": "2026-03-06T12:00:00",
+            "trained_features": list(features),
+            "classes": [0, 1, 2],
+            "class_to_dir": {0: "SHORT", 1: "HOLD", 2: "LONG"},
+            "label_mode": "ternary_mapped",
+            "ternary_threshold_short": 0.40,
+            "ternary_threshold_long": 0.60,
+            "metrics_holdout": {"profit_net": 1.0},
+        }
+        path.with_name(path.stem + "_meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        return path
+
+    monkeypatch.setattr(tab_live_bot_module, "FigureCanvas", StubCanvas)
+    model_a = _write_model(tmp_path / "model_a.pkl", ["feat_a", "feat_b"])
+    model_b = _write_model(tmp_path / "model_b.pkl", ["feat_a", "feat_c"])
+
+    tab = tab_live_bot_module.LiveBotWidget()
+    try:
+        tab.le_model_path.setText(f"{model_a};{model_b}")
+
+        assert tab._load_models() is False
+        assert tab.model_expected_features is None
+        qapp.processEvents()
+        tab._flush_log_queue()
+        assert "Feature kontrakt modelu model_b.pkl nesedi s model_a.pkl." in tab.console.toPlainText()
+    finally:
+        tab.close()
+
+
 def test_live_rescore_replays_history_without_smearing_current_short_position(monkeypatch, qapp):
     from ibkr_trading_bot.gui import tab_live_bot as tab_live_bot_module
 

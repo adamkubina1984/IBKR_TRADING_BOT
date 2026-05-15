@@ -103,10 +103,22 @@ def test_model_training_tab_propagates_search_backend_profile(monkeypatch, qapp)
         tab.run_training()
 
         profile = captured.get("training_profile")
+        meta_extra = captured.get("meta_extra")
         assert isinstance(profile, dict)
+        assert isinstance(meta_extra, dict)
         assert profile["search_backend"] == "optuna"
         assert profile["optuna_trials"] == 17
         assert profile["optuna_timeout_seconds"] == 222
+        assert profile["training_mode"] == "standard"
+        assert profile["workflow_mode"] == "refine"
+        assert profile["compatibility_mode"] == "standard"
+        assert profile["runtime_training_mode"] == "standard"
+        assert profile["training_mode_requested"] == "standard"
+        assert meta_extra["workflow_mode"] == "refine"
+        assert meta_extra["training_mode"] == "standard"
+        assert meta_extra["training_mode_requested"] == "standard"
+        assert meta_extra["training_mode_compatibility"] == "standard"
+        assert meta_extra["training_mode_runtime"] == "standard"
     finally:
         tab.close()
 

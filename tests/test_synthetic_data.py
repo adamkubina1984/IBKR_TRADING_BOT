@@ -9,7 +9,7 @@ Test syntetických OHLC dat:
 
 import pandas as pd
 
-from data.generate_synthetic import generate_synthetic_data
+from ibkr_trading_bot.data.generate_synthetic import generate_synthetic_data
 
 
 def test_synthetic_ohlc_shape_and_consistency():

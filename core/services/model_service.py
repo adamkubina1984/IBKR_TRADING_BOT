@@ -13,6 +13,8 @@ import joblib
 import numpy as np
 import pandas as pd
 
+from ibkr_trading_bot.utils.labeling import infer_label_mode
+
 log = logging.getLogger(__name__)
 
 @dataclass
@@ -77,7 +79,69 @@ def merge_model_metadata(embedded: dict[str, Any] | None, sidecar: dict[str, Any
         merged.update(embedded)
     if isinstance(sidecar, dict):
         merged.update(sidecar)
+    if merged:
+        merged["label_mode"] = infer_label_mode_from_meta(merged)
+        merged["feature_contract"] = feature_contract_from_meta(merged)
     return merged
+
+
+def _normalize_string_list(values: Any) -> list[str]:
+    if values is None or isinstance(values, (str, bytes)):
+        return []
+    try:
+        return [str(item) for item in list(values) if str(item)]
+    except Exception:
+        return []
+
+
+def feature_contract_from_meta(meta: dict[str, Any] | None) -> dict[str, Any]:
+    source = meta if isinstance(meta, dict) else {}
+    features = _normalize_string_list(source.get("trained_features") or source.get("features"))
+    existing = source.get("feature_contract") if isinstance(source.get("feature_contract"), dict) else {}
+
+    count = len(features)
+    if count <= 0:
+        try:
+            count = int(source.get("n_features") or existing.get("count") or existing.get("feature_count") or 0)
+        except Exception:
+            count = 0
+
+    signature = None
+    if features:
+        signature = hashlib.sha1("\x1f".join(features).encode("utf-8")).hexdigest()
+    else:
+        existing_signature = existing.get("signature") or existing.get("feature_signature")
+        if existing_signature:
+            signature = str(existing_signature)
+
+    return {
+        "count": int(max(0, count)),
+        "signature": signature,
+    }
+
+
+def infer_label_mode_from_meta(meta: dict[str, Any] | None) -> str:
+    source = meta if isinstance(meta, dict) else {}
+    candidates = [
+        source.get("label_mode"),
+        (source.get("metrics_holdout") or {}).get("label_mode") if isinstance(source.get("metrics_holdout"), dict) else None,
+        (source.get("metrics") or {}).get("label_mode") if isinstance(source.get("metrics"), dict) else None,
+    ]
+    allowed = {"binary_01", "binary_signed", "ternary_signed", "ternary_mapped"}
+    for candidate in candidates:
+        text = str(candidate or "").strip().lower()
+        if text in allowed:
+            return text
+
+    classes = None
+    if isinstance(source.get("model_classes"), list):
+        classes = list(source.get("model_classes"))
+    elif isinstance(source.get("classes"), list):
+        classes = list(source.get("classes"))
+    elif isinstance(source.get("class_to_dir"), dict):
+        classes = list((source.get("class_to_dir") or {}).keys())
+
+    return str(infer_label_mode(classes or []))
 
 
 def _jsonify_meta_value(value: Any) -> Any:
@@ -158,6 +222,8 @@ def synthesize_sidecar_model_meta(model: Any) -> dict[str, Any]:
         "training_profile",
         "fee_per_trade",
         "slippage_bps",
+        "label_mode",
+        "feature_contract",
         "version",
     ]
     meta: dict[str, Any] = {}
@@ -191,6 +257,9 @@ def synthesize_sidecar_model_meta(model: Any) -> dict[str, Any]:
 
     if "metrics" not in meta and isinstance(meta.get("metrics_holdout"), dict):
         meta["metrics"] = dict(meta["metrics_holdout"])
+
+    meta.setdefault("label_mode", infer_label_mode_from_meta(meta))
+    meta.setdefault("feature_contract", feature_contract_from_meta(meta))
 
     return meta
 
@@ -279,6 +348,9 @@ def load_model_with_meta(model_path: str | Path) -> LoadedModel:
         elif hasattr(predictor, "feature_names_in_"):
             meta["trained_features"] = list(getattr(predictor, "feature_names_in_"))
 
+    meta["label_mode"] = infer_label_mode_from_meta(meta)
+    meta["feature_contract"] = feature_contract_from_meta(meta)
+
     version_warning = build_sklearn_version_warning(meta, model_path=p)
     if version_warning:
         log.warning(version_warning)
@@ -347,6 +419,8 @@ def save_model_with_meta(
         "python_version": runtime_python_version(),
         "schema_version": 1,
     }
+    meta["label_mode"] = infer_label_mode_from_meta(meta)
+    meta["feature_contract"] = feature_contract_from_meta(meta)
     p_meta = p.with_name(p.stem + "_meta.json")
     p_meta.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     return str(p), str(p_meta)

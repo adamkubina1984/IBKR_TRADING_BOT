@@ -31,6 +31,8 @@ from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_sc
 from ibkr_trading_bot.core.services.dataset_service import DatasetService
 from ibkr_trading_bot.core.services.futures_roll_chain_service import read_dataset_sidecar_meta
 from ibkr_trading_bot.core.services.model_training_service import (
+    canonical_workflow_mode,
+    compatibility_training_mode,
     compute_holdout_bars as runtime_compute_holdout_bars,
     name_and_meta_from_csv as runtime_name_and_meta_from_csv,
     run_training_job,
@@ -134,7 +136,11 @@ class TrainWorker(QThread):
             quality_min_mc_sharpe_p50 = float(profile.get("quality_min_mc_sharpe_p50", -0.02))
             quality_min_profit_net = float(profile.get("quality_min_profit_net", 0.0))
             quality_min_holdout_sharpe = float(profile.get("quality_min_holdout_sharpe", 0.0))
-            training_mode = str(profile.get("training_mode", "standard")).strip().lower()
+            training_mode = str(
+                profile.get("training_mode")
+                or profile.get("compatibility_mode")
+                or "standard"
+            ).strip().lower()
             candidate_chain_enabled = bool(profile.get("candidate_chain_enabled", True))
             candidate_selection_criterion = str(
                 profile.get("candidate_selection_criterion", "balanced")
@@ -1221,7 +1227,16 @@ class ModelTrainingTab(QWidget):
         est = self.cmb_model.currentText().strip().lower()
         mode = self._current_training_mode()
         profile = self._apply_search_backend_profile_overrides(self._training_profile_for_mode(mode))
-        profile["training_mode"] = mode
+        workflow_mode = str(profile.get("workflow_mode") or canonical_workflow_mode(mode))
+        compatibility_mode = profile.get("compatibility_mode")
+        if compatibility_mode is None:
+            compatibility_mode = compatibility_training_mode(mode)
+        runtime_training_mode = str(compatibility_mode or mode)
+        profile["training_mode"] = runtime_training_mode
+        profile["training_mode_requested"] = mode
+        profile["workflow_mode"] = workflow_mode
+        profile["compatibility_mode"] = compatibility_mode
+        profile["runtime_training_mode"] = runtime_training_mode
         profile["candidate_chain_enabled"] = True
         profile["candidate_selection_criterion"] = self._current_candidate_criterion()
         profile["candidate_top_n"] = int(max(1, self._current_candidate_top_n()))
@@ -1274,7 +1289,7 @@ class ModelTrainingTab(QWidget):
         profile["mc_block_len"] = int(mc_block)
         self.log.appendPlainText(
             "INFO Training mode: "
-            f"{mode} | cv={int(profile.get('n_splits', 5))} "
+            f"{mode} | workflow={workflow_mode} | compat={compatibility_mode} | runtime={runtime_training_mode} | cv={int(profile.get('n_splits', 5))} "
             f"top_k={int(profile.get('top_k_features', 12))} "
             f"search_backend={profile.get('search_backend', 'grid')} "
             f"optuna_trials={profile.get('optuna_trials')} "
@@ -1302,6 +1317,10 @@ class ModelTrainingTab(QWidget):
         meta_extra["holdout_min_bars"] = int(self.holdout_min_bars_default)
         meta_extra["holdout_max_bars"] = int(self.holdout_max_bars_default)
         meta_extra["training_mode"] = mode
+        meta_extra["training_mode_requested"] = mode
+        meta_extra["training_mode_compatibility"] = compatibility_mode
+        meta_extra["training_mode_runtime"] = runtime_training_mode
+        meta_extra["workflow_mode"] = workflow_mode
         meta_extra["training_profile"] = dict(profile)
 
         self.tbl.setRowCount(0)

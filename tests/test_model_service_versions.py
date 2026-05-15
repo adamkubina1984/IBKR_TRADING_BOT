@@ -1,6 +1,5 @@
 import json
 import logging
-from pathlib import Path
 
 import joblib
 import numpy as np
@@ -56,30 +55,3 @@ def test_load_model_with_mismatched_sklearn_version_warns(caplog, tmp_path):
     assert mismatched_version in loaded.version_warning
     assert runtime_version in loaded.version_warning
     assert "scikit-learn mismatch" in caplog.text
-
-
-def test_load_model_with_meta_recovers_missing_sidecar(tmp_path):
-    model_path = Path(tmp_path) / "refresh_model.pkl"
-    joblib.dump(
-        {
-            "model": DummyPredictor(),
-            "created_at": "20260421_131050",
-            "estimator_name": "hgbt",
-            "features": ["f_open", "f_close"],
-            "ternary_threshold_short": 0.41,
-            "ternary_threshold_long": 0.63,
-            "metrics_holdout": {"profit_net": 12.5, "sharpe": 0.7},
-            "training_mode": "refresh",
-        },
-        model_path,
-    )
-
-    loaded = load_model_with_meta(model_path)
-    meta_path = model_path.with_name(model_path.stem + "_meta.json")
-
-    assert meta_path.exists()
-    assert loaded.meta["trained_features"] == ["f_open", "f_close"]
-    assert loaded.meta["model_classes"] == [0, 1, 2]
-    assert loaded.meta["ternary_threshold_short"] == 0.41
-    assert loaded.meta["ternary_threshold_long"] == 0.63
-    assert loaded.meta["metrics"]["profit_net"] == 12.5

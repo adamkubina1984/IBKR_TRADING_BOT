@@ -52,6 +52,12 @@ except Exception:
 
 
 LOGGER = logging.getLogger(__name__)
+_VALID_TRAINING_MODES = {"quick", "standard", "strict"}
+_CANONICAL_TRAINING_MODE_ALIASES = {
+    "explore": "quick",
+    "refine": "standard",
+    "refresh": "strict",
+}
 
 # --- purged walk-forward split
 from ibkr_trading_bot.model.tscv import PurgedWalkForwardSplit
@@ -82,6 +88,16 @@ def _model_dir() -> pathlib.Path:
     out = root / "model_outputs"
     out.mkdir(parents=True, exist_ok=True)
     return out
+
+def _normalize_legacy_training_mode(mode: Any) -> str:
+    normalized = str(mode or "standard").strip().lower()
+    normalized = _CANONICAL_TRAINING_MODE_ALIASES.get(normalized, normalized)
+    if normalized not in _VALID_TRAINING_MODES:
+        raise ValueError(
+            "Unsupported training_mode. Expected one of quick/standard/strict "
+            "or canonical aliases explore/refine/refresh."
+        )
+    return normalized
 
 
 def _chain_shortlist_path(name_prefix: str | None, estimator_name: str) -> pathlib.Path:
@@ -221,6 +237,93 @@ def _build_chain_signature(
     blob = jsonlib.dumps(sig, sort_keys=True, ensure_ascii=True, default=str)
     digest = hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
     return digest, sig
+
+
+def _select_threshold_calibration_split(
+    df_train: pd.DataFrame,
+    *,
+    is_ternary: bool,
+    threshold_calibration_enabled: bool,
+    threshold_calibration_pct: float,
+    threshold_calibration_min_bars: int,
+    threshold_calibration_max_bars: int,
+    threshold_calibration_train_min_guard: int,
+    embargo: int,
+    label_lookahead_bars: int,
+) -> tuple[pd.DataFrame, pd.DataFrame | None, dict[str, Any], int]:
+    n_train_eff = int(len(df_train))
+    label_lookahead = int(max(0, label_lookahead_bars))
+    effective_embargo = int(max(int(embargo), label_lookahead))
+
+    selection: dict[str, Any] = {
+        "enabled": False,
+        "mode": "disabled",
+        "requested_pct": None,
+        "requested_bars": 0,
+        "min_bars": 0,
+        "max_bars": None,
+        "applied_bars": 0,
+        "train_core_bars": int(n_train_eff),
+        "train_full_bars": int(n_train_eff),
+        "train_min_guard": 0,
+        "gap_bars": 0,
+        "embargo_bars": int(effective_embargo),
+        "label_lookahead_bars": int(label_lookahead),
+        "embargo_respects_label_lookahead": bool(effective_embargo >= label_lookahead),
+        "no_overlap": True,
+    }
+
+    df_train_core = df_train.copy()
+    df_threshold_calib: pd.DataFrame | None = None
+    if not is_ternary or not bool(threshold_calibration_enabled):
+        return df_train_core, df_threshold_calib, selection, effective_embargo
+
+    calib_pct = float(np.clip(threshold_calibration_pct, 0.0, 0.90))
+    calib_min_bars = max(0, int(threshold_calibration_min_bars))
+    calib_max_bars = max(0, int(threshold_calibration_max_bars))
+    calib_train_min_guard = max(100, int(threshold_calibration_train_min_guard))
+
+    requested_calib_bars = int(round(float(n_train_eff) * calib_pct))
+    n_calib = int(max(requested_calib_bars, calib_min_bars))
+    if calib_max_bars > 0:
+        n_calib = int(min(n_calib, calib_max_bars))
+
+    max_calib_allowed = max(0, int(n_train_eff - calib_train_min_guard - effective_embargo))
+    n_calib = int(min(max(0, n_calib), max_calib_allowed))
+
+    selection = {
+        "enabled": True,
+        "mode": "tail_pct",
+        "requested_pct": float(calib_pct),
+        "requested_bars": int(requested_calib_bars),
+        "min_bars": int(calib_min_bars),
+        "max_bars": int(calib_max_bars) if calib_max_bars > 0 else None,
+        "applied_bars": int(n_calib),
+        "train_core_bars": int(n_train_eff),
+        "train_full_bars": int(n_train_eff),
+        "train_min_guard": int(calib_train_min_guard),
+        "gap_bars": 0,
+        "embargo_bars": int(effective_embargo),
+        "label_lookahead_bars": int(label_lookahead),
+        "embargo_respects_label_lookahead": bool(effective_embargo >= label_lookahead),
+        "no_overlap": True,
+    }
+
+    if n_calib <= 0:
+        selection["reason"] = "not_enough_train_bars_for_calibration_split"
+        return df_train_core, df_threshold_calib, selection, effective_embargo
+
+    calib_start = int(n_train_eff - n_calib)
+    core_end = int(max(0, calib_start - effective_embargo))
+    df_train_core = df_train.iloc[:core_end].reset_index(drop=True)
+    df_threshold_calib = df_train.iloc[calib_start:].reset_index(drop=True)
+
+    gap_bars = int(max(0, calib_start - core_end))
+    selection["train_core_bars"] = int(len(df_train_core))
+    selection["applied_bars"] = int(len(df_threshold_calib))
+    selection["gap_bars"] = int(gap_bars)
+    selection["no_overlap"] = bool(gap_bars >= effective_embargo)
+    return df_train_core, df_threshold_calib, selection, effective_embargo
 
 
 def _params_key(params: dict[str, Any]) -> str:
@@ -1790,6 +1893,295 @@ def _rebalance_ternary_thresholds_on_oof(
     return ts, tl, stats
 
 
+def _finalize_threshold_tuning_outcome(
+    threshold_tuning: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(threshold_tuning, dict) or not threshold_tuning:
+        return threshold_tuning if isinstance(threshold_tuning, dict) else {}
+
+    primary_mode = str(
+        threshold_tuning.get("selected_mode_base")
+        or threshold_tuning.get("selected_mode")
+        or ""
+    ).strip()
+    final_mode = str(threshold_tuning.get("selected_mode") or primary_mode or "").strip()
+    adjustments_applied: list[str] = []
+
+    rebalance_adjustment = threshold_tuning.get("rebalance_adjustment")
+    if isinstance(rebalance_adjustment, dict):
+        if bool(rebalance_adjustment.get("reverted")):
+            adjustments_applied.append("rebalance_reverted")
+        else:
+            before_thresholds = rebalance_adjustment.get("before_thresholds")
+            after_thresholds = rebalance_adjustment.get("after_thresholds")
+            if isinstance(before_thresholds, dict) and isinstance(after_thresholds, dict):
+                try:
+                    before_short = float(before_thresholds.get("short"))
+                    before_long = float(before_thresholds.get("long"))
+                    after_short = float(after_thresholds.get("short"))
+                    after_long = float(after_thresholds.get("long"))
+                    if (
+                        abs(before_short - after_short) > 1e-12
+                        or abs(before_long - after_long) > 1e-12
+                    ):
+                        adjustments_applied.append("rebalance")
+                except Exception:
+                    pass
+
+    if "threshold_cap" in threshold_tuning:
+        adjustments_applied.append("threshold_cap")
+
+    threshold_gap_guard = threshold_tuning.get("threshold_gap_guard")
+    if isinstance(threshold_gap_guard, dict) and bool(threshold_gap_guard.get("accepted")):
+        adjustments_applied.append("threshold_gap_guard")
+
+    threshold_asymmetry_guard = threshold_tuning.get("threshold_asymmetry_guard")
+    if isinstance(threshold_asymmetry_guard, dict) and bool(threshold_asymmetry_guard.get("accepted")):
+        adjustments_applied.append("threshold_asymmetry_guard")
+
+    short_recall_enforce = threshold_tuning.get("short_recall_enforce")
+    if isinstance(short_recall_enforce, dict) and bool(short_recall_enforce.get("applied")):
+        adjustments_applied.append("short_recall_enforce")
+
+    if isinstance(threshold_tuning.get("data_driven_fallback"), dict):
+        adjustments_applied.append("data_driven_fallback")
+
+    if final_mode == "shared_threshold_fallback":
+        adjustments_applied.append("shared_threshold_fallback")
+    elif final_mode == "shared_threshold_asymmetry_guard":
+        adjustments_applied.append("shared_threshold_asymmetry_guard")
+    elif final_mode == "revert_pre_guard_balanced":
+        adjustments_applied.append("revert_pre_guard_balanced")
+
+    fallback_reason = threshold_tuning.get("fallback_reason")
+    if fallback_reason is None:
+        if final_mode in {
+            "shared_threshold_fallback",
+            "shared_threshold_asymmetry_guard",
+            "data_driven_fallback",
+            "short_recall_enforce",
+            "revert_pre_guard_balanced",
+        }:
+            fallback_reason = final_mode
+        elif final_mode.startswith("rebalance_reverted("):
+            fallback_reason = (
+                rebalance_adjustment.get("revert_reason")
+                if isinstance(rebalance_adjustment, dict)
+                else None
+            ) or "rebalance_reverted"
+
+    deduped_adjustments: list[str] = []
+    seen_adjustments: set[str] = set()
+    for adjustment in adjustments_applied:
+        adj = str(adjustment or "").strip()
+        if adj and adj not in seen_adjustments:
+            seen_adjustments.add(adj)
+            deduped_adjustments.append(adj)
+
+    threshold_tuning["primary_search_mode"] = primary_mode or None
+    threshold_tuning["final_selected_mode"] = final_mode or None
+    threshold_tuning["fallback_reason"] = (
+        str(fallback_reason) if fallback_reason is not None else None
+    )
+    threshold_tuning["adjustments_applied"] = deduped_adjustments
+    return threshold_tuning
+
+
+def _ternary_threshold_guardrail_config(estimator_name: str | None) -> dict[str, Any]:
+    est_name_lc = str(estimator_name or "").lower()
+    is_lgb_family = est_name_lc in {"lgb", "lightgbm"}
+    config = {
+        "estimator": est_name_lc,
+        "is_lgb_family": bool(is_lgb_family),
+        "short_bounds": [0.03, 0.75],
+        "long_bounds": [0.03, 0.75],
+        "max_gap": 0.45,
+        "max_dir_rate": 0.85,
+    }
+    if is_lgb_family:
+        config.update(
+            {
+                "short_bounds": [0.05, 0.68],
+                "long_bounds": [0.05, 0.72],
+                "max_gap": 0.30,
+            }
+        )
+    return config
+
+
+def _side_recalls_for_ternary_thresholds(
+    y_true_mapped: np.ndarray,
+    oof_short: np.ndarray,
+    oof_long: np.ndarray,
+    thr_short: float,
+    thr_long: float,
+) -> tuple[float, float]:
+    y_arr = np.asarray(y_true_mapped, dtype=int)
+    yp = _ternary_predict_mapped(oof_short, oof_long, float(thr_short), float(thr_long))
+    mask_short = y_arr == 0
+    mask_long = y_arr == 2
+    rec_short = float(np.mean(yp[mask_short] == 0)) if np.any(mask_short) else float("nan")
+    rec_long = float(np.mean(yp[mask_long] == 2)) if np.any(mask_long) else float("nan")
+    return rec_short, rec_long
+
+
+def _guardrail_reasons_for_ternary_thresholds(
+    stats: dict[str, float],
+    *,
+    thr_short: float,
+    thr_long: float,
+    rec_short: float,
+    rec_long: float,
+    min_side_floor: int,
+    max_side_dominance: float,
+    max_gap: float,
+    max_dir_rate: float,
+    min_side_recall: float,
+) -> list[str]:
+    reasons: list[str] = []
+    n_short = int(stats.get("n_short", 0.0))
+    n_long = int(stats.get("n_long", 0.0))
+    dominance = float(stats.get("dominance", 1.0))
+    dir_rate = float(stats.get("dir_rate", 0.0))
+    if n_short < int(min_side_floor):
+        reasons.append("n_short_below_min_side_signals")
+    if n_long < int(min_side_floor):
+        reasons.append("n_long_below_min_side_signals")
+    if dominance > max(0.90, float(max_side_dominance) + 0.12):
+        reasons.append("dominance_above_limit")
+    if dir_rate > float(max_dir_rate):
+        reasons.append("dir_rate_above_limit")
+    if abs(float(thr_short) - float(thr_long)) > float(max_gap):
+        reasons.append("threshold_gap_above_limit")
+    if np.isfinite(rec_short) and float(rec_short) < float(min_side_recall):
+        reasons.append("short_recall_below_min")
+    if np.isfinite(rec_long) and float(rec_long) < float(min_side_recall):
+        reasons.append("long_recall_below_min")
+    return reasons
+
+
+def _apply_single_fallback_ternary_thresholds(
+    *,
+    y_true_mapped: np.ndarray,
+    oof_short: np.ndarray,
+    oof_long: np.ndarray,
+    thr_short: float,
+    thr_long: float,
+    estimator_name: str | None,
+    min_side_floor: int,
+    max_side_dominance: float,
+    min_side_recall: float,
+) -> tuple[float, float, dict[str, Any]]:
+    config = _ternary_threshold_guardrail_config(estimator_name)
+    short_bounds = list(config.get("short_bounds") or [0.03, 0.75])
+    long_bounds = list(config.get("long_bounds") or [0.03, 0.75])
+    max_gap = float(config.get("max_gap", 0.45))
+    max_dir_rate = float(config.get("max_dir_rate", 0.85))
+
+    ts_primary = float(np.clip(float(thr_short), float(short_bounds[0]), float(short_bounds[1])))
+    tl_primary = float(np.clip(float(thr_long), float(long_bounds[0]), float(long_bounds[1])))
+    metadata: dict[str, Any] = {
+        "threshold_guardrails": {
+            **config,
+            "min_side_floor": int(min_side_floor),
+            "max_side_dominance": float(max_side_dominance),
+            "min_side_recall": float(min_side_recall),
+        }
+    }
+    if abs(ts_primary - float(thr_short)) > 1e-12 or abs(tl_primary - float(thr_long)) > 1e-12:
+        metadata["threshold_cap"] = {
+            "short_bounds": [float(short_bounds[0]), float(short_bounds[1])],
+            "long_bounds": [float(long_bounds[0]), float(long_bounds[1])],
+            "before": {"short": float(thr_short), "long": float(thr_long)},
+            "after": {"short": float(ts_primary), "long": float(tl_primary)},
+        }
+
+    primary_stats = _ternary_signal_stats_from_oof(
+        oof_short,
+        oof_long,
+        float(ts_primary),
+        float(tl_primary),
+    )
+    rec_short_primary, rec_long_primary = _side_recalls_for_ternary_thresholds(
+        y_true_mapped,
+        oof_short,
+        oof_long,
+        float(ts_primary),
+        float(tl_primary),
+    )
+    guardrail_reasons = _guardrail_reasons_for_ternary_thresholds(
+        primary_stats,
+        thr_short=float(ts_primary),
+        thr_long=float(tl_primary),
+        rec_short=float(rec_short_primary),
+        rec_long=float(rec_long_primary),
+        min_side_floor=int(min_side_floor),
+        max_side_dominance=float(max_side_dominance),
+        max_gap=float(max_gap),
+        max_dir_rate=float(max_dir_rate),
+        min_side_recall=float(min_side_recall),
+    )
+    metadata["guardrail_reasons"] = list(guardrail_reasons)
+
+    if not guardrail_reasons:
+        metadata["oof_selected_final"] = primary_stats
+        metadata["oof_side_recall_final"] = {
+            "short": float(rec_short_primary) if np.isfinite(rec_short_primary) else None,
+            "long": float(rec_long_primary) if np.isfinite(rec_long_primary) else None,
+            "min_required": float(min_side_recall),
+        }
+        return float(ts_primary), float(tl_primary), metadata
+
+    min_dir_rescue = int(max(12, int(2 * max(1, int(min_side_floor)))))
+    ts_fb, tl_fb = _fallback_ternary_thresholds_from_oof(
+        y_true_mapped=y_true_mapped,
+        oof_short=oof_short,
+        oof_long=oof_long,
+        min_side_signals=int(max(2, max(1, int(min_side_floor // 2)))),
+        min_total_signals=int(min_dir_rescue),
+    )
+    ts_fb = float(np.clip(float(ts_fb), float(short_bounds[0]), float(short_bounds[1])))
+    tl_fb = float(np.clip(float(tl_fb), float(long_bounds[0]), float(long_bounds[1])))
+    fb_stats = _ternary_signal_stats_from_oof(
+        oof_short,
+        oof_long,
+        float(ts_fb),
+        float(tl_fb),
+    )
+    rec_short_fb, rec_long_fb = _side_recalls_for_ternary_thresholds(
+        y_true_mapped,
+        oof_short,
+        oof_long,
+        float(ts_fb),
+        float(tl_fb),
+    )
+    metadata["selected_mode"] = "data_driven_fallback"
+    metadata["fallback_reason"] = "primary_thresholds_failed_guardrails"
+    metadata["data_driven_fallback"] = {
+        "before": {"short": float(ts_primary), "long": float(tl_primary)},
+        "after": {"short": float(ts_fb), "long": float(tl_fb)},
+        "stats_before": primary_stats,
+        "stats_after": fb_stats,
+        "recall_before": {
+            "short": float(rec_short_primary) if np.isfinite(rec_short_primary) else None,
+            "long": float(rec_long_primary) if np.isfinite(rec_long_primary) else None,
+        },
+        "recall_after": {
+            "short": float(rec_short_fb) if np.isfinite(rec_short_fb) else None,
+            "long": float(rec_long_fb) if np.isfinite(rec_long_fb) else None,
+        },
+        "guardrail_reasons": list(guardrail_reasons),
+        "min_dir_required": int(min_dir_rescue),
+    }
+    metadata["oof_selected_final"] = fb_stats
+    metadata["oof_side_recall_final"] = {
+        "short": float(rec_short_fb) if np.isfinite(rec_short_fb) else None,
+        "long": float(rec_long_fb) if np.isfinite(rec_long_fb) else None,
+        "min_required": float(min_side_recall),
+    }
+    return float(ts_fb), float(tl_fb), metadata
+
+
 def _choose_threshold_from_oof_ternary(
     y_true_mapped: np.ndarray,
     oof_short: np.ndarray,
@@ -2054,8 +2446,7 @@ def train_and_evaluate_model(
     annualize_sharpe: bool = bool(kwargs.pop("annualize_sharpe", True))
 
     training_mode = str(training_mode_kw or "standard").strip().lower()
-    if training_mode not in {"quick", "standard", "strict"}:
-        training_mode = "standard"
+    training_mode = _normalize_legacy_training_mode(training_mode_kw)
     candidate_chain_enabled = bool(candidate_chain_enabled_kw)
     candidate_selection_criterion = _normalize_candidate_criterion(candidate_selection_criterion_kw)
     try:
@@ -2180,72 +2571,17 @@ def train_and_evaluate_model(
     if n_hold > 0 and label_lookahead_bars > 0 and len(df_train) > (50 + label_lookahead_bars):
         df_train = df_train.iloc[: len(df_train) - int(label_lookahead_bars)].reset_index(drop=True)
 
-    effective_embargo = int(max(int(embargo), int(max(0, label_lookahead_bars))))
-
-    threshold_calibration_selection: dict[str, Any] = {
-        "enabled": False,
-        "mode": "disabled",
-        "requested_pct": None,
-        "requested_bars": 0,
-        "min_bars": 0,
-        "max_bars": None,
-        "applied_bars": 0,
-        "train_core_bars": int(len(df_train)),
-        "train_full_bars": int(len(df_train)),
-        "train_min_guard": 0,
-        "no_overlap": True,
-    }
-    df_train_core = df_train.copy()
-    df_threshold_calib: pd.DataFrame | None = None
-    if is_ternary:
-        try:
-            calib_enabled = bool(threshold_calibration_enabled_kw)
-        except Exception:
-            calib_enabled = True
-        if calib_enabled:
-            try:
-                calib_pct = float(threshold_calibration_pct_kw)
-            except Exception:
-                calib_pct = 0.08
-            try:
-                calib_min_bars = max(0, int(threshold_calibration_min_bars_kw))
-            except Exception:
-                calib_min_bars = 0
-            try:
-                calib_max_bars = max(0, int(threshold_calibration_max_bars_kw))
-            except Exception:
-                calib_max_bars = 0
-            try:
-                calib_train_min_guard = max(100, int(threshold_calibration_train_min_guard_kw))
-            except Exception:
-                calib_train_min_guard = 2000
-
-            n_train_eff = int(len(df_train))
-            requested_calib_bars = int(round(float(n_train_eff) * float(np.clip(calib_pct, 0.0, 0.90))))
-            n_calib = int(max(requested_calib_bars, int(calib_min_bars)))
-            if calib_max_bars > 0:
-                n_calib = int(min(n_calib, int(calib_max_bars)))
-            max_calib_allowed = max(0, int(n_train_eff - calib_train_min_guard))
-            n_calib = int(min(max(0, n_calib), int(max_calib_allowed)))
-
-            threshold_calibration_selection = {
-                "enabled": True,
-                "mode": "tail_pct",
-                "requested_pct": float(np.clip(calib_pct, 0.0, 0.90)),
-                "requested_bars": int(requested_calib_bars),
-                "min_bars": int(calib_min_bars),
-                "max_bars": int(calib_max_bars) if calib_max_bars > 0 else None,
-                "applied_bars": int(n_calib),
-                "train_core_bars": int(max(0, n_train_eff - n_calib)),
-                "train_full_bars": int(n_train_eff),
-                "train_min_guard": int(calib_train_min_guard),
-                "no_overlap": True,
-            }
-            if n_calib > 0:
-                df_train_core = df_train.iloc[: n_train_eff - n_calib].reset_index(drop=True)
-                df_threshold_calib = df_train.iloc[n_train_eff - n_calib :].reset_index(drop=True)
-            else:
-                threshold_calibration_selection["reason"] = "not_enough_train_bars_for_calibration_split"
+    df_train_core, df_threshold_calib, threshold_calibration_selection, effective_embargo = _select_threshold_calibration_split(
+        df_train,
+        is_ternary=is_ternary,
+        threshold_calibration_enabled=bool(threshold_calibration_enabled_kw),
+        threshold_calibration_pct=float(threshold_calibration_pct_kw),
+        threshold_calibration_min_bars=int(threshold_calibration_min_bars_kw),
+        threshold_calibration_max_bars=int(threshold_calibration_max_bars_kw),
+        threshold_calibration_train_min_guard=int(threshold_calibration_train_min_guard_kw),
+        embargo=int(embargo),
+        label_lookahead_bars=int(max(0, label_lookahead_bars)),
+    )
 
     def _dist_from_frame(frame: pd.DataFrame | None) -> dict[str, int]:
         if frame is None or len(frame) == 0:
@@ -2369,6 +2705,12 @@ def train_and_evaluate_model(
         "source_mode": chain_source_mode,
         "criterion": str(candidate_selection_criterion),
         "source_criterion": None,
+        "invalid_reason": None,
+        "reuse_decision": (
+            "disabled"
+            if not bool(candidate_chain_enabled)
+            else ("source_mode_unavailable" if chain_source_mode is None else "fresh_sampling")
+        ),
         "reranked_with_current_criterion": False,
         "top_n": int(candidate_top_n),
         "fresh_ratio": float(candidate_fresh_ratio),
@@ -2394,40 +2736,48 @@ def train_and_evaluate_model(
                     chain_info["signature_match"] = bool(sig_saved == chain_signature_hash)
                     modes = chain_raw.get("modes") if isinstance(chain_raw.get("modes"), dict) else {}
                     src_entry = modes.get(chain_source_mode) if isinstance(modes, dict) else None
-                    if chain_info["signature_match"] and isinstance(src_entry, dict):
+                    if not chain_info["signature_match"]:
+                        chain_info["invalid_reason"] = "signature_mismatch"
+                    elif not isinstance(src_entry, dict):
+                        chain_info["invalid_reason"] = "source_mode_missing"
+                    else:
                         all_keys = {_params_key(p) for p in all_param_sets_full}
                         src_criterion_norm = _normalize_candidate_criterion(src_entry.get("criterion"))
                         chain_info["source_criterion"] = str(src_criterion_norm)
-                        raw_cands = src_entry.get("candidates")
-                        carry_rows: list[dict[str, Any]] = []
-                        if isinstance(raw_cands, list):
-                            for row in raw_cands:
-                                if not isinstance(row, dict):
-                                    continue
-                                p = row.get("params")
-                                if not isinstance(p, dict):
-                                    continue
-                                pk = _params_key(p)
-                                if pk in all_keys:
-                                    row_copy = dict(row)
-                                    row_copy["params"] = dict(p)
-                                    carry_rows.append(row_copy)
-                        if carry_rows:
-                            # Re-rank carry shortlist by CURRENT criterion so criterion changes
-                            # are applied immediately in the next phase, not only persisted for later.
-                            ranked_carry_rows = _rank_candidates_for_chain(
-                                carry_rows, candidate_selection_criterion
-                            )
-                            carry_params = [
-                                dict(rr.get("params"))
-                                for rr in ranked_carry_rows
-                                if isinstance(rr.get("params"), dict)
-                            ]
-                        chain_info["source_candidates"] = int(len(carry_params))
-                        chain_info["reranked_with_current_criterion"] = bool(
-                            len(carry_params) > 1
-                            and src_criterion_norm != candidate_selection_criterion
-                        )
+                        if src_criterion_norm != candidate_selection_criterion:
+                            # Criterion changes must invalidate carry reuse; otherwise the
+                            # next phase silently mixes a new decision rule with stale evidence.
+                            chain_info["invalid_reason"] = "criterion_mismatch"
+                        else:
+                            raw_cands = src_entry.get("candidates")
+                            carry_rows: list[dict[str, Any]] = []
+                            if isinstance(raw_cands, list):
+                                for row in raw_cands:
+                                    if not isinstance(row, dict):
+                                        continue
+                                    p = row.get("params")
+                                    if not isinstance(p, dict):
+                                        continue
+                                    pk = _params_key(p)
+                                    if pk in all_keys:
+                                        row_copy = dict(row)
+                                        row_copy["params"] = dict(p)
+                                        carry_rows.append(row_copy)
+                            if carry_rows:
+                                ranked_carry_rows = _rank_candidates_for_chain(
+                                    carry_rows, candidate_selection_criterion
+                                )
+                                carry_params = [
+                                    dict(rr.get("params"))
+                                    for rr in ranked_carry_rows
+                                    if isinstance(rr.get("params"), dict)
+                                ]
+                                chain_info["reuse_decision"] = "carry_plus_fresh"
+                            else:
+                                chain_info["invalid_reason"] = "no_candidate_overlap"
+                            chain_info["source_candidates"] = int(len(carry_params))
+            else:
+                chain_info["invalid_reason"] = "source_shortlist_missing"
         except Exception as e_chain_load:
             chain_info["load_error"] = str(e_chain_load)
 
@@ -2990,427 +3340,20 @@ def train_and_evaluate_model(
                         threshold_tuning["selected_mode"] = (
                             f"rebalance({threshold_tuning.get('selected_mode_base', threshold_tuning.get('selected_mode', 'n/a'))})"
                         )
-                pre_guard_short = float(ternary_threshold_short)
-                pre_guard_long = float(ternary_threshold_long)
-                pre_guard_stats = dict(oof_final) if isinstance(oof_final, dict) else {}
-                threshold_tuning["oof_selected_final"] = oof_final
-
-                # Final safety fallback: if still too one-sided, collapse to shared threshold from OOF score scan.
                 min_side_floor = max(4, min(int(min_side), 20))
-                if (
-                    int(oof_final.get("n_short", 0.0)) < int(min_side_floor)
-                    or int(oof_final.get("n_long", 0.0)) < int(min_side_floor)
-                    or float(oof_final.get("dominance", 1.0)) > max(0.90, float(max_dom) + 0.10)
-                ):
-                    shared_thr = _choose_threshold_from_oof_ternary(
-                        y_true_mapped=y_oof_tune,
-                        oof_short=oof_short_tune,
-                        oof_long=oof_long_tune,
-                        df_oof=df_oof_tune,
-                        fee_per_trade=fee_per_trade,
-                        slippage_bps=slippage_bps,
-                        min_signals=20,
-                    )
-                    cand_short = float(np.clip(shared_thr, 0.03, 0.95))
-                    cand_long = float(np.clip(shared_thr, 0.03, 0.95))
-                    cand_stats = _ternary_signal_stats_from_oof(
-                        oof_short_tune,
-                        oof_long_tune,
-                        cand_short,
-                        cand_long,
-                    )
-                    cur_stats = threshold_tuning.get("oof_selected_final", {}) or {}
-                    cur_dir = float(cur_stats.get("n_dir", 0.0))
-                    cur_dom = float(cur_stats.get("dominance", 1.0))
-                    cur_n_short = float(cur_stats.get("n_short", 0.0))
-                    cur_n_long = float(cur_stats.get("n_long", 0.0))
-                    cand_dir = float(cand_stats.get("n_dir", 0.0))
-                    cand_dom = float(cand_stats.get("dominance", 1.0))
-                    cand_n_short = float(cand_stats.get("n_short", 0.0))
-                    cand_n_long = float(cand_stats.get("n_long", 0.0))
-                    min_dir_for_shared = float(max(20, int(2 * min_side_floor)))
-                    cand_has_min_coverage = (
-                        cand_dir >= min_dir_for_shared
-                        and cand_n_short >= float(min_side_floor)
-                        and cand_n_long >= float(min_side_floor)
-                    )
-                    cur_has_min_coverage = (
-                        cur_dir >= min_dir_for_shared
-                        and cur_n_short >= float(min_side_floor)
-                        and cur_n_long >= float(min_side_floor)
-                    )
-
-                    # Only accept shared-threshold fallback if it is clearly not worse than current rebalanced state.
-                    shared_is_better = bool(cand_has_min_coverage) and (
-                        (not bool(cur_has_min_coverage))
-                        or (
-                            cand_n_short >= cur_n_short
-                            and cand_n_long >= cur_n_long
-                            and cand_dom <= cur_dom + 1e-9
-                        )
-                        or (cand_dir > cur_dir and cand_dom <= max(cur_dom, 0.95))
-                    )
-                    if shared_is_better:
-                        ternary_threshold_short = cand_short
-                        ternary_threshold_long = cand_long
-                        threshold_tuning["selected_mode"] = "shared_threshold_fallback"
-                        threshold_tuning["oof_selected_final"] = cand_stats
-                    else:
-                        threshold_tuning["shared_threshold_candidate"] = {
-                            "threshold": float(shared_thr),
-                            "oof_stats": cand_stats,
-                            "min_dir_required": float(min_dir_for_shared),
-                            "cand_has_min_coverage": bool(cand_has_min_coverage),
-                            "cur_has_min_coverage": bool(cur_has_min_coverage),
-                            "accepted": False,
-                        }
-
-                # Final guardrails against extreme per-side thresholds that are fragile out-of-sample.
-                est_name_lc = str(estimator_name or "").lower()
-                is_lgb_family = est_name_lc in {"lgb", "lightgbm"}
-                cap_short_low, cap_short_high = 0.03, 0.75
-                cap_long_low, cap_long_high = 0.03, 0.75
-                max_thr_gap = 0.45
-                asymmetry_trigger_gap = 0.55
-                revert_max_gap = 0.55
-                if is_lgb_family:
-                    # LGB tends to overfit side-specific thresholds on OOF; keep them tighter.
-                    cap_short_low, cap_short_high = 0.05, 0.68
-                    cap_long_low, cap_long_high = 0.05, 0.72
-                    max_thr_gap = 0.30
-                    asymmetry_trigger_gap = 0.42
-                    revert_max_gap = 0.35
-                threshold_tuning["threshold_guardrails"] = {
-                    "estimator": est_name_lc,
-                    "is_lgb_family": bool(is_lgb_family),
-                    "short_bounds": [float(cap_short_low), float(cap_short_high)],
-                    "long_bounds": [float(cap_long_low), float(cap_long_high)],
-                    "max_gap": float(max_thr_gap),
-                    "asymmetry_trigger_gap": float(asymmetry_trigger_gap),
-                    "revert_max_gap": float(revert_max_gap),
-                }
-                ts_prev, tl_prev = float(ternary_threshold_short), float(ternary_threshold_long)
-                ts_cap = float(np.clip(ts_prev, cap_short_low, cap_short_high))
-                tl_cap = float(np.clip(tl_prev, cap_long_low, cap_long_high))
-                ternary_threshold_short = ts_cap
-                ternary_threshold_long = tl_cap
-                if (abs(ts_cap - ts_prev) > 1e-12) or (abs(tl_cap - tl_prev) > 1e-12):
-                    threshold_tuning["threshold_cap"] = {
-                        "short_bounds": [float(cap_short_low), float(cap_short_high)],
-                        "long_bounds": [float(cap_long_low), float(cap_long_high)],
-                        "before": {"short": float(ts_prev), "long": float(tl_prev)},
-                        "after": {"short": float(ts_cap), "long": float(tl_cap)},
-                    }
-                    threshold_tuning["oof_selected_capped"] = _ternary_signal_stats_from_oof(
-                        oof_short_tune,
-                        oof_long_tune,
-                        float(ts_cap),
-                        float(tl_cap),
-                    )
-
-                # Limit asymmetry between SHORT/LONG thresholds.
-                ts_gap, tl_gap = float(ternary_threshold_short), float(ternary_threshold_long)
-                if abs(ts_gap - tl_gap) > float(max_thr_gap):
-                    center = 0.5 * (ts_gap + tl_gap)
-                    if ts_gap >= tl_gap:
-                        ts_try = float(np.clip(center + (max_thr_gap / 2.0), cap_short_low, cap_short_high))
-                        tl_try = float(np.clip(center - (max_thr_gap / 2.0), cap_long_low, cap_long_high))
-                    else:
-                        ts_try = float(np.clip(center - (max_thr_gap / 2.0), cap_short_low, cap_short_high))
-                        tl_try = float(np.clip(center + (max_thr_gap / 2.0), cap_long_low, cap_long_high))
-
-                    stats_try = _ternary_signal_stats_from_oof(
-                        oof_short_tune,
-                        oof_long_tune,
-                        float(ts_try),
-                        float(tl_try),
-                    )
-                    # Accept gap-guard only if it does not collapse one side in OOF.
-                    if (
-                        int(stats_try.get("n_short", 0.0)) >= int(min_side_floor)
-                        and int(stats_try.get("n_long", 0.0)) >= int(min_side_floor)
-                        and float(stats_try.get("dominance", 1.0)) <= max(0.90, float(max_dom) + 0.12)
-                    ):
-                        ternary_threshold_short = ts_try
-                        ternary_threshold_long = tl_try
-                        threshold_tuning["threshold_gap_guard"] = {
-                            "max_gap": float(max_thr_gap),
-                            "before": {"short": float(ts_gap), "long": float(tl_gap)},
-                            "after": {
-                                "short": float(ternary_threshold_short),
-                                "long": float(ternary_threshold_long),
-                            },
-                            "accepted": True,
-                        }
-                        threshold_tuning["oof_selected_gap_guard"] = stats_try
-                    else:
-                        threshold_tuning["threshold_gap_guard"] = {
-                            "max_gap": float(max_thr_gap),
-                            "before": {"short": float(ts_gap), "long": float(tl_gap)},
-                            "after": {"short": float(ts_try), "long": float(tl_try)},
-                            "accepted": False,
-                            "oof_stats_candidate": stats_try,
-                        }
-
-                # If thresholds are still highly asymmetric, try shared-threshold fallback for robustness.
-                final_gap = abs(float(ternary_threshold_short) - float(ternary_threshold_long))
-                if final_gap > float(asymmetry_trigger_gap):
-                    shared_thr_gap = _choose_threshold_from_oof_ternary(
-                        y_true_mapped=y_oof_tune,
-                        oof_short=oof_short_tune,
-                        oof_long=oof_long_tune,
-                        df_oof=df_oof_tune,
-                        fee_per_trade=fee_per_trade,
-                        slippage_bps=slippage_bps,
-                        min_signals=20,
-                    )
-                    shared_thr_gap = float(
-                        np.clip(
-                            shared_thr_gap,
-                            max(float(cap_short_low), float(cap_long_low)),
-                            min(float(cap_short_high), float(cap_long_high)),
-                        )
-                    )
-                    shared_gap_stats = _ternary_signal_stats_from_oof(
-                        oof_short_tune,
-                        oof_long_tune,
-                        float(shared_thr_gap),
-                        float(shared_thr_gap),
-                    )
-                    current_stats = _ternary_signal_stats_from_oof(
-                        oof_short_tune,
-                        oof_long_tune,
-                        float(ternary_threshold_short),
-                        float(ternary_threshold_long),
-                    )
-                    shared_ok = (
-                        int(shared_gap_stats.get("n_short", 0.0)) >= int(min_side_floor)
-                        and int(shared_gap_stats.get("n_long", 0.0)) >= int(min_side_floor)
-                        and float(shared_gap_stats.get("dominance", 1.0)) <= max(0.90, float(max_dom) + 0.12)
-                    )
-                    # Prefer shared threshold if it removes extreme asymmetry without worsening dominance badly.
-                    if shared_ok and (
-                        float(shared_gap_stats.get("dominance", 1.0))
-                        <= (float(current_stats.get("dominance", 1.0)) + 0.08)
-                    ):
-                        ternary_threshold_short = float(shared_thr_gap)
-                        ternary_threshold_long = float(shared_thr_gap)
-                        threshold_tuning["selected_mode"] = "shared_threshold_asymmetry_guard"
-                        threshold_tuning["threshold_asymmetry_guard"] = {
-                            "trigger_gap": float(final_gap),
-                            "shared_threshold": float(shared_thr_gap),
-                            "accepted": True,
-                            "current_oof_stats": current_stats,
-                            "shared_oof_stats": shared_gap_stats,
-                        }
-                    else:
-                        threshold_tuning["threshold_asymmetry_guard"] = {
-                            "trigger_gap": float(final_gap),
-                            "shared_threshold": float(shared_thr_gap),
-                            "accepted": False,
-                            "current_oof_stats": current_stats,
-                            "shared_oof_stats": shared_gap_stats,
-                        }
-
-                # Recompute true final OOF stats after all guards.
-                final_stats = _ternary_signal_stats_from_oof(
-                    oof_short_tune,
-                    oof_long_tune,
-                    float(ternary_threshold_short),
-                    float(ternary_threshold_long),
+                ternary_threshold_short, ternary_threshold_long, post_search_tuning = _apply_single_fallback_ternary_thresholds(
+                    y_true_mapped=y_oof_tune,
+                    oof_short=oof_short_tune,
+                    oof_long=oof_long_tune,
+                    thr_short=float(ternary_threshold_short),
+                    thr_long=float(ternary_threshold_long),
+                    estimator_name=estimator_name,
+                    min_side_floor=int(min_side_floor),
+                    max_side_dominance=float(max_dom),
+                    min_side_recall=float(quality_min_side_recall),
                 )
-                threshold_tuning["oof_selected_final"] = final_stats
-
-                # Safety rollback: if post-guard thresholds became too one-sided, revert to pre-guard balanced state.
-                too_one_sided = (
-                    int(final_stats.get("n_short", 0.0)) < int(min_side_floor)
-                    or int(final_stats.get("n_long", 0.0)) < int(min_side_floor)
-                    or float(final_stats.get("dominance", 1.0)) > max(0.90, float(max_dom) + 0.12)
-                    or float(final_stats.get("dir_rate", 0.0)) > 0.85
-                )
-                pre_guard_gap = abs(float(pre_guard_short) - float(pre_guard_long))
-                pre_guard_in_bounds = (
-                    float(pre_guard_short) >= float(cap_short_low)
-                    and float(pre_guard_short) <= float(cap_short_high)
-                    and float(pre_guard_long) >= float(cap_long_low)
-                    and float(pre_guard_long) <= float(cap_long_high)
-                    and float(pre_guard_gap) <= float(revert_max_gap)
-                )
-                pre_guard_ok = (
-                    int(pre_guard_stats.get("n_short", 0.0)) >= int(min_side_floor)
-                    and int(pre_guard_stats.get("n_long", 0.0)) >= int(min_side_floor)
-                    and float(pre_guard_stats.get("dominance", 1.0)) <= max(0.90, float(max_dom) + 0.12)
-                    and float(pre_guard_stats.get("dir_rate", 0.0)) <= 0.85
-                    and bool(pre_guard_in_bounds)
-                )
-                if too_one_sided and pre_guard_ok:
-                    ternary_threshold_short = float(pre_guard_short)
-                    ternary_threshold_long = float(pre_guard_long)
-                    threshold_tuning["selected_mode"] = "revert_pre_guard_balanced"
-                    threshold_tuning["revert_pre_guard"] = {
-                        "triggered": True,
-                        "final_stats_before_revert": final_stats,
-                        "pre_guard_stats": pre_guard_stats,
-                        "pre_guard_thresholds": {
-                            "short": float(pre_guard_short),
-                            "long": float(pre_guard_long),
-                        },
-                    }
-                    threshold_tuning["oof_selected_final"] = _ternary_signal_stats_from_oof(
-                        oof_short_tune,
-                        oof_long_tune,
-                        float(ternary_threshold_short),
-                        float(ternary_threshold_long),
-                    )
-                elif too_one_sided:
-                    threshold_tuning["revert_pre_guard"] = {
-                        "triggered": False,
-                        "reason": "pre_guard_out_of_bounds_or_not_balanced",
-                        "final_stats_before_revert": final_stats,
-                        "pre_guard_stats": pre_guard_stats,
-                        "pre_guard_thresholds": {
-                            "short": float(pre_guard_short),
-                            "long": float(pre_guard_long),
-                        },
-                        "pre_guard_gap": float(pre_guard_gap),
-                        "pre_guard_in_bounds": bool(pre_guard_in_bounds),
-                    }
-
-                # Hard side-recall guard on OOF: a candidate below min short recall cannot remain final.
-                try:
-                    y_oof_arr = np.asarray(y_oof_tune, dtype=int)
-                    mask_short = y_oof_arr == 0
-                    mask_long = y_oof_arr == 2
-
-                    def _side_recalls_for_thresholds(ts_val: float, tl_val: float) -> tuple[float, float]:
-                        yp = _ternary_predict_mapped(
-                            oof_short_tune,
-                            oof_long_tune,
-                            float(ts_val),
-                            float(tl_val),
-                        )
-                        rs = float(np.mean(yp[mask_short] == 0)) if np.any(mask_short) else float("nan")
-                        rl = float(np.mean(yp[mask_long] == 2)) if np.any(mask_long) else float("nan")
-                        return rs, rl
-
-                    rec_short_cur, rec_long_cur = _side_recalls_for_thresholds(
-                        float(ternary_threshold_short),
-                        float(ternary_threshold_long),
-                    )
-                    threshold_tuning["oof_side_recall_final"] = {
-                        "short": (float(rec_short_cur) if np.isfinite(rec_short_cur) else None),
-                        "long": (float(rec_long_cur) if np.isfinite(rec_long_cur) else None),
-                        "min_required": float(quality_min_side_recall),
-                    }
-
-                    if np.isfinite(rec_short_cur) and rec_short_cur < float(quality_min_side_recall):
-                        base_short = float(ternary_threshold_short)
-                        base_long = float(ternary_threshold_long)
-                        found = None
-                        for step in range(1, 26):
-                            ts_try = float(max(float(cap_short_low), base_short - (0.015 * float(step))))
-                            rs_try, rl_try = _side_recalls_for_thresholds(ts_try, base_long)
-                            stats_try = _ternary_signal_stats_from_oof(
-                                oof_short_tune,
-                                oof_long_tune,
-                                float(ts_try),
-                                float(base_long),
-                            )
-                            if (
-                                np.isfinite(rs_try)
-                                and float(rs_try) >= float(quality_min_side_recall)
-                                and int(stats_try.get("n_short", 0.0)) >= max(2, int(min_side_floor // 2))
-                                and float(stats_try.get("dominance", 1.0)) <= 0.98
-                                and float(stats_try.get("dir_rate", 0.0)) <= 0.95
-                            ):
-                                found = (float(ts_try), float(base_long), float(rs_try), float(rl_try), stats_try)
-                                break
-                        if found is not None:
-                            ternary_threshold_short = float(found[0])
-                            ternary_threshold_long = float(found[1])
-                            threshold_tuning["selected_mode"] = "short_recall_enforce"
-                            threshold_tuning["short_recall_enforce"] = {
-                                "applied": True,
-                                "before": {"short": float(base_short), "long": float(base_long)},
-                                "after": {
-                                    "short": float(ternary_threshold_short),
-                                    "long": float(ternary_threshold_long),
-                                },
-                                "recall_before": {
-                                    "short": float(rec_short_cur),
-                                    "long": (float(rec_long_cur) if np.isfinite(rec_long_cur) else None),
-                                },
-                                "recall_after": {
-                                    "short": float(found[2]),
-                                    "long": (float(found[3]) if np.isfinite(found[3]) else None),
-                                },
-                            }
-                            threshold_tuning["oof_selected_final"] = found[4]
-                        else:
-                            threshold_tuning["short_recall_enforce"] = {
-                                "applied": False,
-                                "reason": "no_feasible_threshold_within_bounds",
-                                "before": {"short": float(base_short), "long": float(base_long)},
-                                "recall_before": {
-                                    "short": float(rec_short_cur),
-                                    "long": (float(rec_long_cur) if np.isfinite(rec_long_cur) else None),
-                                },
-                            }
-                except Exception:
-                    pass
-
-                # Final rescue: avoid dead-zone thresholds that produce almost no directional OOF signals.
-                try:
-                    cur_stats = _ternary_signal_stats_from_oof(
-                        oof_short_tune,
-                        oof_long_tune,
-                        float(ternary_threshold_short),
-                        float(ternary_threshold_long),
-                    )
-                    min_dir_rescue = int(max(8, int(2 * min_side_floor)))
-                    needs_rescue = (
-                        int(cur_stats.get("n_dir", 0.0)) < int(min_dir_rescue)
-                        or int(cur_stats.get("n_short", 0.0)) < max(1, int(min_side_floor // 2))
-                        or int(cur_stats.get("n_long", 0.0)) < max(1, int(min_side_floor // 2))
-                    )
-                    if needs_rescue:
-                        ts_fb, tl_fb = _fallback_ternary_thresholds_from_oof(
-                            y_true_mapped=y_oof_tune,
-                            oof_short=oof_short_tune,
-                            oof_long=oof_long_tune,
-                            min_side_signals=int(max(2, min_side_floor // 2)),
-                            min_total_signals=int(min_dir_rescue),
-                        )
-                        fb_stats = _ternary_signal_stats_from_oof(
-                            oof_short_tune,
-                            oof_long_tune,
-                            float(ts_fb),
-                            float(tl_fb),
-                        )
-                        fb_better = (
-                            int(fb_stats.get("n_dir", 0.0)) >= int(min_dir_rescue)
-                            and int(fb_stats.get("n_short", 0.0)) >= max(1, int(min_side_floor // 2))
-                            and int(fb_stats.get("n_long", 0.0)) >= max(1, int(min_side_floor // 2))
-                            and float(fb_stats.get("dominance", 1.0)) <= 0.98
-                            and int(fb_stats.get("n_dir", 0.0)) > int(cur_stats.get("n_dir", 0.0))
-                        )
-                        if fb_better:
-                            threshold_tuning["selected_mode"] = "data_driven_fallback"
-                            threshold_tuning["data_driven_fallback"] = {
-                                "before": {
-                                    "short": float(ternary_threshold_short),
-                                    "long": float(ternary_threshold_long),
-                                },
-                                "after": {"short": float(ts_fb), "long": float(tl_fb)},
-                                "stats_before": cur_stats,
-                                "stats_after": fb_stats,
-                                "min_dir_required": int(min_dir_rescue),
-                            }
-                            ternary_threshold_short = float(ts_fb)
-                            ternary_threshold_long = float(tl_fb)
-                            threshold_tuning["oof_selected_final"] = fb_stats
-                except Exception:
-                    pass
+                threshold_tuning.update(post_search_tuning)
+                threshold_tuning = _finalize_threshold_tuning_outcome(threshold_tuning)
                 decision_threshold = float((ternary_threshold_short + ternary_threshold_long) / 2.0)
         except Exception:
             pass
@@ -3885,6 +3828,7 @@ def train_and_evaluate_model(
             if feature_stability_threshold is not None
             else None
         ),
+        "feature_stability_filter_requested": bool(feature_stability_threshold is not None),
         "feature_stability_score": dict(feature_stability_score),
         "features_removed_by_stability": list(features_removed_by_stability),
         "features_kept_by_stability": list(features_kept_by_stability),
@@ -3999,6 +3943,7 @@ def train_and_evaluate_model(
         if feature_stability_threshold is not None
         else None
     )
+    meta["feature_stability_filter_requested"] = bool(feature_stability_threshold is not None)
     meta["feature_stability_score"] = dict(feature_stability_score)
     meta["features_removed_by_stability"] = list(features_removed_by_stability)
     meta["features_kept_by_stability"] = list(features_kept_by_stability)

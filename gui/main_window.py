@@ -63,7 +63,7 @@ class MainWindow(QMainWindow):
         return LiveBotTab()
 
     def _create_model_manager_tab(self):
-        from ibkr_trading_bot.gui.tab_model_manager import ModelManagerTab
+        from ibkr_trading_bot.gui.tab_model_manager_legacy import ModelManagerTab
 
         return ModelManagerTab(self)
 

@@ -125,6 +125,7 @@ def test_train_and_evaluate_model_writes_feature_stability_filter_meta(monkeypat
     meta = _load_result_meta(result)
 
     assert meta["feature_stability_threshold"] == pytest.approx(0.60)
+    assert meta["feature_stability_filter_requested"] is True
     assert meta["feature_stability_filter_applied"] is True
     assert meta["feature_stability_filter_fallback_reason"] is None
     assert meta["trained_features"] == ["f_aux"]
@@ -181,6 +182,7 @@ def test_train_and_evaluate_model_reverts_stability_filter_when_refit_fails(monk
     meta = _load_result_meta(result)
 
     assert meta["feature_stability_threshold"] == pytest.approx(0.60)
+    assert meta["feature_stability_filter_requested"] is True
     assert meta["feature_stability_filter_applied"] is False
     assert meta["feature_stability_filter_fallback_reason"] == (
         "stability_filter_refit_failed_reverted_to_original_features"
@@ -210,12 +212,54 @@ def test_train_and_evaluate_model_unsupported_estimator_stability_filter_is_noop
 
     assert meta["feature_stability"] == {}
     assert meta["feature_stability_threshold"] == pytest.approx(0.50)
+    assert meta["feature_stability_filter_requested"] is True
     assert meta["feature_stability_filter_applied"] is False
     assert meta["feature_stability_filter_fallback_reason"] is not None
     assert meta["features_removed_by_stability"] == []
     assert meta["features_kept_by_stability"] == meta["trained_features"]
     assert set(meta["feature_stability_score"]) == set(meta["trained_features"])
     assert all(score == 0.0 for score in meta["feature_stability_score"].values())
+
+
+def test_train_and_evaluate_model_marks_empty_set_stability_fallback_as_requested(monkeypatch):
+    out_dir = _workspace_tmp_dir("feature_stability_threshold_empty_set")
+    monkeypatch.setattr(train_models, "_model_dir", lambda: out_dir)
+
+    def _fake_collect_fold_feature_importances_for_params(**kwargs):
+        return [
+            {"f_aux": 0.90, "f_trend": 0.10},
+            {"f_aux": 0.10, "f_trend": 0.90},
+            {"f_aux": 0.50, "f_trend": 0.50},
+        ]
+
+    monkeypatch.setattr(
+        train_models,
+        "_collect_fold_feature_importances_for_params",
+        _fake_collect_fold_feature_importances_for_params,
+    )
+
+    result = train_and_evaluate_model(
+        df=_small_training_frame(n_rows=120),
+        estimator_name="rf",
+        param_grid=_single_candidate_rf_grid(),
+        n_splits=3,
+        embargo=2,
+        holdout_bars=12,
+        mc_enabled=False,
+        annualize_sharpe=True,
+        feature_stability_threshold=0.95,
+    )
+
+    meta = _load_result_meta(result)
+
+    assert meta["feature_stability_threshold"] == pytest.approx(0.95)
+    assert meta["feature_stability_filter_requested"] is True
+    assert meta["feature_stability_filter_applied"] is False
+    assert meta["feature_stability_filter_fallback_reason"] == (
+        "all_features_below_stability_threshold(threshold=0.9500)"
+    )
+    assert meta["features_removed_by_stability"] == []
+    assert meta["features_kept_by_stability"] == meta["trained_features"]
 
 
 def test_training_profile_for_mode_sets_feature_stability_thresholds():
@@ -280,11 +324,27 @@ def test_training_profile_for_mode_supports_new_workflow_profiles():
     assert explore["profile_name"] == "explore"
     assert refine["profile_name"] == "refine"
     assert refresh["profile_name"] == "refresh"
+    assert explore["compatibility_mode"] == "quick"
+    assert refine["compatibility_mode"] == "standard"
+    assert refresh["compatibility_mode"] == "strict"
     assert explore["quality_min_trades"] < refine["quality_min_trades"]
     assert refresh["max_param_candidates"] == 12
     assert refresh["candidate_chain_enabled"] is False
     assert refresh["quality_min_side_prediction_share"] == pytest.approx(0.05)
     assert refresh["quality_min_side_prediction_count"] == 10
+
+
+def test_training_profile_for_mode_marks_legacy_modes_as_compatibility_profiles():
+    quick = training_profile_for_mode("quick")
+    standard = training_profile_for_mode("standard")
+    strict = training_profile_for_mode("strict")
+
+    assert quick["workflow_mode"] == "explore"
+    assert quick["compatibility_mode"] == "quick"
+    assert standard["workflow_mode"] == "refine"
+    assert standard["compatibility_mode"] == "standard"
+    assert strict["workflow_mode"] == "refresh"
+    assert strict["compatibility_mode"] == "strict"
 
 
 def test_quality_gate_rejects_one_sided_holdout_predictions():

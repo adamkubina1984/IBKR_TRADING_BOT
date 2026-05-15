@@ -69,7 +69,12 @@ except Exception:
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
-from ibkr_trading_bot.core.services.model_service import build_sklearn_version_warning, read_sidecar_model_meta
+from ibkr_trading_bot.core.services.model_service import (
+    build_sklearn_version_warning,
+    feature_contract_from_meta,
+    infer_label_mode_from_meta,
+    read_sidecar_model_meta,
+)
 from ibkr_trading_bot.gui.components.workers import TaskWorker
 
 # Warm-up service
@@ -157,6 +162,43 @@ def _feature_names_for_model(model) -> list[str] | None:
     return None
 
 
+def _expected_features_for_live_model(model, metadata: dict[str, Any] | None) -> list[str] | None:
+    exp = None
+    meta = metadata if isinstance(metadata, dict) else {}
+    if isinstance(meta, dict):
+        exp = meta.get("trained_features") or meta.get("expected_features") or meta.get("features")
+    if exp is None:
+        exp = _feature_names_for_model(model)
+    if exp is None:
+        return None
+    out = [str(c) for c in list(exp) if str(c)]
+    return out or None
+
+
+def _strict_live_feature_frame(
+    Xrow: pd.DataFrame,
+    expected: list[str] | None,
+    *,
+    model_label: str = "model",
+) -> pd.DataFrame:
+    X_use = Xrow.copy()
+    if "average" not in X_use.columns and all(c in X_use.columns for c in ["open", "high", "low", "close"]):
+        X_use["average"] = (X_use["open"] + X_use["high"] + X_use["low"] + X_use["close"]) / 4.0
+
+    exp_list = [str(c) for c in (expected or []) if str(c)]
+    if exp_list:
+        missing = [c for c in exp_list if c not in X_use.columns]
+        if missing:
+            sample = ", ".join(missing[:5])
+            more = "" if len(missing) <= 5 else f" (+{len(missing) - 5} more)"
+            raise ValueError(
+                f"Live data pro {model_label} neobsahuji ocekavane featury: {sample}{more}"
+            )
+        X_use = X_use[exp_list]
+
+    return _sanitize_live_feature_frame(X_use).astype(float)
+
+
 def _align_X_for_model(model, X):
     if isinstance(X, pd.DataFrame):
         Xdf = X.copy()
@@ -165,10 +207,12 @@ def _align_X_for_model(model, X):
 
     names = _feature_names_for_model(model)
     if names:
-        for c in names:
-            if c not in Xdf.columns:
-                Xdf[c] = 0.0
-        Xdf = Xdf.reindex(columns=names, fill_value=0.0)
+        missing = [c for c in names if c not in Xdf.columns]
+        if missing:
+            sample = ", ".join(missing[:5])
+            more = "" if len(missing) <= 5 else f" (+{len(missing) - 5} more)"
+            raise ValueError(f"Model ocekava chybejici featury: {sample}{more}")
+        Xdf = Xdf.reindex(columns=names)
 
     med = Xdf.median(numeric_only=True)
     Xdf = Xdf.fillna(med).fillna(0.0)
@@ -526,20 +570,7 @@ def _compute_snapshot_features(live_df: pd.DataFrame) -> pd.DataFrame | None:
 
 
 def _prepare_X_for_model_static(Xrow: pd.DataFrame, exp: list[str] | None) -> pd.DataFrame:
-    X_use = Xrow.copy()
-    if "average" not in X_use.columns and all(c in X_use.columns for c in ["open", "high", "low", "close"]):
-        X_use["average"] = (X_use["open"] + X_use["high"] + X_use["low"] + X_use["close"]) / 4.0
-    exp_list = [str(c) for c in (exp or [])]
-    if exp_list:
-        missing = [c for c in exp_list if c not in X_use.columns]
-        for c in missing:
-            if "close" in X_use.columns:
-                X_use[c] = X_use["close"].median()
-            else:
-                numeric_cols = X_use.select_dtypes(include=[np.number]).columns
-                X_use[c] = X_use[numeric_cols[0]].median() if len(numeric_cols) > 0 else 0.0
-        X_use = X_use[exp_list]
-    return _sanitize_live_feature_frame(X_use).astype(float)
+    return _strict_live_feature_frame(Xrow, exp, model_label="model")
 
 
 def _build_live_bootstrap_payload_from_history_df(
@@ -1820,7 +1851,7 @@ class LiveBotWidget(QWidget):
     def _load_models(self) -> bool:
         """
         Načte 1..N modelů ze self.le_model_path (oddělené ; nebo novými řádky).
-        Nastaví self.models a self.model_expected_features = průnik featur všech modelů (fallback na base cols).
+        Všechny modely musí sdílet stejný feature kontrakt a ternární label mode.
         """
         text = (self.le_model_path.text() or "").strip()
         if not text:
@@ -1848,6 +1879,10 @@ class LiveBotWidget(QWidget):
         feats_lists = []
         classes_summary = []
         label_map_final = None
+        reference_feature_contract = None
+        reference_expected_features = None
+        reference_label_mode = None
+        reference_model_name = None
 
         def _extract_predictor(obj):
             meta = {}
@@ -1968,23 +2003,64 @@ class LiveBotWidget(QWidget):
                     label_map_final = self.class_to_dir
 
                 # featury
-                exp = None
-                if isinstance(meta, dict):
-                    exp = meta.get("trained_features") or meta.get("expected_features")
-                if exp is None and hasattr(pred, "feature_names_in_") and getattr(pred, "feature_names_in_", None) is not None:
-                    exp = [str(c) for c in list(pred.feature_names_in_)]
-                if exp:
-                    exp_list = [str(c) for c in exp]
-                    feats_sets.append(set(exp_list))
-                    feats_lists.append(exp_list)
-                    sample = ", ".join(exp_list[:10])
-                    more = "" if len(exp_list) <= 10 else f" (+{len(exp_list) - 10} more)"
-                    self._append_log(f"[FEATS] Model expects {len(exp_list)} features: {sample}{more}")
+                exp_list = _expected_features_for_live_model(pred, meta)
+                if not exp_list:
+                    self._append_log(
+                        f"[ERROR] Chybi feature kontrakt modelu: {os.path.basename(p)} "
+                        "(trained_features/expected_features)."
+                    )
+                    return False
+
+                if not isinstance(meta, dict):
+                    meta = {}
+                meta = dict(meta)
+                meta.setdefault("trained_features", list(exp_list))
+                meta["feature_contract"] = feature_contract_from_meta(meta)
+                meta["label_mode"] = infer_label_mode_from_meta(meta)
+
+                label_mode = str(meta.get("label_mode") or "").strip().lower()
+                if not label_mode.startswith("ternary"):
+                    self._append_log(
+                        f"[ERROR] Tab 5 vyzaduje ternarni label mode. Model {os.path.basename(p)} "
+                        f"ma label_mode={label_mode or 'unknown'}"
+                    )
+                    return False
+
+                feature_contract = meta.get("feature_contract") if isinstance(meta.get("feature_contract"), dict) else {}
+                if not feature_contract.get("signature"):
+                    self._append_log(
+                        f"[ERROR] Chybi podpis feature kontraktu modelu: {os.path.basename(p)}"
+                    )
+                    return False
+
+                if reference_feature_contract is None:
+                    reference_feature_contract = dict(feature_contract)
+                    reference_expected_features = list(exp_list)
+                    reference_label_mode = label_mode
+                    reference_model_name = os.path.basename(p)
+                else:
+                    if feature_contract != reference_feature_contract:
+                        self._append_log(
+                            f"[ERROR] Feature kontrakt modelu {os.path.basename(p)} nesedi s {reference_model_name}."
+                        )
+                        return False
+                    if label_mode != reference_label_mode:
+                        self._append_log(
+                            f"[ERROR] Label mode modelu {os.path.basename(p)} nesedi s {reference_model_name}: "
+                            f"{label_mode} != {reference_label_mode}"
+                        )
+                        return False
+
+                feats_sets.append(set(exp_list))
+                feats_lists.append(exp_list)
+                sample = ", ".join(exp_list[:10])
+                more = "" if len(exp_list) <= 10 else f" (+{len(exp_list) - 10} more)"
+                self._append_log(f"[FEATS] Model expects {len(exp_list)} features: {sample}{more}")
 
                 loaded.append({
                     "predictor": pred,
                     "path": p,
-                    "exp_feats": exp_list if exp else None,
+                    "exp_feats": list(exp_list),
                     "label_map": dict(self.class_to_dir),
                     "t_short": float(t_short),
                     "t_long": float(t_long),
@@ -2041,18 +2117,13 @@ class LiveBotWidget(QWidget):
                 f"[TAB4-DIAG] startup models={len(classes_summary)} unique={len(uniq_counts)} {combos}"
             )
 
-        # Cada model usa sus propias features - sin intersección
-        base_cols = ['close', 'ma_fast', 'ma_slow', 'atr', 'average']
-        if feats_sets:
-            self._append_log(f"[INFO] Ensemble mód: {len(feats_lists)} modelů, cada uno usa suas próprias features")
-            for i, exp_list in enumerate(feats_lists):
-                sample = ", ".join(exp_list[:5])
-                more = "" if len(exp_list) <= 5 else f" (+{len(exp_list) - 5} mais)"
-                self._append_log(f"  [M{i}] {len(exp_list)} features: {sample}{more}")
-            # Cada modelo usará sus propias features, no la intersección
-            self.model_expected_features = base_cols  # fallback only for MA etc
+        if reference_expected_features:
+            self.model_expected_features = list(reference_expected_features)
+            self._append_log(
+                f"[INFO] Ensemble feature kontrakt potvrzen: {len(self.model_expected_features)} shared features"
+            )
         else:
-            self.model_expected_features = base_cols
+            self.model_expected_features = None
 
         # pojmenování vrstev
         self._append_log(f"[LAYERS] L0=MA | L1i=Model_i | L1_AND=AND přes {len(self.models)} modelů | L2_AND=(volitelně) MA ∧ L1_AND")
@@ -2294,7 +2365,11 @@ class LiveBotWidget(QWidget):
             # Připrav celý DataFrame pro model
             X_prepared = df_recent
             if exp_feats:
-                X_prepared = self._prepare_X_for_model(df_recent, exp_feats)
+                X_prepared = self._prepare_X_for_model(
+                    df_recent,
+                    exp_feats,
+                    model_label=os.path.basename(str(self.models[0].get("path") or "model")),
+                )
             
             try:
                 # Vypočítej predikce pro všechny řádky najednou
@@ -2440,7 +2515,11 @@ class LiveBotWidget(QWidget):
             t_short = float(m.get("t_short", self._curr_t_short if isinstance(self._curr_t_short, (int, float)) else 0.5))
             t_long = float(m.get("t_long", self._curr_t_long if isinstance(self._curr_t_long, (int, float)) else 0.5))
             if exp:
-                X_use = self._prepare_X_for_model(Xrow, exp)
+                X_use = self._prepare_X_for_model(
+                    Xrow,
+                    exp,
+                    model_label=os.path.basename(str(m.get("path") or "model")),
+                )
             try:
                 label_map = m.get("label_map") or self.class_to_dir  # per-model mapa 1st
                 pL, pS, classes_i, raw_proba = _extract_long_short_proba(mdl, X_use, label_map=label_map)
@@ -2494,7 +2573,11 @@ class LiveBotWidget(QWidget):
             t_short = float(m.get("t_short", self._curr_t_short if isinstance(self._curr_t_short, (int, float)) else 0.5))
             t_long = float(m.get("t_long", self._curr_t_long if isinstance(self._curr_t_long, (int, float)) else 0.5))
             if exp:
-                X_use = self._prepare_X_for_model(Xrow, exp)
+                X_use = self._prepare_X_for_model(
+                    Xrow,
+                    exp,
+                    model_label=os.path.basename(str(m.get("path") or "model")),
+                )
             try:
                 label_map = m.get("label_map") or self.class_to_dir
                 pL, pS, classes_i, raw_proba = _extract_long_short_proba(mdl, X_use, label_map=label_map)
@@ -2799,44 +2882,12 @@ class LiveBotWidget(QWidget):
         return ind
 
     def _align_features_to_model(self, feat: pd.DataFrame) -> pd.DataFrame:
-        base_cols = ['close', 'ma_fast', 'ma_slow', 'atr', 'average']
-        df = feat.copy()
-        if 'average' not in df.columns and all(c in df.columns for c in ['open','high','low','close']):
-            df['average'] = (df['open'] + df['high'] + df['low'] + df['close']) / 4.0
-
-        # Kandidátní seznam požadovaných featur
+        expected = None
         if self.model_expected_features and isinstance(self.model_expected_features, (list, tuple)):
-            use_cols = [str(c) for c in self.model_expected_features]
+            expected = [str(c) for c in self.model_expected_features]
         elif hasattr(self.model, "feature_names_in_") and getattr(self.model, "feature_names_in_", None) is not None:
-            use_cols = [str(c) for c in list(self.model.feature_names_in_)]
-        else:
-            use_cols = list(base_cols)
-
-        # Vezmi pouze ty, které v DF opravdu existují
-        overlap = [c for c in use_cols if c in df.columns]
-
-        # Pokud jich je málo (např. < 30 %), spadni na base_cols (ty si umíme spočítat)
-        if not overlap or len(overlap) < max(1, int(0.2 * len(use_cols))):
-            self._append_log(f"[WARN] Pouze {len(overlap)}/{len(use_cols)} požadovaných featur k dispozici – padám na base_cols.")
-            overlap = [c for c in base_cols if c in df.columns]
-
-        df = df[overlap].copy()
-
-        # Číselná konverze + imputace mediánem (žádné doplňování *nových* sloupců nulami)
-        for c in df.columns:
-            key = str(c).strip().lower()
-            if key in {"date", "time", "timestamp", "datetime"}:
-                ts = pd.to_datetime(df[c], utc=True, errors="coerce")
-                df[c] = pd.Series(
-                    np.where(ts.notna(), ts.astype("int64"), np.nan),
-                    index=df.index,
-                    dtype="float64",
-                )
-            elif not pd.api.types.is_bool_dtype(df[c]):
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-        med = df.median(numeric_only=True)
-        df = df.fillna(med).fillna(0.0).astype('float32')
-        return df
+            expected = [str(c) for c in list(self.model.feature_names_in_)]
+        return _strict_live_feature_frame(feat, expected, model_label="model")
 
     def _sanitize_feature_matrix(self, feat: pd.DataFrame) -> pd.DataFrame:
         """Ponechá všechny dostupné featury, jen je převede na numerický tvar + imputuje NaN."""

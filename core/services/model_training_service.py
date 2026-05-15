@@ -19,17 +19,61 @@ ALLOWED_CANDIDATE_CRITERIA = {
     "recall_balance",
 }
 
+LEGACY_TRAINING_MODES = {"quick", "standard", "strict"}
+CANONICAL_WORKFLOW_MODES = {"explore", "refine", "refresh"}
+WORKFLOW_MODE_ALIAS_MAP = {
+    "fast": "refine",
+    "full": "explore",
+    "weekly": "refresh",
+}
+LEGACY_TO_WORKFLOW_MODE = {
+    "quick": "explore",
+    "standard": "refine",
+    "strict": "refresh",
+}
+WORKFLOW_TO_LEGACY_TRAINING_MODE = {
+    workflow_mode: legacy_mode for legacy_mode, workflow_mode in LEGACY_TO_WORKFLOW_MODE.items()
+}
+
 
 def normalize_training_mode(mode: str | None) -> str:
     txt = str(mode or "").strip().lower()
-    alias_map = {
-        "fast": "refine",
-        "full": "explore",
-        "weekly": "refresh",
-    }
-    if txt in {"quick", "standard", "strict", "explore", "refine", "refresh"}:
+    if not txt:
+        return "standard"
+    if txt in LEGACY_TRAINING_MODES or txt in CANONICAL_WORKFLOW_MODES:
         return txt
-    return alias_map.get(txt, "standard")
+    alias = WORKFLOW_MODE_ALIAS_MAP.get(txt)
+    if alias is not None:
+        return alias
+    raise ValueError(
+        "Unsupported training mode. Expected legacy modes quick/standard/strict, "
+        "canonical modes explore/refine/refresh, or known aliases fast/full/weekly."
+    )
+
+
+def canonical_workflow_mode(mode: str | None) -> str:
+    normalized = normalize_training_mode(mode)
+    if normalized in CANONICAL_WORKFLOW_MODES:
+        return normalized
+    return LEGACY_TO_WORKFLOW_MODE.get(normalized, "refine")
+
+
+def compatibility_training_mode(mode: str | None) -> str | None:
+    normalized = normalize_training_mode(mode)
+    if normalized in LEGACY_TRAINING_MODES:
+        return normalized
+    return WORKFLOW_TO_LEGACY_TRAINING_MODE.get(normalized)
+
+
+def _annotate_training_profile(
+    profile: dict[str, Any],
+    *,
+    requested_mode: str,
+) -> dict[str, Any]:
+    annotated = dict(profile)
+    annotated["workflow_mode"] = canonical_workflow_mode(requested_mode)
+    annotated["compatibility_mode"] = compatibility_training_mode(requested_mode)
+    return annotated
 
 
 def normalize_candidate_criterion(value: str | None, *, default: str = "balanced") -> str:
@@ -43,7 +87,7 @@ def normalize_candidate_criterion(value: str | None, *, default: str = "balanced
 def training_profile_for_mode(mode: str | None) -> dict[str, Any]:
     normalized = normalize_training_mode(mode)
     if normalized == "quick":
-        return {
+        return _annotate_training_profile({
             "profile_name": "quick",
             "n_splits": 3,
             "top_k_features": 8,
@@ -69,9 +113,9 @@ def training_profile_for_mode(mode: str | None) -> dict[str, Any]:
             "candidate_selection_criterion": "balanced",
             "candidate_top_n": 5,
             "candidate_fresh_ratio": 0.30,
-        }
+        }, requested_mode=normalized)
     if normalized == "explore":
-        return {
+        return _annotate_training_profile({
             "profile_name": "explore",
             "n_splits": 4,
             "top_k_features": 10,
@@ -100,9 +144,9 @@ def training_profile_for_mode(mode: str | None) -> dict[str, Any]:
             "candidate_selection_criterion": "balanced",
             "candidate_top_n": 12,
             "candidate_fresh_ratio": 0.30,
-        }
+        }, requested_mode=normalized)
     if normalized == "strict":
-        return {
+        return _annotate_training_profile({
             "profile_name": "strict",
             "n_splits": 6,
             "top_k_features": 14,
@@ -128,9 +172,9 @@ def training_profile_for_mode(mode: str | None) -> dict[str, Any]:
             "candidate_selection_criterion": "balanced",
             "candidate_top_n": 10,
             "candidate_fresh_ratio": 0.30,
-        }
+        }, requested_mode=normalized)
     if normalized == "refresh":
-        return {
+        return _annotate_training_profile({
             "profile_name": "refresh",
             "n_splits": 5,
             "top_k_features": 12,
@@ -159,9 +203,9 @@ def training_profile_for_mode(mode: str | None) -> dict[str, Any]:
             "candidate_selection_criterion": "balanced",
             "candidate_top_n": 1,
             "candidate_fresh_ratio": 0.30,
-        }
+        }, requested_mode=normalized)
     if normalized == "refine":
-        return {
+        return _annotate_training_profile({
             "profile_name": "refine",
             "n_splits": 6,
             "top_k_features": 12,
@@ -190,8 +234,8 @@ def training_profile_for_mode(mode: str | None) -> dict[str, Any]:
             "candidate_selection_criterion": "balanced",
             "candidate_top_n": 8,
             "candidate_fresh_ratio": 0.30,
-        }
-    return {
+        }, requested_mode=normalized)
+    return _annotate_training_profile({
         "profile_name": "refine",
         "n_splits": 5,
         "top_k_features": 12,
@@ -217,7 +261,7 @@ def training_profile_for_mode(mode: str | None) -> dict[str, Any]:
         "candidate_selection_criterion": "balanced",
         "candidate_top_n": 5,
         "candidate_fresh_ratio": 0.30,
-    }
+    }, requested_mode=normalized)
 
 
 def compute_holdout_bars(n_total: int, pct: float, min_bars: int, max_bars: int) -> int:
@@ -347,13 +391,19 @@ def run_training_job(
     extra_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     phase_norm = normalize_training_mode(phase)
+    workflow_mode = canonical_workflow_mode(phase_norm)
+    compatibility_mode = compatibility_training_mode(phase_norm)
+    runtime_training_mode = str(compatibility_mode or phase_norm)
     estimator_norm = str(estimator_name or "").strip().lower()
     criterion_norm = normalize_candidate_criterion(criterion)
     horizon_value = int(horizon)
     tp_value = float(tp_bps)
     sl_value = float(sl_bps)
     profile = dict(training_profile or training_profile_for_mode(phase_norm))
-    profile["training_mode"] = phase_norm
+    profile["training_mode"] = runtime_training_mode
+    profile["workflow_mode"] = str(profile.get("workflow_mode") or workflow_mode)
+    profile["compatibility_mode"] = profile.get("compatibility_mode", compatibility_mode)
+    profile["training_mode_requested"] = phase_norm
     profile["candidate_chain_enabled"] = bool(profile.get("candidate_chain_enabled", True))
     profile["candidate_selection_criterion"] = criterion_norm
     profile["candidate_top_n"] = int(max(1, candidate_top_n))
@@ -394,6 +444,9 @@ def run_training_job(
     meta_extra["holdout_min_bars"] = int(holdout_min_bars)
     meta_extra["holdout_max_bars"] = int(holdout_max_bars)
     meta_extra["training_mode"] = phase_norm
+    meta_extra["workflow_mode"] = workflow_mode
+    meta_extra["training_mode_requested"] = phase_norm
+    meta_extra["training_mode_compatibility"] = compatibility_mode
     meta_extra["training_profile"] = dict(profile)
     if isinstance(extra_meta, dict) and extra_meta:
         meta_extra.update(extra_meta)
@@ -440,7 +493,7 @@ def run_training_job(
             search_backend=profile.get("search_backend", "grid"),
             optuna_trials=profile.get("optuna_trials"),
             optuna_timeout_seconds=profile.get("optuna_timeout_seconds"),
-            training_mode=phase_norm,
+            training_mode=runtime_training_mode,
             candidate_chain_enabled=bool(profile.get("candidate_chain_enabled", True)),
             candidate_selection_criterion=criterion_norm,
             candidate_top_n=int(profile.get("candidate_top_n", 5)),
@@ -488,6 +541,9 @@ def run_training_job(
 
     return {
         "phase": phase_norm,
+        "workflow_mode": workflow_mode,
+        "compatibility_mode": compatibility_mode,
+        "runtime_training_mode": runtime_training_mode,
         "model": estimator_norm,
         "criterion": criterion_norm,
         "horizon": int(horizon_value),
