@@ -446,6 +446,43 @@ def test_train_and_evaluate_rejects_unknown_training_mode():
         )
 
 
+def test_train_and_evaluate_model_interrupts_mid_candidate_when_should_continue_turns_false(monkeypatch):
+    stop_state = {"stop": False}
+
+    class _TwoFoldSplit:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def split(self, X):
+            n = len(X)
+            yield np.arange(0, n // 2), np.arange(n // 2, min(n // 2 + 10, n))
+            yield np.arange(10, min((n // 2) + 10, n)), np.arange(max(n - 10, 0), n)
+
+    original_fit_estimator = train_models._fit_estimator
+
+    def _fit_estimator_and_request_stop(*args, **kwargs):
+        result = original_fit_estimator(*args, **kwargs)
+        stop_state["stop"] = True
+        return result
+
+    monkeypatch.setattr(train_models, "PurgedWalkForwardSplit", _TwoFoldSplit)
+    monkeypatch.setattr(train_models, "_fit_estimator", _fit_estimator_and_request_stop)
+
+    with pytest.raises(InterruptedError, match="training cancelled by caller"):
+        train_and_evaluate_model(
+            df=_small_training_frame(n_rows=96),
+            estimator_name="rf",
+            param_grid=_single_candidate_rf_grid(),
+            n_splits=2,
+            embargo=2,
+            holdout_bars=12,
+            mc_enabled=False,
+            annualize_sharpe=True,
+            quality_gate_enabled=False,
+            should_continue=lambda: not bool(stop_state["stop"]),
+        )
+
+
 def test_finalize_threshold_tuning_outcome_records_fallback_reason_and_adjustments():
     threshold_tuning = {
         "selected_mode_base": "score_grid",

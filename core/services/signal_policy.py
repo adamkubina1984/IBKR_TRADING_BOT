@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 
 
-DEFAULT_EXIT_POLICY = "hold_until_opposite"
+DEFAULT_EXIT_POLICY = "flat_on_weak_signal"
 
 
 def _normalize_direction_label(value: Any) -> str | None:
@@ -148,16 +148,25 @@ def pick_ternary_direction_from_raw_proba(
     return "FLAT", float(max(prob_long[0], prob_short[0], prob_hold[0] if prob_hold.size else 0.0))
 
 
+def exit_policy_display_text(value: Any) -> str:
+    policy = normalize_exit_policy_name(value)
+    labels = {
+        "flat_on_weak_signal": "flat_on_weak_signal (flat pri slabem signalu)",
+        "hold_until_opposite": "hold_until_opposite (drzet do opacneho signalu)",
+    }
+    return labels.get(policy, policy)
+
+
 def normalize_exit_policy_name(value: Any, *, default: str = DEFAULT_EXIT_POLICY) -> str:
     text = str(value or "").strip().lower()
     aliases = {
         "": default,
         "default": DEFAULT_EXIT_POLICY,
-        "legacy": "legacy_flat_exit",
-        "legacy_flat": "legacy_flat_exit",
-        "legacy_flat_exit": "legacy_flat_exit",
-        "flat_on_neutral": "legacy_flat_exit",
-        "flat_on_weak_signal": "legacy_flat_exit",
+        "legacy": "flat_on_weak_signal",
+        "legacy_flat": "flat_on_weak_signal",
+        "legacy_flat_exit": "flat_on_weak_signal",
+        "flat_on_neutral": "flat_on_weak_signal",
+        "flat_on_weak_signal": "flat_on_weak_signal",
         "hold_until_opposite": "hold_until_opposite",
         "hold-opposite": "hold_until_opposite",
         "hold_opposite": "hold_until_opposite",
@@ -177,6 +186,27 @@ def resolve_exit_policy_setting(source: Any, *, default: str = DEFAULT_EXIT_POLI
         if direct_policy is not None:
             return normalize_exit_policy_name(direct_policy, default=default)
     return normalize_exit_policy_name(source, default=default)
+
+
+def stamp_exit_policy_metadata(metadata: dict[str, Any], *, default: str = DEFAULT_EXIT_POLICY) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+
+    resolved = resolve_exit_policy_setting(metadata, default=default)
+    changed = False
+
+    if metadata.get("exit_policy") != resolved:
+        metadata["exit_policy"] = resolved
+        changed = True
+
+    user_settings = metadata.get("user_settings")
+    if isinstance(user_settings, dict) and user_settings.get("exit_policy") != resolved:
+        nested = dict(user_settings)
+        nested["exit_policy"] = resolved
+        metadata["user_settings"] = nested
+        changed = True
+
+    return changed
 
 
 @dataclass(frozen=True)
@@ -281,7 +311,7 @@ def apply_entry_exit_thresholds(
     exit_policy: str = DEFAULT_EXIT_POLICY,
 ) -> np.ndarray:
     policy = normalize_exit_policy_name(exit_policy)
-    if policy == "legacy_flat_exit":
+    if policy == "flat_on_weak_signal":
         out = apply_confidence_entry_threshold(raw_pred, confidence, entry_threshold)
         out = normalize_signal_array(out)
         if float(exit_threshold) > 0.0:
@@ -328,7 +358,7 @@ def evaluate_live_policy(
             return LivePolicyDecision(proposal=proposal, final_signal=proposal, reason="entry_confirmed")
         return LivePolicyDecision(proposal=proposal, final_signal=None, reason="entry_low_confidence")
 
-    if policy == "legacy_flat_exit":
+    if policy == "flat_on_weak_signal":
         if proposal == current_dir and confidence >= float(exit_threshold):
             return LivePolicyDecision(proposal=proposal, final_signal=current_dir, reason="hold_confirmed")
         if proposal == current_dir:

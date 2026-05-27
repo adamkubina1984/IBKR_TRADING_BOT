@@ -8,6 +8,7 @@ from typing import Any, Callable, Literal
 from .live import ExecutionJournal, PaperSafeTwsClient, RuntimeStateStore, TwsConnectionConfig
 from .live_release_gate import LiveReleaseGateInputs, LiveReleaseGateResult, evaluate_live_release_gate
 from .live_trading_execution_service import LiveTradingExecutionConfig, LiveTradingExecutionService, ProcessBarResult, ServiceStatus
+from .signal_policy import DEFAULT_EXIT_POLICY, resolve_exit_policy_setting
 
 ExecutionMode = Literal["PAPER", "REAL"]
 
@@ -55,6 +56,7 @@ class LiveServiceController:
         timeframe: str,
         entry_threshold: float,
         exit_threshold: float,
+        exit_policy: str = DEFAULT_EXIT_POLICY,
         use_ma_alignment: bool,
         freshness_timeout_sec: int,
         session_root: str | Path | None = None,
@@ -69,6 +71,7 @@ class LiveServiceController:
         self.timeframe = str(timeframe)
         self.entry_threshold = float(entry_threshold)
         self.exit_threshold = float(exit_threshold)
+        self.exit_policy = resolve_exit_policy_setting(exit_policy, default=DEFAULT_EXIT_POLICY)
         self.use_ma_alignment = bool(use_ma_alignment)
         self.freshness_timeout_sec = int(freshness_timeout_sec)
         self._release_gate_inputs = release_gate_inputs or _default_release_gate_inputs()
@@ -279,6 +282,7 @@ class LiveServiceController:
             timeframe=self.timeframe,
             entry_threshold=self.entry_threshold,
             exit_threshold=self.exit_threshold,
+            exit_policy=self.exit_policy,
             use_ma_alignment=self.use_ma_alignment,
             freshness_timeout_sec=self.freshness_timeout_sec,
         )

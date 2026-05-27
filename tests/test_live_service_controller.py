@@ -76,6 +76,13 @@ def test_live_service_controller_blocks_real_money_by_default(tmp_path):
         controller.assert_real_money_ready()
 
 
+def test_live_service_controller_normalizes_exit_policy(tmp_path):
+    controller = _build_controller(tmp_path, exit_policy="legacy_flat")
+
+    assert controller.exit_policy == "flat_on_weak_signal"
+    assert controller._service.config.exit_policy == "flat_on_weak_signal"
+
+
 def test_live_service_controller_allows_real_money_after_clean_signoff(tmp_path):
     controller = _build_controller(
         tmp_path,

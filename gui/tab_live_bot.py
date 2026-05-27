@@ -51,10 +51,14 @@ from ibkr_trading_bot.core.config.presets import PRESETS_BY_TF
 from ibkr_trading_bot.core.services.live import TwsConnectionConfig
 from ibkr_trading_bot.core.services.live_service_controller import LiveServiceController
 from ibkr_trading_bot.core.services.signal_policy import (
+    DEFAULT_EXIT_POLICY,
     apply_live_hysteresis,
     build_live_proposal,
+    exit_policy_display_text,
     infer_label_map_from_classes as infer_signal_policy_label_map,
     pick_ternary_direction_from_raw_proba as pick_shared_ternary_direction_from_raw_proba,
+    resolve_exit_policy_setting,
+    stamp_exit_policy_metadata,
 )
 from ibkr_trading_bot.core.services.trade_executor import ClosedTrade, TradeExecutor, TradeState
 from ibkr_trading_bot.features.feature_engineering import compute_all_features
@@ -74,6 +78,7 @@ from ibkr_trading_bot.core.services.model_service import (
     feature_contract_from_meta,
     infer_label_mode_from_meta,
     read_sidecar_model_meta,
+    write_sidecar_model_meta,
 )
 from ibkr_trading_bot.gui.components.workers import TaskWorker
 
@@ -936,9 +941,20 @@ class _WarmAdapter:
             "low":    float(bar["low"]),
             "close":  float(bar["close"]),
             "volume": float(bar.get("volume", 0) or 0),
-        }])
-        self._hist_df = pd.concat([self._hist_df, row], ignore_index=True)
+        }], columns=self._hist_df.columns)
+        if self._hist_df.empty:
+            self._hist_df = row
+        else:
+            self._hist_df = pd.concat([self._hist_df, row], ignore_index=True)
         feat = self.w._compute_indicators(self._hist_df.rename(columns={"date": "date"}))
+        if feat is None or feat.empty:
+            last = self._hist_df.iloc[[-1]].copy()
+            closes = pd.to_numeric(self._hist_df["close"], errors="coerce")
+            last["ma_fast"] = float(closes.tail(9).mean()) if not closes.empty else np.nan
+            last["ma_slow"] = float(closes.tail(21).mean()) if not closes.empty else np.nan
+            if "average" not in last.columns:
+                last["average"] = (last["open"] + last["high"] + last["low"] + last["close"]) / 4.0
+            return self.w._sanitize_feature_matrix(last)
         last = feat.iloc[[-1]].copy()
         X = self.w._sanitize_feature_matrix(last)
 
@@ -1018,6 +1034,7 @@ class _WarmAdapter:
             thr_ui,
             max(0.0, thr_ui - 0.05),
             block_entry=bool(self.w._live_pos == 0 and self.w._near_round_level(close, atr)),
+            exit_policy=str(getattr(self.w, "_curr_exit_policy", DEFAULT_EXIT_POLICY) or DEFAULT_EXIT_POLICY),
         )
 
         # log (už neodkazuje na neexistující 'thr' / 'thr_and')
@@ -1093,6 +1110,9 @@ class LiveBotWidget(QWidget):
         self._bootstrap_done = True
         self._warmup_done = True
         self._log_queue = deque()
+        self._tab_active = False
+        self._startup_status_checked = False
+        self._startup_check_scheduled = False
 
         self._live_pos = 0       # -1 short, 0 flat, +1 long
         self._live_entry_px = None
@@ -1102,6 +1122,7 @@ class LiveBotWidget(QWidget):
         self._trading_enabled = False
         self._curr_entry_thr = self.config.entry_thr
         self._curr_exit_thr = self.config.exit_thr
+        self._curr_exit_policy = DEFAULT_EXIT_POLICY
         self._curr_t_short = None
         self._curr_t_long = None
         self._rounds = {"grid": [], "tol_atr": 0.0}
@@ -1125,7 +1146,7 @@ class LiveBotWidget(QWidget):
         self._restore_ibkr_paper_settings()
         self._load_tv_credentials_into_ui()
         self.live_controller = self._build_live_service_controller()
-        self._refresh_controller_status(run_startup_check=True)
+        self._refresh_controller_status(run_startup_check=False)
         self._sync_live_state_from_controller()
         self._refresh_trades_from_controller()
         self._wire_basic_logic()
@@ -1150,6 +1171,28 @@ class LiveBotWidget(QWidget):
         self._log_timer.setInterval(100)
         self._log_timer.timeout.connect(self._flush_log_queue)
         self._log_timer.start()
+
+    def on_tab_activated(self) -> None:
+        self._tab_active = True
+        if hasattr(self, "fresh_timer") and not self.fresh_timer.isActive():
+            self.fresh_timer.start()
+        if not self._startup_status_checked and not self._startup_check_scheduled:
+            self._startup_check_scheduled = True
+            QTimer.singleShot(0, self._run_deferred_startup_check)
+
+    def on_tab_deactivated(self) -> None:
+        self._tab_active = False
+        if hasattr(self, "fresh_timer") and self.fresh_timer.isActive():
+            self.fresh_timer.stop()
+
+    def _run_deferred_startup_check(self) -> None:
+        self._startup_check_scheduled = False
+        if not self._tab_active:
+            return
+        self._startup_status_checked = True
+        self._refresh_controller_status(run_startup_check=True)
+        self._sync_live_state_from_controller()
+        self._refresh_trades_from_controller()
 
     def _load_ui_settings(self) -> None:
         try:
@@ -1242,6 +1285,7 @@ class LiveBotWidget(QWidget):
             timeframe=(self.cmb_interval.currentText() or self.config.bar_size).strip(),
             entry_threshold=float(self._curr_entry_thr),
             exit_threshold=float(self._curr_exit_thr),
+            exit_policy=str(self._curr_exit_policy or DEFAULT_EXIT_POLICY),
             use_ma_alignment=bool(self.config.use_and_ensemble),
             freshness_timeout_sec=max(60, int(self.config.max_fresh_age_min) * 60),
             broker_connection=self._build_ib_connection_config(),
@@ -1451,12 +1495,14 @@ class LiveBotWidget(QWidget):
         self.lbl_time = QLabel("Time: --:--:--")
         self.lbl_fresh = QLabel("Freshness: --")
         self.lbl_mode = QLabel("Mode: OBSERVE")
+        self.lbl_exit_policy = QLabel(f"Exit Policy: {exit_policy_display_text(DEFAULT_EXIT_POLICY)}")
         grid.addWidget(self.lbl_ib_status, 0, 0)
         grid.addWidget(self.lbl_broker_status, 0, 1)
         grid.addWidget(self.lbl_release_gate, 0, 2)
         grid.addWidget(self.lbl_time, 1, 0)
         grid.addWidget(self.lbl_fresh, 1, 1)
         grid.addWidget(self.lbl_mode, 1, 2)
+        grid.addWidget(self.lbl_exit_policy, 2, 0, 1, 3)
         status_box.setLayout(grid)
 
         # Sezení
@@ -1851,7 +1897,7 @@ class LiveBotWidget(QWidget):
     def _load_models(self) -> bool:
         """
         Načte 1..N modelů ze self.le_model_path (oddělené ; nebo novými řádky).
-        Všechny modely musí sdílet stejný feature kontrakt a ternární label mode.
+        Všechny modely musí sdílet stejný feature kontrakt, ternární label mode a exit policy.
         """
         text = (self.le_model_path.text() or "").strip()
         if not text:
@@ -1882,6 +1928,7 @@ class LiveBotWidget(QWidget):
         reference_feature_contract = None
         reference_expected_features = None
         reference_label_mode = None
+        reference_exit_policy = None
         reference_model_name = None
 
         def _extract_predictor(obj):
@@ -1918,6 +1965,19 @@ class LiveBotWidget(QWidget):
                 if t_long is None:
                     t_long = _safe_float(user.get("ternary_threshold_long_eval"))
             return t_short, t_long
+
+        def _persist_normalized_exit_policy(model_path: str, meta_dict: dict) -> dict:
+            if not isinstance(meta_dict, dict):
+                return meta_dict
+            updated_meta = dict(meta_dict)
+            if not stamp_exit_policy_metadata(updated_meta):
+                return updated_meta
+            try:
+                write_sidecar_model_meta(model_path, updated_meta)
+                self._append_log(f"[META] Exit policy backfilled: {Path(model_path).stem}_meta.json")
+            except Exception as ex:
+                self._append_log(f"[WARN] Exit policy backfill selhal pro {os.path.basename(model_path)}: {ex}")
+            return updated_meta
 
         from pathlib import Path
         for p in parts:
@@ -2017,6 +2077,8 @@ class LiveBotWidget(QWidget):
                 meta.setdefault("trained_features", list(exp_list))
                 meta["feature_contract"] = feature_contract_from_meta(meta)
                 meta["label_mode"] = infer_label_mode_from_meta(meta)
+                meta["exit_policy"] = resolve_exit_policy_setting(meta, default=DEFAULT_EXIT_POLICY)
+                meta = _persist_normalized_exit_policy(p, meta)
 
                 label_mode = str(meta.get("label_mode") or "").strip().lower()
                 if not label_mode.startswith("ternary"):
@@ -2037,6 +2099,7 @@ class LiveBotWidget(QWidget):
                     reference_feature_contract = dict(feature_contract)
                     reference_expected_features = list(exp_list)
                     reference_label_mode = label_mode
+                    reference_exit_policy = str(meta.get("exit_policy") or DEFAULT_EXIT_POLICY)
                     reference_model_name = os.path.basename(p)
                 else:
                     if feature_contract != reference_feature_contract:
@@ -2048,6 +2111,13 @@ class LiveBotWidget(QWidget):
                         self._append_log(
                             f"[ERROR] Label mode modelu {os.path.basename(p)} nesedi s {reference_model_name}: "
                             f"{label_mode} != {reference_label_mode}"
+                        )
+                        return False
+                    exit_policy = str(meta.get("exit_policy") or DEFAULT_EXIT_POLICY)
+                    if exit_policy != reference_exit_policy:
+                        self._append_log(
+                            f"[ERROR] Exit policy modelu {os.path.basename(p)} nesedi s {reference_model_name}: "
+                            f"{exit_policy} != {reference_exit_policy}"
                         )
                         return False
 
@@ -2464,14 +2534,22 @@ class LiveBotWidget(QWidget):
     
     def _update_settings_display(self, user_settings: dict, metadata: dict | None = None) -> None:
         """Uloží user_settings a synchronizuje runtime nastavení TAB 5 s metadaty modelu."""
-        self.user_settings = user_settings  # uložit pro použití v predikci
+        normalized_exit_policy = resolve_exit_policy_setting(
+            user_settings if user_settings else (metadata or {}),
+            default=DEFAULT_EXIT_POLICY,
+        )
+        self.user_settings = dict(user_settings or {})
+        self.user_settings["exit_policy"] = normalized_exit_policy
+        self._curr_exit_policy = normalized_exit_policy
+        if hasattr(self, "lbl_exit_policy"):
+            self.lbl_exit_policy.setText(f"Exit Policy: {exit_policy_display_text(normalized_exit_policy)}")
 
         t_short, t_long = self._extract_ternary_thresholds_from_metadata(metadata or {})
-        entry_threshold = user_settings.get("entry_threshold", "–")
-        exit_threshold = user_settings.get("exit_threshold", "–")
-        use_ma_only = _coerce_bool(user_settings.get("use_ma_only"), default=self.config.use_ma_only)
+        entry_threshold = self.user_settings.get("entry_threshold", "–")
+        exit_threshold = self.user_settings.get("exit_threshold", "–")
+        use_ma_only = _coerce_bool(self.user_settings.get("use_ma_only"), default=self.config.use_ma_only)
         use_and_ensemble = _coerce_bool(
-            user_settings.get("use_and_ensemble"),
+            self.user_settings.get("use_and_ensemble"),
             default=self.config.use_and_ensemble,
         )
 
@@ -2492,10 +2570,11 @@ class LiveBotWidget(QWidget):
             self._curr_t_long = float(t_long)
         
         # Log po aktualizaci
-        if user_settings or isinstance(t_short, (int, float)) or isinstance(t_long, (int, float)):
+        if self.user_settings or isinstance(t_short, (int, float)) or isinstance(t_long, (int, float)):
             self._append_log(
                 f"[SETTINGS] T-short={t_short_disp}, T-long={t_long_disp}, "
-                f"Entry={entry_threshold}, Exit={exit_threshold}, MA-Only={use_ma_only}, AND={use_and_ensemble}"
+                f"Entry={entry_threshold}, Exit={exit_threshold}, ExitPolicy={normalized_exit_policy}, "
+                f"MA-Only={use_ma_only}, AND={use_and_ensemble}"
             )
 
     # AND hlasování přes všechny modely
@@ -2608,7 +2687,7 @@ class LiveBotWidget(QWidget):
         conf_vote = float(np.mean([c for d, c in zip(dirs, confs) if d == "SHORT"]))
         return -1, conf_vote, dirs, confs
 
-    def _prepare_X_for_model(self, Xrow: pd.DataFrame, exp: list[str]) -> pd.DataFrame:
+    def _prepare_X_for_model(self, Xrow: pd.DataFrame, exp: list[str], *, model_label: str = "model") -> pd.DataFrame:
         """Připrav řádek pro model. Chybné features vyplní mediánem z dostupných dat."""
         X_use = Xrow.copy()
         missing = [c for c in exp if c not in X_use.columns]
@@ -2620,7 +2699,9 @@ class LiveBotWidget(QWidget):
             if key not in self._diag_once:
                 sample = ", ".join(missing[:5])
                 more = "" if len(missing) <= 5 else f" (+{len(missing)-5} more)"
-                self._append_log(f"[WARN] Chybí features ({len(missing)}/{len(exp)}): {sample}{more}")
+                self._append_log(
+                    f"[WARN] Chybí features pro {model_label} ({len(missing)}/{len(exp)}): {sample}{more}"
+                )
                 self._diag_once[key] = True
             
             # Doplň chybné features mediánem z existujícíích dat
@@ -2744,92 +2825,6 @@ class LiveBotWidget(QWidget):
         self._save_ui_settings()
         self._append_log(f"[INFO] Zobrazeni svicek nastaveno na {bars}.")
         self._render_charts()
-
-    # ---------- Worker reakce ----------
-    @Slot(dict)
-    def _on_bar_closed(self, bar: dict) -> None:
-        ts_raw = bar.get("time")
-        close = float(bar.get("close", 0.0))
-        self._append_log(f"[BAR] {ts_raw} close={close}")
-
-        ts = pd.to_datetime(ts_raw, utc=True, errors="coerce")
-        if pd.isna(ts):
-            return
-        key = int(ts.value)
-        payload = {
-            "time": ts,
-            "open":  float(bar.get("open",  np.nan)),
-            "high":  float(bar.get("high",  np.nan)),
-            "low":   float(bar.get("low",   np.nan)),
-            "close": close,
-            "volume": float(bar.get("volume", 0) or 0),
-        }
-        idx = self._bar_index.get(key)
-        if idx is None:
-            self._bar_index[key] = len(self._bars)
-            self._bars.append(payload)
-        else:
-            self._bars[idx] = payload
-
-        self._bars.sort(key=lambda item: pd.to_datetime(item.get("time"), utc=True, errors="coerce"))
-        self._bar_index = {int(pd.to_datetime(item["time"]).value): i for i, item in enumerate(self._bars)}
-
-        if len(self._bars) > self.config.max_bars_buffer:
-            self._bars = self._bars[-self.config.max_bars_buffer:]
-            self._bar_index = {int(pd.to_datetime(x["time"]).value): i for i, x in enumerate(self._bars)}
-
-        row = {
-            "timestamp": ts,
-            "open": payload["open"],
-            "high": payload["high"],
-            "low":  payload["low"],
-            "close": payload["close"],
-            "volume": payload["volume"],
-        }
-        self.live_df = pd.concat([self.live_df, pd.DataFrame([row])], ignore_index=True)
-        self.live_df.dropna(subset=["timestamp"], inplace=True)
-        self.live_df.drop_duplicates(subset=["timestamp"], keep="last", inplace=True)
-        self.live_df.sort_values("timestamp", inplace=True)
-        self.live_df.reset_index(drop=True, inplace=True)
-        
-        # Udržuj VĚTŠÍ buffer (700 barů) pro rolling indicators - neřezat na max_bars_buffer!
-        # Display se ořeže až při rendering
-        max_live_buffer = max(700, self.config.max_bars_buffer + 400)  # +400 pro rolling warmup
-        if len(self.live_df) > max_live_buffer:
-            self.live_df = self.live_df.tail(max_live_buffer).reset_index(drop=True)
-
-        try:
-            if self.warm is not None:
-                self.warm.on_new_bar(payload)
-                self._sync_live_mode_label()
-            self._rescore_all()
-            self._maybe_alert_flip_on_last_bar()
-        except Exception as e:
-            self._append_log(f"[WARN] Re-score selhal: {e}")
-
-        self._last_arrival_utc = pd.Timestamp.now(tz='UTC')
-        self._update_freshness()
-        self._render_charts()
-
-        # email flip alert
-        try:
-            if self.config.alert_email_enabled and self._bars:
-                last = self._bars[-1]
-                sig = last.get("signal")
-                if sig in ("LONG", "SHORT"):
-                    bar_key = int(pd.to_datetime(last["time"]).value)
-                    if self._last_alert_bar_key is None or bar_key > self._last_alert_bar_key:
-                        prev = self._last_alert_sig
-                        if prev in ("LONG", "SHORT") and prev != sig:
-                            subj, body = self._format_flip_email(prev, sig, last["time"], float(last.get("close", float("nan"))))
-                            for addr in (self.config.alert_email_to or "").split(","):
-                                addr = addr.strip()
-                                if addr:
-                                    self._send_email_async(addr, subj, body)
-                        self._last_alert_sig = sig
-                        self._last_alert_bar_key = bar_key
-        except Exception:
-            pass
 
     @Slot(str)
     def _on_ib_status(self, status: str) -> None:
@@ -3012,18 +3007,36 @@ class LiveBotWidget(QWidget):
         if self.config.use_ma_only or not self.models:
             reason = "MA-only=True" if self.config.use_ma_only else "no_models_loaded"
             n_total = len(feats.index)
-            n_mapped = n_shown = n_long = n_short = 0
+            n_mapped = n_markers = n_active = n_long = n_short = 0
+            replay_live_pos = 0
+            prev_chart_dir = None
             for ts, d0 in zip(feats.index, l0_dir):
                 idx = self._nearest_bar_index(ts)
                 if idx is None: continue
                 n_mapped += 1
                 sig = None if d0 == "FLAT" else d0
+                chart_sig = sig if sig in {"LONG", "SHORT"} and sig != prev_chart_dir else None
                 self._bars[idx]["signal"] = sig
+                self._bars[idx]["chart_signal"] = chart_sig
                 self._bars[idx]["proba"]  = 1.0 if sig else None
                 self._bars[idx]["layers"] = {"L0_MA": d0, "L1_AND": None, "L2_AND": sig or "FLAT"}
-                if sig == "LONG": n_long += 1; n_shown += 1
-                elif sig == "SHORT": n_short += 1; n_shown += 1
-            self._append_log(f"[RESCORE] (MA-only/model-missing) bars={len(self._bars)} feats={n_total} mapped={n_mapped} shown={n_shown} (LONG={n_long}, SHORT={n_short})")
+                if sig == "LONG":
+                    n_long += 1
+                    n_active += 1
+                    replay_live_pos = 1
+                elif sig == "SHORT":
+                    n_short += 1
+                    n_active += 1
+                    replay_live_pos = -1
+                else:
+                    replay_live_pos = 0
+                prev_chart_dir = sig if sig in {"LONG", "SHORT"} else None
+                if chart_sig in {"LONG", "SHORT"}:
+                    n_markers += 1
+            self._append_log(
+                f"[RESCORE] (MA-only/model-missing) bars={len(self._bars)} feats={n_total} mapped={n_mapped} "
+                f"shown={n_markers} active={n_active} (LONG={n_long}, SHORT={n_short})"
+            )
             self._append_log(f"[RESCORE] ({reason}) bars={len(self._bars)} feats={n_total} mapped={n_mapped} ")
             
             # Sleduj obchody i v MA-only režimu
@@ -3036,8 +3049,9 @@ class LiveBotWidget(QWidget):
         # Ensemble AND (volitelně MA ∧ L1_AND)
         use_ma_and = self.config.use_and_ensemble
         replay_live_pos = 0
+        prev_chart_dir = None
 
-        n_mapped = n_shown = n_long = n_short = 0
+        n_mapped = n_markers = n_active = n_long = n_short = 0
         n_none = 0
         n_l1_flat = 0
         for ts, d0 in zip(feats.index, l0_dir):
@@ -3069,7 +3083,11 @@ class LiveBotWidget(QWidget):
                 replay_live_pos,
                 self._curr_entry_thr,
                 self._curr_exit_thr,
+                exit_policy=str(self._curr_exit_policy or DEFAULT_EXIT_POLICY),
             )
+
+            proposal_dir = proposal if proposal in {"LONG", "SHORT"} else None
+            chart_sig = proposal_dir if proposal_dir is not None and proposal_dir != prev_chart_dir else None
 
             proba = conf_min if final else None
             layers = {"L0_MA": d0, "L1_AND": l1, "L2_AND": (final or "FLAT"),
@@ -3077,6 +3095,7 @@ class LiveBotWidget(QWidget):
 
 
             self._bars[idx]["signal"] = final
+            self._bars[idx]["chart_signal"] = chart_sig
             self._bars[idx]["proba"]  = proba
             self._bars[idx]["layers"] = layers
 
@@ -3086,14 +3105,19 @@ class LiveBotWidget(QWidget):
                 replay_live_pos = -1
             else:
                 replay_live_pos = 0
+            prev_chart_dir = proposal_dir
 
             n_mapped += 1
-            if final == "LONG":  n_long += 1; n_shown += 1
+            if final == "LONG":
+                n_long += 1
+                n_active += 1
             elif final == "SHORT":
                 n_short += 1
-                n_shown += 1
+                n_active += 1
             else:
                 n_none += 1
+            if chart_sig in {"LONG", "SHORT"}:
+                n_markers += 1
 
         # Sleduj obchody po všech signálech
         try:
@@ -3102,11 +3126,11 @@ class LiveBotWidget(QWidget):
             self._append_log(f"[WARN] Sledování obchodů selhalo: {e}")
 
         self._append_log(
-            f"[RESCORE] bars={len(self._bars)} mapped={n_mapped} shown={n_shown} "
+            f"[RESCORE] bars={len(self._bars)} mapped={n_mapped} shown={n_markers} active={n_active} "
             f"(LONG={n_long}, SHORT={n_short}) thr={thr:.2f} models={len(self.models)} AND_MA={use_ma_and}"
         )
         self._append_log(
-            f"[TAB4-DIAG] signal_dist mapped={n_mapped} LONG={n_long} SHORT={n_short} ACTIVE={n_shown} NONE={n_none} L1_FLAT={n_l1_flat}"
+            f"[TAB4-DIAG] signal_dist mapped={n_mapped} LONG={n_long} SHORT={n_short} ACTIVE={n_active} MARKERS={n_markers} NONE={n_none} L1_FLAT={n_l1_flat}"
         )
 
         # Track predictions a ceny pro degradation diagnostics
@@ -3636,17 +3660,26 @@ class LiveBotWidget(QWidget):
                 )
             )
 
-        # šipky (výsledek = L2_AND / FINAL)
-        if 'signal' in df.columns:
+        # Šipky v grafu reprezentují aktivní stav obchodu po dobu držení pozice.
+        if 'signal' in df.columns or 'chart_signal' in df.columns:
             rng = (df['high'] - df['low']).replace(0, np.nan)
             pad = float(np.nanmedian(rng)) * 0.12 if not np.isnan(np.nanmedian(rng)) else 0.0
             pad = max(pad, 0.0001)
             long_x, long_y, short_x, short_y = [], [], [], []
             for i2, row2 in df.iterrows():
-                s = row2.get('signal')
-                if s == 'LONG':
+                state_sig = row2.get('signal') if 'signal' in df.columns else None
+                if state_sig not in ('LONG', 'SHORT'):
+                    state_sig = None
+
+                marker_sig = state_sig
+                if marker_sig is None and 'chart_signal' in df.columns:
+                    fallback_sig = row2.get('chart_signal')
+                    if fallback_sig in ('LONG', 'SHORT'):
+                        marker_sig = fallback_sig
+
+                if marker_sig == 'LONG':
                     long_x.append(i2); long_y.append(row2['low'] - pad)
-                elif s == 'SHORT':
+                elif marker_sig == 'SHORT':
                     short_x.append(i2); short_y.append(row2['high'] + pad)
             if long_x:
                 ax1.scatter(long_x, long_y, marker='^', s=90, color=bullish_color, zorder=5)
@@ -4066,6 +4099,13 @@ class LiveBotWidget(QWidget):
 
         key = int(ts.value)
         idx = self._bar_index.get(key)
+        if idx is not None:
+            existing_bar = self._bars[idx]
+            if isinstance(existing_bar, dict):
+                if "signal" in existing_bar:
+                    payload["signal"] = existing_bar.get("signal")
+                if "chart_signal" in existing_bar:
+                    payload["chart_signal"] = existing_bar.get("chart_signal")
         if idx is None:
             self._bar_index[key] = len(self._bars)
             self._bars.append(payload)
@@ -4087,7 +4127,11 @@ class LiveBotWidget(QWidget):
             "close": payload["close"],
             "volume": payload["volume"],
         }
-        self.live_df = pd.concat([self.live_df, pd.DataFrame([row])], ignore_index=True)
+        row_df = pd.DataFrame([row], columns=self.live_df.columns)
+        if self.live_df.empty:
+            self.live_df = row_df
+        else:
+            self.live_df = pd.concat([self.live_df, row_df], ignore_index=True)
         self.live_df.dropna(subset=["timestamp"], inplace=True)
         self.live_df.drop_duplicates(subset=["timestamp"], keep="last", inplace=True)
         self.live_df.sort_values("timestamp", inplace=True)

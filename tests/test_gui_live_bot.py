@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import time
+from matplotlib.collections import PathCollection
 from PySide6.QtCore import QCoreApplication
 from PySide6.QtWidgets import QGroupBox, QWidget
 
@@ -111,6 +112,31 @@ def test_project_loggers_do_not_propagate_to_root():
 
     assert get_app_logger("IBKR_BOT.test").propagate is False
     assert get_core_logger("live_bot.test").propagate is False
+
+
+def test_live_tab_defers_startup_check_until_activated(monkeypatch, qapp):
+    from ibkr_trading_bot.gui import tab_live_bot as tab_live_bot_module
+
+    calls: list[bool] = []
+    monkeypatch.setattr(tab_live_bot_module, "FigureCanvas", StubCanvas)
+    monkeypatch.setattr(tab_live_bot_module.LiveBotWidget, "_sync_live_state_from_controller", lambda self: None)
+    monkeypatch.setattr(tab_live_bot_module.LiveBotWidget, "_refresh_trades_from_controller", lambda self: None)
+
+    def _fake_refresh(self, *, run_startup_check: bool = False) -> None:
+        calls.append(bool(run_startup_check))
+
+    monkeypatch.setattr(tab_live_bot_module.LiveBotWidget, "_refresh_controller_status", _fake_refresh)
+
+    tab = tab_live_bot_module.LiveBotWidget()
+    try:
+        assert calls == [False]
+
+        tab.on_tab_activated()
+        qapp.processEvents()
+
+        assert calls == [False, True]
+    finally:
+        tab.close()
 
 
 def test_live_bootstrap_keeps_warmup_snapshot_when_tv_snapshot_empty(monkeypatch, qapp):
@@ -342,6 +368,7 @@ def test_live_settings_display_applies_runtime_flags(monkeypatch, qapp):
             {
                 "entry_threshold": 0.55,
                 "exit_threshold": 0.45,
+                "exit_policy": "legacy_flat",
                 "use_ma_only": True,
                 "use_and_ensemble": True,
             },
@@ -355,8 +382,55 @@ def test_live_settings_display_applies_runtime_flags(monkeypatch, qapp):
         assert tab.config.use_and_ensemble is True
         assert tab._curr_entry_thr == 0.55
         assert tab._curr_exit_thr == 0.45
+        assert tab._curr_exit_policy == "flat_on_weak_signal"
         assert tab._curr_t_short == 0.40
         assert tab._curr_t_long == 0.60
+        assert tab.user_settings["exit_policy"] == "flat_on_weak_signal"
+        assert "flat_on_weak_signal" in tab.lbl_exit_policy.text()
+    finally:
+        tab.close()
+
+
+def test_live_rescore_forwards_active_exit_policy(monkeypatch, qapp):
+    from ibkr_trading_bot.gui import tab_live_bot as tab_live_bot_module
+
+    monkeypatch.setattr(tab_live_bot_module, "FigureCanvas", StubCanvas)
+    tab = tab_live_bot_module.LiveBotWidget()
+    try:
+        ts1 = pd.Timestamp("2026-03-18T10:00:00Z")
+        tab._bars = [
+            {"time": ts1, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0},
+        ]
+        tab.models = [{"predictor": object(), "label_map": {0: "SHORT", 1: "LONG"}, "t_short": 0.5, "t_long": 0.5}]
+        tab.config.use_and_ensemble = False
+        tab._update_settings_display({"exit_policy": "legacy_flat"}, {})
+
+        raw = pd.DataFrame(
+            {
+                "close": [100.0],
+                "atr": [1.0],
+                "ma_fast": [10.0],
+                "ma_slow": [10.0],
+            },
+            index=pd.to_datetime([ts1], utc=True),
+        )
+        calls: list[dict[str, object]] = []
+
+        monkeypatch.setattr(tab, "_get_raw_indicators", lambda: raw)
+        monkeypatch.setattr(tab, "_sanitize_feature_matrix", lambda feat: feat)
+        monkeypatch.setattr(tab, "_predict_one_label_VOTE", lambda Xrow: (-1, 0.8, ["SHORT"], [0.8]))
+        monkeypatch.setattr(tab, "_update_position_and_trades", lambda raw_df: None)
+        monkeypatch.setattr(tab, "_track_predictions_for_degradation", lambda raw_df: None)
+        monkeypatch.setattr(
+            tab_live_bot_module,
+            "apply_live_hysteresis",
+            lambda *args, **kwargs: (calls.append(kwargs), "SHORT")[1],
+        )
+
+        tab._rescore_all()
+
+        assert len(calls) == 1
+        assert calls[0]["exit_policy"] == "flat_on_weak_signal"
     finally:
         tab.close()
 
@@ -407,6 +481,188 @@ def test_live_chart_renders_doji_with_visible_body(monkeypatch, qapp):
         assert len(tab.ax_price.patches) == 2
         heights = [float(patch.get_height()) for patch in tab.ax_price.patches]
         assert all(height > 0 for height in heights)
+    finally:
+        tab.close()
+
+
+def test_live_chart_keeps_existing_signal_marker_when_rescore_fails_on_bar_update(monkeypatch, qapp):
+    from ibkr_trading_bot.gui import tab_live_bot as tab_live_bot_module
+
+    monkeypatch.setattr(tab_live_bot_module, "FigureCanvas", StubCanvas)
+    tab = tab_live_bot_module.LiveBotWidget()
+    try:
+        ts = pd.Timestamp("2026-03-18T10:00:00Z")
+        tab._bars = [
+            {
+                "time": ts,
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.4,
+                "close": 100.8,
+                "volume": 10.0,
+                "signal": "LONG",
+                "chart_signal": "LONG",
+            }
+        ]
+        tab._bar_index = {int(ts.value): 0}
+        tab.live_df = pd.DataFrame(
+            {
+                "timestamp": [ts],
+                "open": [100.0],
+                "high": [101.0],
+                "low": [99.4],
+                "close": [100.8],
+                "volume": [10.0],
+            }
+        )
+
+        def _raise_rescore() -> None:
+            raise RuntimeError("rescore failed")
+
+        monkeypatch.setattr(tab, "_rescore_all", _raise_rescore)
+
+        tab._render_charts()
+        before_offsets = sum(
+            len(collection.get_offsets())
+            for collection in tab.ax_price.collections
+            if isinstance(collection, PathCollection)
+        )
+
+        tab._on_bar_closed(
+            {
+                "time": ts,
+                "open": 100.1,
+                "high": 101.2,
+                "low": 99.3,
+                "close": 100.9,
+                "volume": 11.0,
+            }
+        )
+        qapp.processEvents()
+
+        after_offsets = sum(
+            len(collection.get_offsets())
+            for collection in tab.ax_price.collections
+            if isinstance(collection, PathCollection)
+        )
+
+        assert before_offsets == 1
+        assert after_offsets == 1
+        assert tab._bars[0].get("signal") == "LONG"
+        assert tab._bars[0].get("chart_signal") == "LONG"
+    finally:
+        tab.close()
+
+
+def test_live_chart_renders_active_signal_marker_on_each_bar_in_position(monkeypatch, qapp):
+    from ibkr_trading_bot.gui import tab_live_bot as tab_live_bot_module
+
+    monkeypatch.setattr(tab_live_bot_module, "FigureCanvas", StubCanvas)
+    tab = tab_live_bot_module.LiveBotWidget()
+    try:
+        ts1 = pd.Timestamp("2026-03-18T10:00:00Z")
+        ts2 = pd.Timestamp("2026-03-18T10:05:00Z")
+        ts3 = pd.Timestamp("2026-03-18T10:10:00Z")
+        tab._bars = [
+            {"time": ts1, "open": 100.0, "high": 101.0, "low": 99.2, "close": 100.6, "signal": "SHORT", "chart_signal": "SHORT"},
+            {"time": ts2, "open": 100.4, "high": 100.9, "low": 99.1, "close": 99.8, "signal": "SHORT", "chart_signal": None},
+            {"time": ts3, "open": 99.8, "high": 100.1, "low": 98.9, "close": 99.4, "signal": "SHORT", "chart_signal": None},
+        ]
+
+        tab._render_charts()
+
+        marker_offsets = sum(
+            len(collection.get_offsets())
+            for collection in tab.ax_price.collections
+            if isinstance(collection, PathCollection)
+        )
+
+        assert marker_offsets == 3
+    finally:
+        tab.close()
+
+
+def test_live_chart_keeps_markers_on_all_visible_bars_of_held_position(monkeypatch, qapp):
+    from ibkr_trading_bot.gui import tab_live_bot as tab_live_bot_module
+
+    monkeypatch.setattr(tab_live_bot_module, "FigureCanvas", StubCanvas)
+    tab = tab_live_bot_module.LiveBotWidget()
+    try:
+        tab.config.display_bars = 30
+        base_ts = pd.Timestamp("2026-03-18T10:00:00Z")
+        bars = []
+        for idx in range(31):
+            bars.append(
+                {
+                    "time": base_ts + pd.Timedelta(minutes=5 * idx),
+                    "open": 100.0 - idx * 0.1,
+                    "high": 101.0 - idx * 0.1,
+                    "low": 99.0 - idx * 0.1,
+                    "close": 99.8 - idx * 0.1,
+                    "signal": "SHORT",
+                    "chart_signal": "SHORT" if idx == 0 else None,
+                }
+            )
+        tab._bars = bars
+
+        tab._render_charts()
+
+        marker_offsets = sum(
+            len(collection.get_offsets())
+            for collection in tab.ax_price.collections
+            if isinstance(collection, PathCollection)
+        )
+
+        assert marker_offsets == 30
+    finally:
+        tab.close()
+
+
+def test_live_rescore_marks_chart_signal_on_proposal_direction_changes(monkeypatch, qapp):
+    from ibkr_trading_bot.gui import tab_live_bot as tab_live_bot_module
+
+    monkeypatch.setattr(tab_live_bot_module, "FigureCanvas", StubCanvas)
+    tab = tab_live_bot_module.LiveBotWidget()
+    try:
+        ts1 = pd.Timestamp("2026-03-18T10:00:00Z")
+        ts2 = pd.Timestamp("2026-03-18T10:05:00Z")
+        ts3 = pd.Timestamp("2026-03-18T10:10:00Z")
+        ts4 = pd.Timestamp("2026-03-18T10:15:00Z")
+        tab._bars = [
+            {"time": ts1, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0},
+            {"time": ts2, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0},
+            {"time": ts3, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0},
+            {"time": ts4, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0},
+        ]
+        tab.models = [{"predictor": object(), "label_map": {0: "SHORT", 1: "LONG"}, "t_short": 0.5, "t_long": 0.5}]
+        tab.config.use_and_ensemble = False
+        raw = pd.DataFrame(
+            {
+                "close": [100.0, 100.0, 100.0, 100.0],
+                "atr": [1.0, 1.0, 1.0, 1.0],
+                "ma_fast": [10.0, 10.0, 10.0, 10.0],
+                "ma_slow": [10.0, 10.0, 10.0, 10.0],
+            },
+            index=pd.to_datetime([ts1, ts2, ts3, ts4], utc=True),
+        )
+        outputs = iter([
+            (-1, 0.8, ["SHORT"], [0.8]),
+            (-1, 0.8, ["SHORT"], [0.8]),
+            (0, 0.0, ["FLAT"], [0.0]),
+            (-1, 0.8, ["SHORT"], [0.8]),
+        ])
+
+        monkeypatch.setattr(tab, "_get_raw_indicators", lambda: raw)
+        monkeypatch.setattr(tab, "_sanitize_feature_matrix", lambda feat: feat)
+        monkeypatch.setattr(tab, "_predict_one_label_VOTE", lambda Xrow: next(outputs))
+        monkeypatch.setattr(tab, "_update_position_and_trades", lambda raw_df: None)
+        monkeypatch.setattr(tab, "_track_predictions_for_degradation", lambda raw_df: None)
+        tab._update_settings_display({"exit_policy": "hold_until_opposite"}, {})
+
+        tab._rescore_all()
+
+        assert [bar.get("signal") for bar in tab._bars] == ["SHORT", "SHORT", "SHORT", "SHORT"]
+        assert [bar.get("chart_signal") for bar in tab._bars] == ["SHORT", None, None, "SHORT"]
     finally:
         tab.close()
 
@@ -473,6 +729,45 @@ def test_live_load_models_rejects_mixed_feature_contracts(monkeypatch, qapp, tmp
         qapp.processEvents()
         tab._flush_log_queue()
         assert "Feature kontrakt modelu model_b.pkl nesedi s model_a.pkl." in tab.console.toPlainText()
+    finally:
+        tab.close()
+
+
+def test_live_load_models_rejects_mixed_exit_policy(monkeypatch, qapp, tmp_path):
+    import json
+    import joblib
+
+    from ibkr_trading_bot.gui import tab_live_bot as tab_live_bot_module
+
+    def _write_model(path, exit_policy):
+        joblib.dump(DummyTernaryPredictor(), path)
+        meta = {
+            "created_at": "2026-03-06T12:00:00",
+            "created_at_iso": "2026-03-06T12:00:00",
+            "trained_features": ["feat_a", "feat_b"],
+            "classes": [0, 1, 2],
+            "class_to_dir": {0: "SHORT", 1: "HOLD", 2: "LONG"},
+            "label_mode": "ternary_mapped",
+            "ternary_threshold_short": 0.40,
+            "ternary_threshold_long": 0.60,
+            "metrics_holdout": {"profit_net": 1.0},
+            "user_settings": {"exit_policy": exit_policy},
+        }
+        path.with_name(path.stem + "_meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        return path
+
+    monkeypatch.setattr(tab_live_bot_module, "FigureCanvas", StubCanvas)
+    model_a = _write_model(tmp_path / "model_a.pkl", "legacy_flat")
+    model_b = _write_model(tmp_path / "model_b.pkl", "hold_until_opposite")
+
+    tab = tab_live_bot_module.LiveBotWidget()
+    try:
+        tab.le_model_path.setText(f"{model_a};{model_b}")
+
+        assert tab._load_models() is False
+        qapp.processEvents()
+        tab._flush_log_queue()
+        assert "Exit policy modelu model_b.pkl nesedi s model_a.pkl:" in tab.console.toPlainText()
     finally:
         tab.close()
 
@@ -752,6 +1047,53 @@ def test_live_warm_adapter_builds_history_incrementally_without_duplicates(monke
         tab.close()
 
 
+def test_live_warm_adapter_featurize_until_falls_back_when_indicators_are_empty(monkeypatch, qapp):
+    from ibkr_trading_bot.gui import tab_live_bot as tab_live_bot_module
+
+    monkeypatch.setattr(tab_live_bot_module, "FigureCanvas", StubCanvas)
+    tab = tab_live_bot_module.LiveBotWidget()
+    try:
+        monkeypatch.setattr(tab, "_compute_indicators", lambda df: pd.DataFrame())
+        monkeypatch.setattr(tab, "_sanitize_feature_matrix", lambda df: df.copy())
+        adapter = tab_live_bot_module._WarmAdapter(tab)
+
+        features = adapter.featurize_until(
+            {
+                "time": pd.Timestamp("2026-03-18T10:00:00Z"),
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.5,
+                "volume": 10.0,
+            }
+        )
+
+        assert len(features.index) == 1
+        assert float(features["close"].iloc[-1]) == 100.5
+        assert float(features["ma_fast"].iloc[-1]) == 100.5
+        assert float(features["ma_slow"].iloc[-1]) == 100.5
+    finally:
+        tab.close()
+
+
+def test_live_prepare_x_for_model_accepts_model_label_kwarg(monkeypatch, qapp):
+    from ibkr_trading_bot.gui import tab_live_bot as tab_live_bot_module
+
+    monkeypatch.setattr(tab_live_bot_module, "FigureCanvas", StubCanvas)
+    tab = tab_live_bot_module.LiveBotWidget()
+    try:
+        prepared = tab._prepare_X_for_model(
+            pd.DataFrame({"close": [100.5]}),
+            ["close"],
+            model_label="demo_model.pkl",
+        )
+
+        assert list(prepared.columns) == ["close"]
+        assert float(prepared["close"].iloc[-1]) == 100.5
+    finally:
+        tab.close()
+
+
 def test_live_bot_restores_last_model_paths(monkeypatch, qapp, tmp_path):
     from ibkr_trading_bot.gui import tab_live_bot as tab_live_bot_module
 
@@ -992,6 +1334,8 @@ def test_live_widget_shows_configured_and_connected_client_id_when_fallback_used
 
     tab = tab_live_bot_module.LiveBotWidget()
     try:
+        tab.on_tab_activated()
+        qapp.processEvents()
         tooltip = tab.lbl_broker_status.toolTip()
         assert tab.lbl_broker_status.text() == "Broker: PAPER OK (DU123456)"
         assert "clientId=2" in tooltip
@@ -1015,6 +1359,7 @@ def test_live_widget_restores_service_backed_mode_and_trades(monkeypatch, qapp, 
             timeframe=(self.config.bar_size or "5 min").strip(),
             entry_threshold=float(self._curr_entry_thr),
             exit_threshold=float(self._curr_exit_thr),
+            exit_policy="hold_until_opposite",
             use_ma_alignment=bool(self.config.use_and_ensemble),
             freshness_timeout_sec=max(60, int(self.config.max_fresh_age_min) * 60),
             session_root=tmp_path,

@@ -46,11 +46,11 @@ def test_pick_ternary_direction_from_raw_proba_matches_reordered_classes():
 	assert confidence == 0.80
 
 
-def test_apply_entry_exit_thresholds_flats_low_confidence_predictions():
+def test_apply_entry_exit_thresholds_defaults_to_flat_on_weak_signal():
 	raw = np.array([1, -1, 1, 0])
 	conf = np.array([0.8, 0.4, 0.55, 0.9])
 	out = apply_entry_exit_thresholds(raw, conf, entry_threshold=0.5, exit_threshold=0.6)
-	assert out.tolist() == [1, 1, 1, 1]
+	assert out.tolist() == [1.0, 0.0, 0.0, 0.0]
 
 
 def test_apply_entry_exit_thresholds_supports_legacy_flat_exit_policy():
@@ -60,28 +60,40 @@ def test_apply_entry_exit_thresholds_supports_legacy_flat_exit_policy():
 	assert out.tolist() == [1.0, 0.0, 0.0, 0.0]
 
 
+def test_apply_entry_exit_thresholds_supports_hold_until_opposite_policy():
+	raw = np.array([1, -1, 1, 0])
+	conf = np.array([0.8, 0.4, 0.55, 0.9])
+	out = apply_entry_exit_thresholds(raw, conf, entry_threshold=0.5, exit_threshold=0.6, exit_policy="hold_until_opposite")
+	assert out.tolist() == [1, 1, 1, 1]
+
+
 def test_build_live_proposal_respects_ma_alignment():
 	assert build_live_proposal("LONG", "LONG", True) == "LONG"
 	assert build_live_proposal("SHORT", "LONG", True) is None
 	assert build_live_proposal("SHORT", "LONG", False) == "LONG"
 
 
-def test_apply_live_hysteresis_requires_confirmation_for_current_direction():
+def test_apply_live_hysteresis_defaults_to_flat_on_weak_signal():
 	assert apply_live_hysteresis("LONG", 0.70, 0, 0.60, 0.50) == "LONG"
-	assert apply_live_hysteresis("SHORT", 0.70, 1, 0.60, 0.50) == "SHORT"
-	assert apply_live_hysteresis("LONG", 0.40, 1, 0.60, 0.50) == "LONG"
+	assert apply_live_hysteresis("SHORT", 0.70, 1, 0.60, 0.50) is None
+	assert apply_live_hysteresis("LONG", 0.40, 1, 0.60, 0.50) is None
 	assert apply_live_hysteresis("LONG", 0.55, 1, 0.60, 0.50) == "LONG"
+
+
+def test_apply_live_hysteresis_supports_hold_until_opposite_policy():
+	assert apply_live_hysteresis("SHORT", 0.70, 1, 0.60, 0.50, exit_policy="hold_until_opposite") == "SHORT"
+	assert apply_live_hysteresis("LONG", 0.40, 1, 0.60, 0.50, exit_policy="hold_until_opposite") == "LONG"
 
 
 def test_evaluate_live_policy_returns_specific_exit_reasons():
 	decision = evaluate_live_policy("LONG", "LONG", True, 0.40, 1, 0.60, 0.50)
-	assert decision.final_signal == "LONG"
-	assert decision.reason == "hold_same_signal"
-	assert decision.close_reason is None
+	assert decision.final_signal is None
+	assert decision.reason == "exit_low_confidence"
+	assert decision.close_reason == "low_confidence"
 
 	decision = evaluate_live_policy("LONG", "SHORT", False, 0.90, 1, 0.60, 0.50)
-	assert decision.final_signal == "SHORT"
-	assert decision.reason == "flip_confirmed"
+	assert decision.final_signal is None
+	assert decision.reason == "exit_opposite_signal"
 	assert decision.close_reason == "opposite_signal"
 
 
@@ -90,6 +102,18 @@ def test_evaluate_live_policy_legacy_mode_preserves_flat_exit_behavior():
 	assert decision.final_signal is None
 	assert decision.reason == "exit_low_confidence"
 	assert decision.close_reason == "low_confidence"
+
+
+def test_evaluate_live_policy_hold_until_opposite_preserves_hold_behavior():
+	decision = evaluate_live_policy("LONG", "LONG", True, 0.40, 1, 0.60, 0.50, exit_policy="hold_until_opposite")
+	assert decision.final_signal == "LONG"
+	assert decision.reason == "hold_same_signal"
+	assert decision.close_reason is None
+
+	decision = evaluate_live_policy("LONG", "SHORT", False, 0.90, 1, 0.60, 0.50, exit_policy="hold_until_opposite")
+	assert decision.final_signal == "SHORT"
+	assert decision.reason == "flip_confirmed"
+	assert decision.close_reason == "opposite_signal"
 
 
 def test_normalize_signal_array_accepts_text_and_numbers():

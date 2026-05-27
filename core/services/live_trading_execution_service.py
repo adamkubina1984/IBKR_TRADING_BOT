@@ -20,7 +20,7 @@ from .live import (
     RuntimeState,
     RuntimeStateStore,
 )
-from .signal_policy import DEFAULT_EXIT_POLICY, LivePolicyDecision, evaluate_live_policy
+from .signal_policy import DEFAULT_EXIT_POLICY, LivePolicyDecision, evaluate_live_policy, resolve_exit_policy_setting
 from .trade_executor import TradeExecutor, TradeState, TradeStepResult
 
 ServiceMode = Literal["OBSERVE", "LIVE", "WARNING", "SAFE_STOP", "EMERGENCY_STOP"]
@@ -105,6 +105,11 @@ class LiveTradingExecutionConfig:
             raise ValueError("safe_stop_ratio must be in (0, 1].")
         if not 0.0 < float(self.warning_enter_ratio) <= float(self.warning_exit_ratio) <= 1.0:
             raise ValueError("warning ratios must satisfy 0 < enter <= exit <= 1.")
+        object.__setattr__(
+            self,
+            "exit_policy",
+            resolve_exit_policy_setting(self.exit_policy, default=DEFAULT_EXIT_POLICY),
+        )
 
 
 @dataclass(frozen=True)
@@ -424,11 +429,14 @@ class LiveTradingExecutionService:
             restored = RuntimeState()
         else:
             restored = RuntimeState()
+        extra = dict(restored.extra)
+        extra["exit_policy"] = self.config.exit_policy
         return replace(
             restored,
             strategy_id=restored.strategy_id or self.config.strategy_id,
             instrument=restored.instrument or self.config.instrument,
             timeframe=restored.timeframe or self.config.timeframe,
+            extra=extra,
         )
 
     def _capture_baseline_if_missing(self, baseline_profit_per_bar: float | None, timestamp: str) -> None:
@@ -450,9 +458,7 @@ class LiveTradingExecutionService:
             return target_signal, decision.reason
         if current_direction is None:
             return None, "observe_mode_block_entry"
-        if target_signal in {"LONG", "SHORT"} and target_signal != current_direction:
-            return None, "controlled_disarm_exit"
-        return current_direction, decision.reason
+        return None, "controlled_disarm_exit"
 
     def _position_from_executor(self) -> PositionState:
         quantity = self.state.position.quantity if self.state.position.side != "FLAT" else self.config.order_quantity
@@ -557,9 +563,11 @@ class LiveTradingExecutionService:
     def _append_event(self, event_type: str, payload: dict[str, Any], *, occurred_at: str | None = None) -> None:
         if self.journal is None:
             return
+        enriched_payload = dict(payload)
+        enriched_payload.setdefault("exit_policy", self.config.exit_policy)
         self.journal.append_event(
             event_type,
-            payload=payload,
+            payload=enriched_payload,
             occurred_at=occurred_at or _utcnow_iso(),
             instrument=self.config.instrument,
             strategy_id=self.config.strategy_id,
@@ -575,6 +583,7 @@ class LiveTradingExecutionService:
                 "rolling_bar_pnls": list(self._rolling_bar_pnls),
                 "ewma_profit_per_bar": self._ewma_profit_per_bar,
                 "last_mark_price": self._last_mark_price,
+                "exit_policy": self.config.exit_policy,
             }
         )
         persisted = replace(

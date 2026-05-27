@@ -15,6 +15,7 @@ sys.path.insert(0, repo_root)
 
 from ibkr_trading_bot.core.services.live import TwsConnectionConfig
 from ibkr_trading_bot.core.services.live_service_controller import LiveServiceController
+from ibkr_trading_bot.core.services.signal_policy import DEFAULT_EXIT_POLICY
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -33,6 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeframe", default="5 min", help="Timeframe label stored in journal/state.")
     parser.add_argument("--entry-threshold", type=float, default=0.55, help="Policy entry threshold for the smoke run.")
     parser.add_argument("--exit-threshold", type=float, default=0.50, help="Policy exit threshold for the smoke run.")
+    parser.add_argument("--exit-policy", default=DEFAULT_EXIT_POLICY, help="Exit policy used for the smoke run.")
     parser.add_argument("--freshness-timeout-sec", type=int, default=300, help="Freshness timeout passed to the controller.")
     parser.add_argument(
         "--baseline-profit-per-bar",
@@ -85,6 +87,7 @@ def build_controller(args: argparse.Namespace) -> LiveServiceController:
         timeframe=args.timeframe,
         entry_threshold=args.entry_threshold,
         exit_threshold=args.exit_threshold,
+        exit_policy=args.exit_policy,
         use_ma_alignment=False,
         freshness_timeout_sec=args.freshness_timeout_sec,
         session_root=Path(args.session_root),
@@ -99,6 +102,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"SMOKE_SESSION_DIR={controller.session_dir.as_posix()}")
     print(f"SMOKE_EXECUTION_MODE={controller.execution_mode}")
+    print(f"SMOKE_EXIT_POLICY={controller.exit_policy}")
     print(f"SMOKE_BROKER_CHECK_ENABLED={int(bool(args.paper_broker_check))}")
 
     if args.paper_broker_check:
@@ -153,12 +157,18 @@ def main(argv: list[str] | None = None) -> int:
         101.0,
         signal="SHORT",
     )
+    third = controller.process_closed_bar(
+        "2026-04-29T12:40:00Z",
+        100.5,
+        signal="SHORT",
+    )
     trades = controller.list_closed_trades()
     controller.stop_session()
 
     first_action = first.trade_result.action if first.trade_result is not None else "NONE"
     second_action = second.trade_result.action if second.trade_result is not None else "NONE"
-    print(f"SMOKE_ACTIONS={first_action},{second_action}")
+    third_action = third.trade_result.action if third.trade_result is not None else "NONE"
+    print(f"SMOKE_ACTIONS={first_action},{second_action},{third_action}")
     print(f"SMOKE_FINAL_MODE={controller.status.mode}")
     print(f"SMOKE_FINAL_POSITION={controller.status.runtime_state.position.side}")
     print(f"SMOKE_CLOSED_TRADES={len(trades)}")
@@ -169,8 +179,11 @@ def main(argv: list[str] | None = None) -> int:
     if len(trades) != 1:
         print("ERROR: expected exactly one closed trade in deterministic smoke run")
         return 4
-    if second_action != "FLIP_TO_SHORT":
-        print(f"ERROR: expected second action FLIP_TO_SHORT, got {second_action}")
+    if second_action != "EXIT_LONG":
+        print(f"ERROR: expected second action EXIT_LONG, got {second_action}")
+        return 5
+    if third_action != "ENTRY_SHORT":
+        print(f"ERROR: expected third action ENTRY_SHORT, got {third_action}")
         return 5
     if controller.execution_mode != "PAPER":
         print(f"ERROR: expected controller to remain in PAPER mode, got {controller.execution_mode}")
@@ -196,9 +209,9 @@ def main(argv: list[str] | None = None) -> int:
             f"got {restored_status.runtime_state.position.side}"
         )
         return 8
-    if restored_status.runtime_state.last_processed_closed_bar_at != "2026-04-29T12:35:00+00:00":
+    if restored_status.runtime_state.last_processed_closed_bar_at != "2026-04-29T12:40:00+00:00":
         print(
-            "ERROR: expected restored last_processed_closed_bar_at 2026-04-29T12:35:00+00:00, "
+            "ERROR: expected restored last_processed_closed_bar_at 2026-04-29T12:40:00+00:00, "
             f"got {restored_status.runtime_state.last_processed_closed_bar_at}"
         )
         return 9

@@ -25,16 +25,17 @@ def test_run_live_paper_smoke_main_reports_blocked_real_mode_and_closed_trade(tm
 
     assert exit_code == 0
     assert "SMOKE_EXECUTION_MODE=PAPER" in output
+    assert "SMOKE_EXIT_POLICY=flat_on_weak_signal" in output
     assert "SMOKE_GATE_ALLOWED=0" in output
     assert "SMOKE_REAL_BLOCKED=1" in output
     assert "AUTOMATED_TESTS_FAILED" in output
-    assert "SMOKE_ACTIONS=ENTRY_LONG,FLIP_TO_SHORT" in output
+    assert "SMOKE_ACTIONS=ENTRY_LONG,EXIT_LONG,ENTRY_SHORT" in output
     assert "SMOKE_CLOSED_TRADES=1" in output
     assert "SMOKE_FIRST_TRADE_PNL=1.0" in output
     assert "SMOKE_FINAL_POSITION=SHORT" in output
     assert "SMOKE_RESTORE_POSITION=SHORT" in output
     assert "SMOKE_RESTORE_CLOSED_TRADES=1" in output
-    assert "SMOKE_RESTORE_LAST_PROCESSED_BAR=2026-04-29T12:35:00+00:00" in output
+    assert "SMOKE_RESTORE_LAST_PROCESSED_BAR=2026-04-29T12:40:00+00:00" in output
     assert "SMOKE_OK" in output
 
 
@@ -63,6 +64,7 @@ def test_run_live_paper_smoke_main_reports_connected_broker_when_enabled(tmp_pat
             timeframe=args.timeframe,
             entry_threshold=args.entry_threshold,
             exit_threshold=args.exit_threshold,
+            exit_policy=args.exit_policy,
             use_ma_alignment=False,
             freshness_timeout_sec=args.freshness_timeout_sec,
             session_root=Path(args.session_root),
@@ -95,6 +97,7 @@ def test_run_live_paper_smoke_main_reports_connected_broker_when_enabled(tmp_pat
 
     assert exit_code == 0
     assert "SMOKE_BROKER_CHECK_ENABLED=1" in output
+    assert "SMOKE_EXIT_POLICY=flat_on_weak_signal" in output
     assert "SMOKE_BROKER_PORT=7497" in output
     assert "SMOKE_BROKER_CLIENT_ID=1" in output
     assert "SMOKE_BROKER_ACCOUNT=DU123456" in output

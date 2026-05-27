@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from ibkr_trading_bot.core.services.live import ExecutionJournal, RuntimeStateStore
@@ -128,3 +130,17 @@ def test_service_restores_runtime_state_on_restart(tmp_path):
     assert restored.status.runtime_state.position.side == "LONG"
     assert restored.status.runtime_state.baseline is not None
     assert restored.status.mode == "LIVE"
+
+
+def test_service_persists_exit_policy_into_runtime_state_and_journal(tmp_path):
+    service = _make_service(tmp_path, min_bars_for_health=10, exit_policy="legacy_flat_exit")
+    service.arm_trading(baseline_profit_per_bar=0.8, actor="tester")
+    service.process_closed_bar("2026-04-29T12:30:00Z", 100.0, model_direction="LONG", confidence=1.0)
+
+    state_payload = json.loads((tmp_path / "runtime.state.json").read_text(encoding="utf-8"))
+    journal_lines = (tmp_path / "execution.journal.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    journal_payloads = [json.loads(line) for line in journal_lines if line.strip()]
+
+    assert state_payload["extra"]["exit_policy"] == "flat_on_weak_signal"
+    assert journal_payloads
+    assert all(event["payload"].get("exit_policy") == "flat_on_weak_signal" for event in journal_payloads)
