@@ -1,3 +1,5 @@
+import csv
+import json
 import uuid
 from pathlib import Path
 
@@ -9,13 +11,11 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from ibkr_trading_bot.core.services import model_eval_service as model_eval_runtime
-from ibkr_trading_bot.core.services.model_training_service import dataset_snapshot_signature_from_csv
 from ibkr_trading_bot.core.services.model_service import read_sidecar_model_meta, write_sidecar_model_meta
 from ibkr_trading_bot.data.generate_synthetic import generate_synthetic_data
 from ibkr_trading_bot.gui import tab_model_ranking as tab_model_ranking_module
 from ibkr_trading_bot.gui.tab_model_ranking import (
     COL_BIAS,
-    COL_CHECK,
     COL_MODE,
     COL_NOTE,
     COL_PROFIT,
@@ -56,10 +56,18 @@ def qapp():
     return app
 
 
-def _ranking_payload(csv_path: Path, *, fee: float, profit_h: float, trades_h: float) -> dict[str, object]:
+def _ranking_payload(
+    csv_path: Path,
+    *,
+    fee: float,
+    profit_h: float,
+    trades_h: float,
+    metadata: dict[str, object] | None = None,
+) -> dict[str, object]:
     return model_eval_runtime.build_tab5_holdout_ranking_payload(
         data_path=csv_path,
         fee_per_trade=fee,
+        metadata=metadata,
         entry_threshold=0.55,
         exit_threshold=0.60,
         metrics={"profit_net": profit_h, "max_dd": -10.0, "trades": trades_h},
@@ -87,6 +95,7 @@ def _write_ranked_model(
     exchange: str = "COMEX",
     timeframe: str = "5m",
     training_mode: str | None = None,
+    candidate_selection_criterion: str | None = None,
     user_note: str | None = None,
     trained_features: list[str] | None = None,
     feature_stability: dict[str, object] | None = None,
@@ -118,6 +127,8 @@ def _write_ranked_model(
     }
     if training_mode:
         meta["training_mode"] = str(training_mode)
+    if candidate_selection_criterion:
+        meta["candidate_selection_criterion"] = str(candidate_selection_criterion)
     if user_note:
         meta["model_ranking_note"] = str(user_note)
     if feature_stability is not None:
@@ -140,6 +151,7 @@ def _write_ranked_model(
             fee=fee,
             profit_h=optimized_profit,
             trades_h=trades_h,
+            metadata=meta,
         )
     else:
         meta[model_eval_runtime.TAB5_HOLDOUT_RANKING_KEY] = {
@@ -253,9 +265,32 @@ def test_set_and_get_tab5_holdout_ranking_by_policy_bucket():
         exit_policy="flat_on_neutral",
     )
 
-    assert stored["exit_policy"] == "legacy_flat_exit"
+    assert stored["exit_policy"] == "flat_on_weak_signal"
     assert model_eval_runtime.get_tab5_holdout_ranking(meta, exit_policy="flat_on_neutral") == stored
     assert model_eval_runtime.get_tab5_holdout_ranking(meta, exit_policy="hold_until_opposite") is None
+
+
+def test_policy_specific_lookup_rejects_legacy_ranking_without_exit_policy(tmp_path: Path):
+    csv_path = tmp_path / "features.csv"
+    csv_path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+
+    ranking = model_eval_runtime.build_tab5_holdout_ranking_payload(
+        data_path=csv_path,
+        fee_per_trade=0.25,
+        entry_threshold=0.34,
+        exit_threshold=0.41,
+        metrics={"profit_net": 12.5, "max_dd": -5.0, "trades": 9},
+        status="ok",
+    )
+    ranking.pop("exit_policy", None)
+    meta = {model_eval_runtime.TAB5_HOLDOUT_RANKING_KEY: ranking}
+
+    assert model_eval_runtime.get_tab5_holdout_ranking(meta, exit_policy="flat_on_weak_signal") is None
+    assert model_eval_runtime.is_tab5_holdout_ranking_stale(
+        meta,
+        data_path=csv_path,
+        fee_per_trade=0.25,
+    ) is True
 
 
 def test_discover_ranking_models_sorts_optimized_then_fallback_then_error():
@@ -414,7 +449,139 @@ def test_manual_recompute_skips_fresh_ok_models(monkeypatch, qapp):
             lambda **kwargs: captured.update(kwargs),
         )
 
-        tab._on_recompute_all_clicked()
+        tab._on_recompute_profit_opt_clicked()
+
+        assert [record.model_path.name for record in captured["records"]] == ["pending.pkl"]
+        assert captured["context"] == context
+        assert captured["full_recompute"] is False
+    finally:
+        tab.close()
+
+
+def test_recompute_profit_opt_uses_only_checked_pending_models(monkeypatch, qapp):
+    tmp_path = Path(".codex_test_tmp") / f"tab5_rank_checked_manual_{uuid.uuid4().hex}"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    csv_path = tmp_path / "features.csv"
+    csv_path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+
+    fresh_model = tmp_path / "fresh.pkl"
+    fresh_model.write_bytes(b"fresh")
+    fresh_meta = {"created_at": "2026-03-16T10:00:00"}
+    fresh_meta[model_eval_runtime.TAB5_HOLDOUT_RANKING_KEY] = model_eval_runtime.build_tab5_holdout_ranking_payload(
+        data_path=csv_path,
+        fee_per_trade=0.25,
+        entry_threshold=0.34,
+        exit_threshold=0.41,
+        metrics={"profit_net": 12.5, "max_dd": -5.0, "trades": 9},
+        status="ok",
+    )
+    write_sidecar_model_meta(fresh_model, fresh_meta)
+
+    pending_model = tmp_path / "pending.pkl"
+    pending_model.write_bytes(b"pending")
+    write_sidecar_model_meta(
+        pending_model,
+        {
+            "created_at": "2026-03-16T09:00:00",
+            "metrics_holdout": {"profit_net": 1.0},
+        },
+    )
+
+    other_pending_model = tmp_path / "other_pending.pkl"
+    other_pending_model.write_bytes(b"other")
+    write_sidecar_model_meta(
+        other_pending_model,
+        {
+            "created_at": "2026-03-16T08:00:00",
+            "metrics_holdout": {"profit_net": 2.0},
+        },
+    )
+
+    monkeypatch.setattr("ibkr_trading_bot.gui.tab_model_ranking.DEFAULT_MODEL_DIR", tmp_path)
+
+    tab = ModelRankingTab()
+    try:
+        captured = {}
+        context = {
+            "data_path": str(csv_path),
+            "fee_per_trade": 0.25,
+            "entry_threshold": 0.60,
+            "exit_threshold": 0.70,
+        }
+        monkeypatch.setattr(tab, "_current_eval_context", lambda: context)
+        monkeypatch.setattr(
+            tab,
+            "_start_batch_worker",
+            lambda **kwargs: captured.update(kwargs),
+        )
+
+        for row in range(tab.tbl.rowCount()):
+            model_item = tab.tbl.item(row, 0)
+            check_item = tab.tbl.item(row, tab_model_ranking_module.COL_CHECK)
+            if model_item is None or check_item is None:
+                continue
+            if model_item.text() == "pending.pkl":
+                check_item.setCheckState(Qt.Checked)
+                break
+        qapp.processEvents()
+
+        tab._on_recompute_profit_opt_clicked()
+
+        assert [record.model_path.name for record in captured["records"]] == ["pending.pkl"]
+        assert captured["context"] == context
+        assert captured["full_recompute"] is False
+    finally:
+        tab.close()
+
+
+def test_incremental_recompute_skips_fresh_ok_models(monkeypatch, qapp):
+    tmp_path = Path(".codex_test_tmp") / f"tab5_rank_incremental_{uuid.uuid4().hex}"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    csv_path = tmp_path / "features.csv"
+    csv_path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+
+    fresh_model = tmp_path / "fresh.pkl"
+    fresh_model.write_bytes(b"fresh")
+    fresh_meta = {"created_at": "2026-03-16T10:00:00"}
+    fresh_meta[model_eval_runtime.TAB5_HOLDOUT_RANKING_KEY] = model_eval_runtime.build_tab5_holdout_ranking_payload(
+        data_path=csv_path,
+        fee_per_trade=0.25,
+        entry_threshold=0.34,
+        exit_threshold=0.41,
+        metrics={"profit_net": 12.5, "max_dd": -5.0, "trades": 9},
+        status="ok",
+    )
+    write_sidecar_model_meta(fresh_model, fresh_meta)
+
+    pending_model = tmp_path / "pending.pkl"
+    pending_model.write_bytes(b"pending")
+    write_sidecar_model_meta(
+        pending_model,
+        {
+            "created_at": "2026-03-16T09:00:00",
+            "metrics_holdout": {"profit_net": 1.0},
+        },
+    )
+
+    monkeypatch.setattr("ibkr_trading_bot.gui.tab_model_ranking.DEFAULT_MODEL_DIR", tmp_path)
+
+    tab = ModelRankingTab()
+    try:
+        captured = {}
+        context = {
+            "data_path": str(csv_path),
+            "fee_per_trade": 0.25,
+            "entry_threshold": 0.60,
+            "exit_threshold": 0.70,
+        }
+        monkeypatch.setattr(tab, "_current_eval_context", lambda: context)
+        monkeypatch.setattr(
+            tab,
+            "_start_batch_worker",
+            lambda **kwargs: captured.update(kwargs),
+        )
+
+        tab._start_incremental_if_needed()
 
         assert [record.model_path.name for record in captured["records"]] == ["pending.pkl"]
         assert captured["context"] == context
@@ -456,6 +623,8 @@ def test_ranking_task_prepares_datasets_per_model_contract(monkeypatch, tmp_path
         },
     }
     load_calls: list[tuple[int, float, float]] = []
+    search_calls: list[dict[str, object]] = []
+    recalc_calls: list[dict[str, object]] = []
 
     def fake_load_predictor_with_merged_meta(model_path):
         meta = dict(metas[str(model_path)])
@@ -505,17 +674,23 @@ def test_ranking_task_prepares_datasets_per_model_contract(monkeypatch, tmp_path
     monkeypatch.setattr(
         model_eval_runtime,
         "run_auto_threshold_search_from_context",
-        lambda **kwargs: model_eval_runtime.AutoThresholdPayload(
-            best_entry=0.61,
-            best_exit=0.72,
-            best_score=12.0,
-            best_metrics={"profit_net": 12.0, "trades": 1},
-        ),
+        lambda **kwargs: (
+            search_calls.append(kwargs),
+            model_eval_runtime.AutoThresholdPayload(
+                best_entry=0.61,
+                best_exit=0.72,
+                best_score=12.0,
+                best_metrics={"profit_net": 12.0, "trades": 1},
+            ),
+        )[1],
     )
     monkeypatch.setattr(
         model_eval_runtime,
         "recalculate_metrics_from_predictions",
-        lambda **kwargs: (np.asarray([1]), {"profit_net": 12.0, "max_dd": -1.0, "trades": 1}),
+        lambda **kwargs: (
+            recalc_calls.append(kwargs),
+            (np.asarray([1]), {"profit_net": 12.0, "max_dd": -1.0, "trades": 1}),
+        )[1],
     )
     monkeypatch.setattr(tab_model_ranking_module, "read_sidecar_model_meta", lambda path: {})
     monkeypatch.setattr(tab_model_ranking_module, "write_sidecar_model_meta", lambda path, meta: None)
@@ -535,9 +710,13 @@ def test_ranking_task_prepares_datasets_per_model_contract(monkeypatch, tmp_path
         (8, 50.0, 40.0),
         (12, 60.0, 45.0),
     ]
+    assert len(search_calls) == 3
+    assert len(recalc_calls) == 3
+    assert all(kwargs["exit_policy"] == "hold_to_flip" for kwargs in search_calls)
+    assert all(kwargs["exit_policy"] == "hold_to_flip" for kwargs in recalc_calls)
 
 
-def test_recompute_filtered_uses_only_visible_pending_models(monkeypatch, qapp):
+def test_recompute_profit_opt_uses_only_visible_pending_models_when_filter_is_active(monkeypatch, qapp):
     tmp_path = Path(".codex_test_tmp") / f"tab5_rank_recompute_filtered_{uuid.uuid4().hex}"
     tmp_path.mkdir(parents=True, exist_ok=True)
     csv_path = tmp_path / "features.csv"
@@ -576,7 +755,7 @@ def test_recompute_filtered_uses_only_visible_pending_models(monkeypatch, qapp):
 
         tab.set_bias_filter("tight")
         qapp.processEvents()
-        tab._on_recompute_filtered_clicked()
+        tab._on_recompute_profit_opt_clicked()
 
         assert [record.model_path.name for record in captured["records"]] == ["tight_pending.pkl"]
         assert captured["context"] == context
@@ -585,25 +764,27 @@ def test_recompute_filtered_uses_only_visible_pending_models(monkeypatch, qapp):
         tab.close()
 
 
-def test_recompute_checked_uses_only_checked_pending_models(monkeypatch, qapp):
-    tmp_path = Path(".codex_test_tmp") / f"tab5_rank_recompute_checked_{uuid.uuid4().hex}"
+def test_recompute_profit_opt_uses_only_mode_filtered_pending_models(monkeypatch, qapp):
+    tmp_path = Path(".codex_test_tmp") / f"tab5_rank_recompute_mode_filter_{uuid.uuid4().hex}"
     tmp_path.mkdir(parents=True, exist_ok=True)
     csv_path = tmp_path / "features.csv"
     csv_path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
 
     _write_ranked_model(
         tmp_path,
-        "checked_pending.pkl",
+        "filtered_pending.pkl",
         csv_path=csv_path,
         n_total_bars=44268,
         ranking_status="error",
+        training_mode="explore",
     )
     _write_ranked_model(
         tmp_path,
-        "unchecked_pending.pkl",
+        "other_pending.pkl",
         csv_path=csv_path,
         n_total_bars=44268,
         ranking_status="error",
+        training_mode="refresh",
     )
 
     monkeypatch.setattr("ibkr_trading_bot.gui.tab_model_ranking.DEFAULT_MODEL_DIR", tmp_path)
@@ -620,12 +801,145 @@ def test_recompute_checked_uses_only_checked_pending_models(monkeypatch, qapp):
         monkeypatch.setattr(tab, "_current_eval_context", lambda: context)
         monkeypatch.setattr(tab, "_start_batch_worker", lambda **kwargs: captured.update(kwargs))
 
-        check_item = tab.tbl.item(0, COL_CHECK)
-        assert check_item is not None
-        check_item.setCheckState(Qt.Checked)
+        tab.set_mode_filter(["Explore"])
+        qapp.processEvents()
+        tab._on_recompute_profit_opt_clicked()
+
+        assert [record.model_path.name for record in captured["records"]] == ["filtered_pending.pkl"]
+        assert captured["context"] == context
+        assert captured["full_recompute"] is False
+    finally:
+        tab.close()
+
+
+def test_recompute_profit_opt_ignores_row_selection_when_filter_is_active(monkeypatch, qapp):
+    tmp_path = Path(".codex_test_tmp") / f"tab5_rank_recompute_row_selection_{uuid.uuid4().hex}"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    csv_path = tmp_path / "features.csv"
+    csv_path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+
+    _write_ranked_model(
+        tmp_path,
+        "selected_pending.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        ranking_status="error",
+        per_class_3={"-1": {"recall": 0.31}, "1": {"recall": 0.29}},
+    )
+    _write_ranked_model(
+        tmp_path,
+        "other_filtered_pending.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        ranking_status="error",
+        per_class_3={"-1": {"recall": 0.32}, "1": {"recall": 0.30}},
+    )
+    _write_ranked_model(
+        tmp_path,
+        "filtered_out_pending.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        ranking_status="error",
+        per_class_3={"-1": {"recall": 0.61}, "1": {"recall": 0.09}},
+    )
+
+    monkeypatch.setattr("ibkr_trading_bot.gui.tab_model_ranking.DEFAULT_MODEL_DIR", tmp_path)
+
+    tab = ModelRankingTab()
+    try:
+        captured = {}
+        context = {
+            "data_path": str(csv_path),
+            "fee_per_trade": 0.25,
+            "entry_threshold": 0.60,
+            "exit_threshold": 0.70,
+        }
+        monkeypatch.setattr(tab, "_current_eval_context", lambda: context)
+        monkeypatch.setattr(tab, "_start_batch_worker", lambda **kwargs: captured.update(kwargs))
+
+        tab.set_bias_filter("tight")
+        qapp.processEvents()
+        selected_row = None
+        for row in range(tab.tbl.rowCount()):
+            item = tab.tbl.item(row, 0)
+            if item is not None and item.text() == "selected_pending.pkl":
+                selected_row = row
+                break
+        assert selected_row is not None
+        tab.tbl.selectRow(selected_row)
         qapp.processEvents()
 
-        tab._on_recompute_checked_clicked()
+        tab._on_recompute_profit_opt_clicked()
+
+        assert {record.model_path.name for record in captured["records"]} == {
+            "selected_pending.pkl",
+            "other_filtered_pending.pkl",
+        }
+        assert captured["context"] == context
+        assert captured["full_recompute"] is False
+    finally:
+        tab.close()
+
+
+def test_recompute_profit_opt_prefers_checked_models_over_filtered_scope(monkeypatch, qapp):
+    tmp_path = Path(".codex_test_tmp") / f"tab5_rank_recompute_checked_{uuid.uuid4().hex}"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    csv_path = tmp_path / "features.csv"
+    csv_path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+
+    _write_ranked_model(
+        tmp_path,
+        "checked_pending.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        ranking_status="error",
+        per_class_3={"-1": {"recall": 0.31}, "1": {"recall": 0.29}},
+    )
+    _write_ranked_model(
+        tmp_path,
+        "other_filtered_pending.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        ranking_status="error",
+        per_class_3={"-1": {"recall": 0.32}, "1": {"recall": 0.30}},
+    )
+    _write_ranked_model(
+        tmp_path,
+        "filtered_out_pending.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        ranking_status="error",
+        per_class_3={"-1": {"recall": 0.61}, "1": {"recall": 0.09}},
+    )
+
+    monkeypatch.setattr("ibkr_trading_bot.gui.tab_model_ranking.DEFAULT_MODEL_DIR", tmp_path)
+
+    tab = ModelRankingTab()
+    try:
+        captured = {}
+        context = {
+            "data_path": str(csv_path),
+            "fee_per_trade": 0.25,
+            "entry_threshold": 0.60,
+            "exit_threshold": 0.70,
+        }
+        monkeypatch.setattr(tab, "_current_eval_context", lambda: context)
+        monkeypatch.setattr(tab, "_start_batch_worker", lambda **kwargs: captured.update(kwargs))
+
+        tab.set_bias_filter("tight")
+        qapp.processEvents()
+
+        for row in range(tab.tbl.rowCount()):
+            model_item = tab.tbl.item(row, 0)
+            check_item = tab.tbl.item(row, tab_model_ranking_module.COL_CHECK)
+            if model_item is None or check_item is None:
+                continue
+            if model_item.text() == "checked_pending.pkl":
+                check_item.setCheckState(Qt.Checked)
+                break
+        qapp.processEvents()
+
+        tab._on_recompute_profit_opt_clicked()
 
         assert [record.model_path.name for record in captured["records"]] == ["checked_pending.pkl"]
         assert captured["context"] == context
@@ -680,7 +994,7 @@ def test_context_change_does_not_auto_start_ranking_batch(monkeypatch, qapp):
         tab._tick()
 
         assert calls["auto"] == 0
-        assert "klikni 'Prepocitat Profit(H)'" in tab.lbl_status.text()
+        assert "klikni 'Prepocitat neaktualni (H opt)'" in tab.lbl_status.text()
     finally:
         tab.close()
 
@@ -704,17 +1018,17 @@ def test_ranking_table_shows_training_mode_and_persists_note(monkeypatch, qapp):
 
     tab = ModelRankingTab()
     try:
-        assert tab.tbl.item(0, COL_MODE).text() == "standard"
+        assert tab.tbl.item(0, COL_MODE).text() == "Refine"
         assert tab.tbl.item(0, COL_NOTE).text() == "puvodni poznamka"
 
         note_item = tab.tbl.item(0, COL_NOTE)
         assert note_item is not None
-        note_item.setText("  favorit do strictu  ")
+        note_item.setText("  kandidat k revizi  ")
         qapp.processEvents()
 
         reloaded = read_sidecar_model_meta(model_path)
-        assert reloaded["model_ranking_note"] == "favorit do strictu"
-        assert tab.tbl.item(0, COL_NOTE).text() == "favorit do strictu"
+        assert reloaded["model_ranking_note"] == "kandidat k revizi"
+        assert tab.tbl.item(0, COL_NOTE).text() == "kandidat k revizi"
     finally:
         tab.close()
 
@@ -1001,6 +1315,920 @@ def test_ranking_stability_filter_applies_thresholds(monkeypatch, qapp):
         tab.close()
 
 
+def test_ranking_mode_filter_applies_selected_modes(monkeypatch, qapp):
+    tmp_path = Path(".codex_test_tmp") / f"tab5_rank_mode_filter_{uuid.uuid4().hex}"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    csv_path = tmp_path / "features.csv"
+    csv_path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+
+    _write_ranked_model(
+        tmp_path,
+        "alpha.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        optimized_profit=610.0,
+        training_mode="explore",
+    )
+    _write_ranked_model(
+        tmp_path,
+        "beta.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        optimized_profit=620.0,
+        training_mode="refresh",
+    )
+    _write_ranked_model(
+        tmp_path,
+        "gamma.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        optimized_profit=630.0,
+        training_mode="explore",
+    )
+
+    monkeypatch.setattr("ibkr_trading_bot.gui.tab_model_ranking.DEFAULT_MODEL_DIR", tmp_path)
+
+    tab = ModelRankingTab()
+    try:
+        assert tab.tbl.rowCount() == 3
+
+        tab.set_mode_filter(["Explore"])
+        qapp.processEvents()
+
+        assert tab.tbl.rowCount() == 2
+        assert {tab.tbl.item(row, 0).text() for row in range(tab.tbl.rowCount())} == {
+            "alpha.pkl",
+            "gamma.pkl",
+        }
+        assert tab._has_active_filters() is True
+
+        tab.set_mode_filter(None)
+        qapp.processEvents()
+
+        assert tab.tbl.rowCount() == 3
+    finally:
+        tab.close()
+
+
+def test_compare_action_prefers_checked_scope_over_selected_rows(monkeypatch, qapp):
+    tmp_path = Path(".codex_test_tmp") / f"tab5_compare_scope_{uuid.uuid4().hex}"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    csv_path = tmp_path / "features.csv"
+    csv_path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+
+    _write_ranked_model(
+        tmp_path,
+        "selected_a.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        optimized_profit=510.0,
+    )
+    _write_ranked_model(
+        tmp_path,
+        "selected_b.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        optimized_profit=520.0,
+    )
+    _write_ranked_model(
+        tmp_path,
+        "checked_c.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        optimized_profit=530.0,
+    )
+    _write_ranked_model(
+        tmp_path,
+        "checked_d.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        optimized_profit=540.0,
+    )
+
+    monkeypatch.setattr("ibkr_trading_bot.gui.tab_model_ranking.DEFAULT_MODEL_DIR", tmp_path)
+
+    tab = ModelRankingTab()
+    try:
+        selected_records = [record for record in tab.records if record.model_path.name in {"selected_a.pkl", "selected_b.pkl"}]
+        checked_records = [record for record in tab.records if record.model_path.name in {"checked_c.pkl", "checked_d.pkl"}]
+        captured: dict[str, object] = {}
+
+        monkeypatch.setattr(
+            tab,
+            "_current_eval_context",
+            lambda: {
+                "data_path": str(csv_path),
+                "fee_per_trade": 0.25,
+                "entry_threshold": 0.55,
+                "exit_threshold": 0.60,
+            },
+        )
+        monkeypatch.setattr(tab, "_selected_records", lambda: list(selected_records))
+        monkeypatch.setattr(tab, "_checked_records", lambda: list(checked_records))
+        monkeypatch.setattr(
+            tab,
+            "_show_comparison_dialog",
+            lambda records, context: captured.update(
+                {
+                    "records": [record.model_path.name for record in records],
+                    "context": dict(context),
+                }
+            ),
+        )
+
+        tab._on_compare_selected_clicked()
+
+        assert captured["records"] == ["checked_d.pkl", "checked_c.pkl"]
+        assert captured["context"] == {
+            "data_path": str(csv_path),
+            "fee_per_trade": 0.25,
+            "entry_threshold": 0.55,
+            "exit_threshold": 0.60,
+        }
+        assert "oteviram porovnani pro 2 modelu (zatrzene)" in tab.lbl_status.text()
+    finally:
+        tab.close()
+
+
+def test_compare_filtered_uses_filtered_scope_even_when_checked_exists(monkeypatch, qapp):
+    tmp_path = Path(".codex_test_tmp") / f"tab5_compare_filtered_{uuid.uuid4().hex}"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    csv_path = tmp_path / "features.csv"
+    csv_path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+
+    _write_ranked_model(
+        tmp_path,
+        "alpha.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        estimator="lgb",
+        horizon=12,
+        tp_bps=40.0,
+        sl_bps=30.0,
+        optimized_profit=610.0,
+    )
+    _write_ranked_model(
+        tmp_path,
+        "beta.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        estimator="hgbt",
+        horizon=16,
+        tp_bps=40.0,
+        sl_bps=30.0,
+        optimized_profit=620.0,
+    )
+    _write_ranked_model(
+        tmp_path,
+        "balanced.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        estimator="lgb",
+        horizon=12,
+        tp_bps=40.0,
+        sl_bps=30.0,
+        candidate_selection_criterion="balanced",
+        optimized_profit=630.0,
+    )
+    _write_ranked_model(
+        tmp_path,
+        "outside.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        estimator="rf",
+        horizon=8,
+        tp_bps=50.0,
+        sl_bps=50.0,
+        optimized_profit=640.0,
+    )
+
+    shortlist_dir = tmp_path / "auto_search"
+    shortlist_dir.mkdir(parents=True, exist_ok=True)
+    shortlist_path = shortlist_dir / "sample_shortlist.json"
+    shortlist_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "mode": "refine",
+                "created_at": "2026-05-27T12:00:00+00:00",
+                "dataset_signature": {
+                    "instrument": "GC",
+                    "exchange": "COMEX",
+                    "timeframe": "5m",
+                    "n_total_bars": 44268,
+                },
+                "candidates": [
+                    {"model": "lgb", "criterion": "balanced", "horizon": 12, "tp_bps": 40.0, "sl_bps": 30.0},
+                    {"model": "hgbt", "criterion": "balanced", "horizon": 16, "tp_bps": 40.0, "sl_bps": 30.0},
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("ibkr_trading_bot.gui.tab_model_ranking.DEFAULT_MODEL_DIR", tmp_path)
+
+    tab = ModelRankingTab()
+    try:
+        context = {
+            "data_path": str(csv_path),
+            "fee_per_trade": 0.25,
+            "entry_threshold": 0.55,
+            "exit_threshold": 0.60,
+        }
+        captured: dict[str, object] = {}
+        monkeypatch.setattr(tab, "_current_eval_context", lambda: context)
+        monkeypatch.setattr(
+            tab,
+            "_show_comparison_dialog",
+            lambda records, ctx: captured.update(
+                {
+                    "records": [record.model_path.name for record in records],
+                    "context": dict(ctx),
+                }
+            ),
+        )
+
+        for row in range(tab.tbl.rowCount()):
+            model_item = tab.tbl.item(row, 0)
+            check_item = tab.tbl.item(row, tab_model_ranking_module.COL_CHECK)
+            if model_item is None or check_item is None:
+                continue
+            if model_item.text() == "outside.pkl":
+                check_item.setCheckState(Qt.Checked)
+                break
+        qapp.processEvents()
+
+        tab.set_shortlist_filter(str(shortlist_path))
+        qapp.processEvents()
+
+        tab._on_compare_filtered_clicked()
+
+        assert set(captured["records"]) == {"alpha.pkl", "beta.pkl", "balanced.pkl"}
+        assert captured["context"] == context
+        assert "oteviram porovnani pro 3 modelu (filtrovane)" in tab.lbl_status.text()
+    finally:
+        tab.close()
+
+
+def test_compare_filtered_falls_back_to_latest_shortlist_without_active_filter(monkeypatch, qapp):
+    tmp_path = Path(".codex_test_tmp") / f"tab5_compare_latest_shortlist_{uuid.uuid4().hex}"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    csv_path = tmp_path / "features.csv"
+    csv_path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+
+    _write_ranked_model(
+        tmp_path,
+        "latest_a.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        estimator="lgb",
+        horizon=12,
+        tp_bps=40.0,
+        sl_bps=30.0,
+        optimized_profit=610.0,
+    )
+    _write_ranked_model(
+        tmp_path,
+        "latest_b.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        estimator="hgbt",
+        horizon=16,
+        tp_bps=40.0,
+        sl_bps=30.0,
+        optimized_profit=620.0,
+    )
+    _write_ranked_model(
+        tmp_path,
+        "old_only.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        estimator="rf",
+        horizon=8,
+        tp_bps=50.0,
+        sl_bps=50.0,
+        optimized_profit=630.0,
+    )
+
+    shortlist_dir = tmp_path / "auto_search"
+    shortlist_dir.mkdir(parents=True, exist_ok=True)
+    (shortlist_dir / "older_shortlist.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "mode": "refine",
+                "created_at": "2026-05-26T12:00:00+00:00",
+                "dataset_signature": {
+                    "instrument": "GC",
+                    "exchange": "COMEX",
+                    "timeframe": "5m",
+                    "n_total_bars": 44268,
+                },
+                "candidates": [
+                    {"model": "rf", "criterion": "balanced", "horizon": 8, "tp_bps": 50.0, "sl_bps": 50.0}
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    latest_shortlist_path = shortlist_dir / "latest_shortlist.json"
+    latest_shortlist_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "mode": "refine",
+                "created_at": "2026-05-27T12:00:00+00:00",
+                "dataset_signature": {
+                    "instrument": "GC",
+                    "exchange": "COMEX",
+                    "timeframe": "5m",
+                    "n_total_bars": 44268,
+                },
+                "candidates": [
+                    {"model": "lgb", "criterion": "balanced", "horizon": 12, "tp_bps": 40.0, "sl_bps": 30.0},
+                    {"model": "hgbt", "criterion": "balanced", "horizon": 16, "tp_bps": 40.0, "sl_bps": 30.0},
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("ibkr_trading_bot.gui.tab_model_ranking.DEFAULT_MODEL_DIR", tmp_path)
+
+    tab = ModelRankingTab()
+    try:
+        captured: dict[str, object] = {}
+        context = {
+            "data_path": str(csv_path),
+            "fee_per_trade": 0.25,
+            "entry_threshold": 0.55,
+            "exit_threshold": 0.60,
+        }
+        monkeypatch.setattr(tab, "_current_eval_context", lambda: context)
+        monkeypatch.setattr(
+            tab,
+            "_show_comparison_dialog",
+            lambda records, ctx: captured.update(
+                {
+                    "records": [record.model_path.name for record in records],
+                    "context": dict(ctx),
+                }
+            ),
+        )
+
+        assert tab._has_active_filters() is False
+        assert tab._active_shortlist_artifact() is None
+        assert tab._latest_shortlist_artifact() is not None
+        assert tab._latest_shortlist_artifact().path == latest_shortlist_path
+
+        tab._on_compare_filtered_clicked()
+
+        assert set(captured["records"]) == {"latest_a.pkl", "latest_b.pkl"}
+        assert captured["context"] == context
+        assert "oteviram porovnani pro 2 modelu (posledni shortlist)" in tab.lbl_status.text()
+    finally:
+        tab.close()
+
+
+def test_latest_shortlist_prefill_does_not_activate_filtered_scope(monkeypatch, qapp):
+    tmp_path = Path(".codex_test_tmp") / f"tab5_latest_shortlist_scope_{uuid.uuid4().hex}"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    csv_path = tmp_path / "features.csv"
+    csv_path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+
+    _write_ranked_model(
+        tmp_path,
+        "alpha.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        estimator="lgb",
+        horizon=12,
+        tp_bps=40.0,
+        sl_bps=30.0,
+        ranking_status="error",
+    )
+    _write_ranked_model(
+        tmp_path,
+        "beta.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        estimator="hgbt",
+        horizon=16,
+        tp_bps=40.0,
+        sl_bps=30.0,
+        ranking_status="error",
+    )
+
+    shortlist_dir = tmp_path / "auto_search"
+    shortlist_dir.mkdir(parents=True, exist_ok=True)
+    (shortlist_dir / "latest_shortlist.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "mode": "refine",
+                "created_at": "2026-05-27T12:00:00+00:00",
+                "dataset_signature": {
+                    "instrument": "GC",
+                    "exchange": "COMEX",
+                    "timeframe": "5m",
+                    "n_total_bars": 44268,
+                },
+                "candidates": [
+                    {"model": "lgb", "criterion": "balanced", "horizon": 12, "tp_bps": 40.0, "sl_bps": 30.0},
+                    {"model": "hgbt", "criterion": "balanced", "horizon": 16, "tp_bps": 40.0, "sl_bps": 30.0},
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("ibkr_trading_bot.gui.tab_model_ranking.DEFAULT_MODEL_DIR", tmp_path)
+
+    tab = ModelRankingTab()
+    try:
+        assert tab._has_active_filters() is False
+        assert tab._active_shortlist_artifact() is None
+        assert "pripraven posledni" in tab.lbl_shortlist.text()
+
+        candidate_records, _empty_message, _up_to_date_message = tab._recompute_profit_opt_target()
+        assert {record.model_path.name for record in candidate_records} == {"alpha.pkl", "beta.pkl"}
+    finally:
+        tab.close()
+
+
+def test_shortlist_filter_limits_table_to_matching_candidates(monkeypatch, qapp):
+    tmp_path = Path(".codex_test_tmp") / f"tab5_shortlist_filter_{uuid.uuid4().hex}"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    csv_path = tmp_path / "features.csv"
+    csv_path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+
+    _write_ranked_model(
+        tmp_path,
+        "alpha.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        estimator="lgb",
+        horizon=12,
+        tp_bps=40.0,
+        sl_bps=30.0,
+        optimized_profit=610.0,
+    )
+    _write_ranked_model(
+        tmp_path,
+        "beta.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        estimator="hgbt",
+        horizon=16,
+        tp_bps=40.0,
+        sl_bps=30.0,
+        optimized_profit=620.0,
+    )
+    _write_ranked_model(
+        tmp_path,
+        "gamma.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        estimator="rf",
+        horizon=8,
+        tp_bps=50.0,
+        sl_bps=50.0,
+        optimized_profit=630.0,
+    )
+
+    shortlist_dir = tmp_path / "auto_search"
+    shortlist_dir.mkdir(parents=True, exist_ok=True)
+    shortlist_path = shortlist_dir / "sample_shortlist.json"
+    shortlist_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "mode": "refine",
+                "created_at": "2026-05-27T12:00:00+00:00",
+                "dataset_signature": {
+                    "instrument": "GC",
+                    "exchange": "COMEX",
+                    "timeframe": "5m",
+                    "n_total_bars": 44268,
+                },
+                "candidates": [
+                    {"model": "lgb", "criterion": "balanced", "horizon": 12, "tp_bps": 40.0, "sl_bps": 30.0},
+                    {"model": "hgbt", "criterion": "balanced", "horizon": 16, "tp_bps": 40.0, "sl_bps": 30.0},
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("ibkr_trading_bot.gui.tab_model_ranking.DEFAULT_MODEL_DIR", tmp_path)
+
+    tab = ModelRankingTab()
+    try:
+        assert tab.cmb_shortlist_filter.count() == 2
+
+        tab.set_shortlist_filter(str(shortlist_path))
+        qapp.processEvents()
+
+        assert tab.tbl.rowCount() == 3
+        assert {tab.tbl.item(row, 0).text() for row in range(tab.tbl.rowCount())} == {
+            "alpha.pkl",
+            "beta.pkl",
+            "balanced.pkl",
+        }
+        assert tab._has_active_filters() is True
+        assert "sample_shortlist.json" in tab.lbl_shortlist.text()
+        assert "kandidati 2" in tab.lbl_shortlist.text()
+    finally:
+        tab.close()
+
+
+def test_shortlist_filter_respects_candidate_selection_criterion(monkeypatch, qapp):
+    tmp_path = Path(".codex_test_tmp") / f"tab5_shortlist_criterion_{uuid.uuid4().hex}"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    csv_path = tmp_path / "features.csv"
+    csv_path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+
+    _write_ranked_model(
+        tmp_path,
+        "balanced.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        estimator="lgb",
+        horizon=12,
+        tp_bps=40.0,
+        sl_bps=30.0,
+        candidate_selection_criterion="balanced",
+        optimized_profit=610.0,
+    )
+    _write_ranked_model(
+        tmp_path,
+        "profit_first.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        estimator="lgb",
+        horizon=12,
+        tp_bps=40.0,
+        sl_bps=30.0,
+        candidate_selection_criterion="profit_first",
+        optimized_profit=620.0,
+    )
+
+    shortlist_dir = tmp_path / "auto_search"
+    shortlist_dir.mkdir(parents=True, exist_ok=True)
+    shortlist_path = shortlist_dir / "criterion_shortlist.json"
+    shortlist_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "mode": "refine",
+                "created_at": "2026-05-27T12:00:00+00:00",
+                "dataset_signature": {
+                    "instrument": "GC",
+                    "exchange": "COMEX",
+                    "timeframe": "5m",
+                    "n_total_bars": 44268,
+                },
+                "candidates": [
+                    {
+                        "model": "lgb",
+                        "criterion": "profit_first",
+                        "horizon": 12,
+                        "tp_bps": 40.0,
+                        "sl_bps": 30.0,
+                    }
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("ibkr_trading_bot.gui.tab_model_ranking.DEFAULT_MODEL_DIR", tmp_path)
+
+    tab = ModelRankingTab()
+    try:
+        tab.set_shortlist_filter(str(shortlist_path))
+        qapp.processEvents()
+
+        assert tab.tbl.rowCount() == 1
+        assert tab.tbl.item(0, 0).text() == "profit_first.pkl"
+    finally:
+        tab.close()
+
+
+def test_check_filtered_requires_active_filter(monkeypatch, qapp):
+    tmp_path = Path(".codex_test_tmp") / f"tab5_check_filtered_guard_{uuid.uuid4().hex}"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    csv_path = tmp_path / "features.csv"
+    csv_path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+
+    _write_ranked_model(
+        tmp_path,
+        "alpha.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        optimized_profit=610.0,
+    )
+    _write_ranked_model(
+        tmp_path,
+        "beta.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        optimized_profit=620.0,
+    )
+
+    monkeypatch.setattr("ibkr_trading_bot.gui.tab_model_ranking.DEFAULT_MODEL_DIR", tmp_path)
+
+    tab = ModelRankingTab()
+    try:
+        assert tab._checked_records() == []
+
+        tab._on_check_filtered_clicked()
+
+        assert tab._checked_records() == []
+        assert "nejprve zapni shortlist nebo jiny filtr" in tab.lbl_status.text()
+    finally:
+        tab.close()
+
+
+def test_check_filtered_replaces_checked_scope_with_visible_shortlist_rows(monkeypatch, qapp):
+    tmp_path = Path(".codex_test_tmp") / f"tab5_check_filtered_scope_{uuid.uuid4().hex}"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    csv_path = tmp_path / "features.csv"
+    csv_path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+
+    _write_ranked_model(
+        tmp_path,
+        "alpha.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        estimator="lgb",
+        horizon=12,
+        tp_bps=40.0,
+        sl_bps=30.0,
+        optimized_profit=610.0,
+    )
+    _write_ranked_model(
+        tmp_path,
+        "beta.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        estimator="hgbt",
+        horizon=16,
+        tp_bps=40.0,
+        sl_bps=30.0,
+        optimized_profit=620.0,
+    )
+    _write_ranked_model(
+        tmp_path,
+        "balanced.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        estimator="lgb",
+        horizon=12,
+        tp_bps=40.0,
+        sl_bps=30.0,
+        candidate_selection_criterion="balanced",
+        optimized_profit=630.0,
+    )
+    _write_ranked_model(
+        tmp_path,
+        "outside.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        estimator="rf",
+        horizon=8,
+        tp_bps=50.0,
+        sl_bps=50.0,
+        optimized_profit=640.0,
+    )
+
+    shortlist_dir = tmp_path / "auto_search"
+    shortlist_dir.mkdir(parents=True, exist_ok=True)
+    shortlist_path = shortlist_dir / "sample_shortlist.json"
+    shortlist_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "mode": "refine",
+                "created_at": "2026-05-27T12:00:00+00:00",
+                "dataset_signature": {
+                    "instrument": "GC",
+                    "exchange": "COMEX",
+                    "timeframe": "5m",
+                    "n_total_bars": 44268,
+                },
+                "candidates": [
+                    {"model": "lgb", "criterion": "balanced", "horizon": 12, "tp_bps": 40.0, "sl_bps": 30.0},
+                    {"model": "hgbt", "criterion": "balanced", "horizon": 16, "tp_bps": 40.0, "sl_bps": 30.0},
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("ibkr_trading_bot.gui.tab_model_ranking.DEFAULT_MODEL_DIR", tmp_path)
+
+    tab = ModelRankingTab()
+    try:
+        for row in range(tab.tbl.rowCount()):
+            model_item = tab.tbl.item(row, 0)
+            check_item = tab.tbl.item(row, tab_model_ranking_module.COL_CHECK)
+            if model_item is None or check_item is None:
+                continue
+            if model_item.text() == "outside.pkl":
+                check_item.setCheckState(Qt.Checked)
+                break
+        qapp.processEvents()
+
+        assert {record.model_path.name for record in tab._checked_records()} == {"outside.pkl"}
+
+        tab.set_shortlist_filter(str(shortlist_path))
+        qapp.processEvents()
+
+        tab._on_check_filtered_clicked()
+
+        assert {record.model_path.name for record in tab._checked_records()} == {
+            "alpha.pkl",
+            "beta.pkl",
+            "balanced.pkl",
+        }
+        assert "zatrzeno 3 filtrovanych modelu" in tab.lbl_status.text()
+
+        checked_scope, scope_source = tab._comparison_target_records()
+        assert scope_source == "checked"
+        assert {record.model_path.name for record in checked_scope} == {
+            "alpha.pkl",
+            "beta.pkl",
+            "balanced.pkl",
+        }
+
+        tab._on_clear_checked_clicked()
+
+        assert tab._checked_records() == []
+        assert "zatrzeni vymazano" in tab.lbl_status.text()
+    finally:
+        tab.close()
+
+
+def test_comparison_snapshots_expose_ranking_context_and_metadata(monkeypatch, qapp):
+    tmp_path = Path(".codex_test_tmp") / f"tab5_compare_snapshot_{uuid.uuid4().hex}"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    csv_path = tmp_path / "features.csv"
+    csv_path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+
+    _write_ranked_model(
+        tmp_path,
+        "alpha.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        training_mode="standard",
+        user_note="kandidat",
+        horizon=8,
+        tp_bps=40.0,
+        sl_bps=30.0,
+        optimized_profit=610.0,
+        trades_h=77.0,
+    )
+    _write_ranked_model(
+        tmp_path,
+        "beta.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        training_mode="refresh",
+        horizon=16,
+        tp_bps=35.0,
+        sl_bps=25.0,
+        optimized_profit=620.0,
+        trained_features=["feat_a", "feat_b", "feat_c"],
+        feature_stability={
+            "feat_a": {"mean": 0.90, "std": 0.09, "folds_present": 5},
+            "feat_b": {"mean": 0.60, "std": 0.12, "folds_present": 5},
+            "feat_c": {"mean": 0.40, "std": 0.24, "folds_present": 5},
+        },
+        feature_stability_score={
+            "feat_a": 0.80,
+            "feat_b": 0.60,
+            "feat_c": 0.40,
+        },
+        per_class_3={
+            "-1": {"recall": 0.61},
+            "1": {"recall": 0.09},
+        },
+    )
+
+    monkeypatch.setattr("ibkr_trading_bot.gui.tab_model_ranking.DEFAULT_MODEL_DIR", tmp_path)
+
+    tab = ModelRankingTab()
+    try:
+        context = {
+            "data_path": str(csv_path),
+            "fee_per_trade": 0.25,
+            "entry_threshold": 0.55,
+            "exit_threshold": 0.60,
+        }
+
+        snapshots = tab._comparison_snapshots(list(tab.records), context)
+        snapshot_map = {snapshot.model_name: snapshot for snapshot in snapshots}
+
+        alpha = snapshot_map["alpha.pkl"]
+        assert alpha.values["mode"] == "Refine"
+        assert alpha.values["status"] == "ok"
+        assert alpha.values["freshness"] == "aktualni"
+        assert alpha.values["optimized_profit"] == "610.00"
+        assert alpha.values["trades"] == "77.00"
+        assert alpha.values["horizon"] == "8"
+        assert alpha.values["tp_bps"] == "40.00"
+        assert alpha.values["sl_bps"] == "30.00"
+        assert alpha.values["note"] == "kandidat"
+
+        beta = snapshot_map["beta.pkl"]
+        assert beta.values["mode"] == "Refresh"
+        assert beta.values["optimized_profit"] == "620.00"
+        assert beta.values["bias"] == "+0.520"
+        assert beta.values["stability"] == "0.600"
+        assert beta.values["horizon"] == "16"
+        assert beta.values["tp_bps"] == "35.00"
+        assert beta.values["sl_bps"] == "25.00"
+    finally:
+        tab.close()
+
+
+def test_compare_export_writes_csv_and_json(monkeypatch, qapp):
+    tmp_path = Path(".codex_test_tmp") / f"tab5_compare_export_{uuid.uuid4().hex}"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    csv_path = tmp_path / "features.csv"
+    csv_path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+
+    _write_ranked_model(
+        tmp_path,
+        "alpha.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        training_mode="standard",
+        optimized_profit=610.0,
+        trades_h=77.0,
+    )
+    _write_ranked_model(
+        tmp_path,
+        "beta.pkl",
+        csv_path=csv_path,
+        n_total_bars=44268,
+        training_mode="refresh",
+        optimized_profit=620.0,
+        trades_h=88.0,
+    )
+
+    monkeypatch.setattr("ibkr_trading_bot.gui.tab_model_ranking.DEFAULT_MODEL_DIR", tmp_path)
+
+    tab = ModelRankingTab()
+    try:
+        context = {
+            "data_path": str(csv_path),
+            "fee_per_trade": 0.25,
+            "entry_threshold": 0.55,
+            "exit_threshold": 0.60,
+        }
+        snapshots = tab._comparison_snapshots(list(tab.records), context)
+
+        csv_out = tmp_path / "compare_export.csv"
+        json_out = tmp_path / "compare_export.json"
+        out_paths = [str(csv_out), str(json_out)]
+
+        monkeypatch.setattr(
+            tab_model_ranking_module.QFileDialog,
+            "getSaveFileName",
+            lambda *args, **kwargs: (out_paths.pop(0), ""),
+        )
+
+        tab._export_comparison_snapshots(snapshots, context, file_format="csv")
+        tab._export_comparison_snapshots(snapshots, context, file_format="json")
+
+        with csv_out.open("r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        assert len(rows) == 2
+        assert rows[0]["model_name"] == "beta.pkl"
+        assert rows[0]["data_path"] == str(csv_path)
+        assert rows[0]["scope_mode"] == "holdout"
+        assert rows[0]["optimized_profit"] == "620.00"
+
+        payload = json.loads(json_out.read_text(encoding="utf-8"))
+        assert payload["comparison_context"]["data_path"] == str(csv_path)
+        assert payload["comparison_context"]["scope_mode"] == "holdout"
+        assert payload["models"][0]["model_name"] == "beta.pkl"
+        assert payload["models"][0]["optimized_profit"] == "620.00"
+        assert "compare export ulozen" in tab.lbl_status.text()
+    finally:
+        tab.close()
+
+
 def test_ranking_stability_detail_dialog_opens_without_crash(monkeypatch, qapp):
     tmp_path = Path(".codex_test_tmp") / f"tab5_rank_stability_detail_{uuid.uuid4().hex}"
     tmp_path.mkdir(parents=True, exist_ok=True)
@@ -1055,326 +2283,106 @@ def test_ranking_stability_detail_dialog_opens_without_crash(monkeypatch, qapp):
         tab.close()
 
 
-def test_strict_shortlist_filters_and_dedupes_candidates():
-    tmp_path = Path(".codex_test_tmp") / f"tab5_rank_strict_shortlist_{uuid.uuid4().hex}"
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    csv_path = tmp_path / "GC_5m_features.csv"
-    csv_path.write_text("timestamp,open,high,low,close,volume\n1,1,1,1,1,1\n", encoding="utf-8")
-    snapshot_signature = dataset_snapshot_signature_from_csv(csv_path, 44268)
-    assert snapshot_signature is not None
+def test_ranking_batch_finished_reenables_recompute_button(qapp):
+    tab = ModelRankingTab()
+    try:
+        tab._ranking_request_id = 3
+        tab._ranking_worker = object()
+        tab._batch_total = 2
+        tab.btn_recompute_profit_opt.setEnabled(False)
+        tab.btn_stop_recompute.setEnabled(True)
 
-    _write_ranked_model(
-        tmp_path,
-        "good_a.pkl",
-        csv_path=csv_path,
-        n_total_bars=44268,
-        estimator="hgbt",
-        horizon=8,
-        tp_bps=50.0,
-        sl_bps=50.0,
-        base_profit=140.0,
-        sharpe=0.02,
-        optimized_profit=640.0,
-    )
-    _write_ranked_model(
-        tmp_path,
-        "good_b.pkl",
-        csv_path=csv_path,
-        n_total_bars=44268,
-        estimator="lgb",
-        horizon=12,
-        tp_bps=50.0,
-        sl_bps=60.0,
-        base_profit=-15.0,
-        sharpe=0.01,
-        optimized_profit=590.0,
-    )
-    _write_ranked_model(
-        tmp_path,
-        "duplicate_lower.pkl",
-        csv_path=csv_path,
-        n_total_bars=44268,
-        estimator="hgbt",
-        horizon=8,
-        tp_bps=50.0,
-        sl_bps=50.0,
-        base_profit=100.0,
-        sharpe=0.015,
-        optimized_profit=610.0,
-    )
-    _write_ranked_model(
-        tmp_path,
-        "rescued_only.pkl",
-        csv_path=csv_path,
-        n_total_bars=44268,
-        estimator="xgb",
-        horizon=8,
-        tp_bps=40.0,
-        sl_bps=40.0,
-        base_profit=-20.0,
-        sharpe=0.0,
-        optimized_profit=700.0,
-    )
-    _write_ranked_model(
-        tmp_path,
-        "other_snapshot.pkl",
-        csv_path=csv_path,
-        n_total_bars=45840,
-        estimator="rf",
-        horizon=8,
-        tp_bps=50.0,
-        sl_bps=50.0,
-        base_profit=90.0,
-        sharpe=0.02,
-        optimized_profit=520.0,
-    )
-    _write_ranked_model(
-        tmp_path,
-        "stale_fee.pkl",
-        csv_path=csv_path,
-        n_total_bars=44268,
-        estimator="et",
-        horizon=8,
-        tp_bps=50.0,
-        sl_bps=50.0,
-        base_profit=95.0,
-        sharpe=0.02,
-        optimized_profit=510.0,
-        fee=0.99,
-    )
-    _write_ranked_model(
-        tmp_path,
-        "status_error.pkl",
-        csv_path=csv_path,
-        n_total_bars=44268,
-        ranking_status="error",
-    )
-
-    records = discover_ranking_models(tmp_path)
-    shortlist = ModelRankingTab._build_strict_shortlist(
-        records=records,
-        context={"data_path": str(csv_path), "fee_per_trade": 0.25},
-        current_snapshot_signature=snapshot_signature,
-        limit=5,
-    )
-
-    selected_names = [candidate.record.model_path.name for candidate in shortlist["selected"]]
-    rejected_reasons = {rejection.record.model_path.name: rejection.reason for rejection in shortlist["rejected"]}
-
-    assert selected_names == ["good_a.pkl", "good_b.pkl"]
-    assert shortlist["selected"][0].tier_label == "A"
-    assert shortlist["selected"][1].tier_label == "B"
-    assert "duplicitni konfigurace" in rejected_reasons["duplicate_lower.pkl"]
-    assert rejected_reasons["rescued_only.pkl"] == "Profit(H) < 0 a Sharpe(H) <= 0"
-    assert rejected_reasons["other_snapshot.pkl"] == "model nepatri do aktualniho dataset snapshotu"
-    assert rejected_reasons["stale_fee.pkl"] == "ranking je stale pro aktualni CSV/fee"
-    assert rejected_reasons["status_error.pkl"] == "ranking nema status ok"
-
-
-def test_strict_shortlist_limits_to_top10_after_tiering():
-    tmp_path = Path(".codex_test_tmp") / f"tab5_rank_strict_top10_{uuid.uuid4().hex}"
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    csv_path = tmp_path / "GC_5m_features.csv"
-    csv_path.write_text("timestamp,open,high,low,close,volume\n1,1,1,1,1,1\n", encoding="utf-8")
-    snapshot_signature = dataset_snapshot_signature_from_csv(csv_path, 44268)
-    assert snapshot_signature is not None
-
-    for idx, profit in enumerate([650.0, 640.0, 630.0, 620.0, 610.0, 600.0, 590.0, 580.0, 570.0, 560.0, 550.0], start=1):
-        _write_ranked_model(
-            tmp_path,
-            f"candidate_{idx}.pkl",
-            csv_path=csv_path,
-            n_total_bars=44268,
-            estimator=f"model{idx}",
-            horizon=8 + idx,
-            tp_bps=40.0 + idx,
-            sl_bps=50.0 + idx,
-            base_profit=100.0 - idx,
-            sharpe=0.02,
-            optimized_profit=profit,
+        tab._on_batch_result(
+            3,
+            {
+                "updated": 2,
+                "failures": 0,
+                "requested": 2,
+                "full_recompute": False,
+            },
         )
+        tab._on_batch_finished(3)
 
-    records = discover_ranking_models(tmp_path)
-    shortlist = ModelRankingTab._build_strict_shortlist(
-        records=records,
-        context={"data_path": str(csv_path), "fee_per_trade": 0.25},
-        current_snapshot_signature=snapshot_signature,
-        limit=10,
-    )
-
-    selected_names = [candidate.record.model_path.name for candidate in shortlist["selected"]]
-    rejected_reasons = {rejection.record.model_path.name: rejection.reason for rejection in shortlist["rejected"]}
-
-    assert len(selected_names) == 10
-    assert selected_names == [f"candidate_{idx}.pkl" for idx in range(1, 11)]
-    assert rejected_reasons["candidate_11.pkl"] == "mimo Top 10 po serazeni"
+        assert tab._ranking_worker is None
+        assert tab.btn_recompute_profit_opt.isEnabled() is True
+        assert tab.btn_stop_recompute.isEnabled() is False
+        assert "hotovo 2/2" in tab.lbl_batch_progress.text()
+        assert "prepocet dokoncen" in tab.lbl_status.text()
+    finally:
+        tab.close()
 
 
-def test_strict_shortlist_rejects_models_with_too_few_trades():
-    tmp_path = Path(".codex_test_tmp") / f"tab5_rank_strict_min_trades_{uuid.uuid4().hex}"
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    csv_path = tmp_path / "GC_5m_features.csv"
-    csv_path.write_text("timestamp,open,high,low,close,volume\n1,1,1,1,1,1\n", encoding="utf-8")
-    snapshot_signature = dataset_snapshot_signature_from_csv(csv_path, 44268)
-    assert snapshot_signature is not None
+def test_ranking_timer_runs_only_while_tab_is_active(monkeypatch, qapp, tmp_path):
+    monkeypatch.setattr("ibkr_trading_bot.gui.tab_model_ranking.DEFAULT_MODEL_DIR", tmp_path)
 
-    _write_ranked_model(
-        tmp_path,
-        "sleepy.pkl",
-        csv_path=csv_path,
-        n_total_bars=44268,
-        optimized_profit=900.0,
-        base_profit=150.0,
-        sharpe=0.05,
-        trades_h=12.0,
-    )
-    _write_ranked_model(
-        tmp_path,
-        "active.pkl",
-        csv_path=csv_path,
-        n_total_bars=44268,
-        optimized_profit=500.0,
-        base_profit=120.0,
-        sharpe=0.03,
-        trades_h=180.0,
-    )
+    tab = ModelRankingTab()
+    try:
+        assert tab.timer.isActive() is False
 
-    records = discover_ranking_models(tmp_path)
-    shortlist = ModelRankingTab._build_strict_shortlist(
-        records=records,
-        context={"data_path": str(csv_path), "fee_per_trade": 0.25},
-        current_snapshot_signature=snapshot_signature,
-        limit=10,
-    )
+        tab.on_tab_activated()
 
-    selected_names = [candidate.record.model_path.name for candidate in shortlist["selected"]]
-    rejected_reasons = {rejection.record.model_path.name: rejection.reason for rejection in shortlist["rejected"]}
+        assert tab.timer.isActive() is True
 
-    assert selected_names == ["active.pkl"]
-    assert rejected_reasons["sleepy.pkl"] == "Trades(H) je pod minimem 60 pro strict shortlist"
+        tab.on_tab_deactivated()
+
+        assert tab.timer.isActive() is False
+    finally:
+        tab.close()
 
 
-def test_strict_shortlist_excludes_already_strict_models():
-    tmp_path = Path(".codex_test_tmp") / f"tab5_rank_strict_mode_filter_{uuid.uuid4().hex}"
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    csv_path = tmp_path / "GC_5m_features.csv"
-    csv_path.write_text("timestamp,open,high,low,close,volume\n1,1,1,1,1,1\n", encoding="utf-8")
-    snapshot_signature = dataset_snapshot_signature_from_csv(csv_path, 44268)
-    assert snapshot_signature is not None
+def test_batch_progress_text_keeps_model_context_for_nested_status(qapp):
+    tab = ModelRankingTab()
+    try:
+        tab._batch_total = 5
+        tab._ranking_worker = object()
 
-    _write_ranked_model(
-        tmp_path,
-        "already_strict.pkl",
-        csv_path=csv_path,
-        n_total_bars=44268,
-        optimized_profit=650.0,
-        base_profit=150.0,
-        sharpe=0.03,
-        training_mode="strict",
-    )
-    _write_ranked_model(
-        tmp_path,
-        "fresh_standard.pkl",
-        csv_path=csv_path,
-        n_total_bars=44268,
-        optimized_profit=620.0,
-        base_profit=140.0,
-        sharpe=0.02,
-        training_mode="standard",
-    )
+        tab._on_batch_progress_text("Ranking 2/5: demo.pkl")
 
-    records = discover_ranking_models(tmp_path)
-    shortlist = ModelRankingTab._build_strict_shortlist(
-        records=records,
-        context={"data_path": str(csv_path), "fee_per_trade": 0.25},
-        current_snapshot_signature=snapshot_signature,
-        limit=5,
-    )
+        assert tab.lbl_status.text() == "Status: Ranking 2/5: demo.pkl"
+        assert "hotovo 1/5" in tab.lbl_batch_progress.text()
+        assert "demo.pkl" in tab.lbl_batch_progress.text()
 
-    selected_names = [candidate.record.model_path.name for candidate in shortlist["selected"]]
-    rejected_reasons = {rejection.record.model_path.name: rejection.reason for rejection in shortlist["rejected"]}
+        tab._on_batch_progress_text("Vyhodnoceni: pripravuji dataset...")
 
-    assert selected_names == ["fresh_standard.pkl"]
-    assert rejected_reasons["already_strict.pkl"] == "model uz je strict"
+        assert "model 2/5 (demo.pkl)" in tab.lbl_status.text()
+        assert "Vyhodnoceni: pripravuji dataset..." in tab.lbl_status.text()
+        assert "hotovo 1/5" in tab.lbl_batch_progress.text()
+    finally:
+        tab.close()
 
 
-def test_strict_batch_writes_provenance_to_new_models(monkeypatch):
-    tmp_path = Path(".codex_test_tmp") / f"tab5_rank_strict_batch_{uuid.uuid4().hex}"
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    csv_path = tmp_path / "GC_5m_features.csv"
-    csv_path.write_text("timestamp,open,high,low,close,volume\n1,1,1,1,1,1\n", encoding="utf-8")
-    counter = {"idx": 0}
+def test_stop_recompute_requests_worker_stop_and_reports_partial_progress(qapp):
+    class DummyWorker:
+        def __init__(self):
+            self.stop_calls = 0
 
-    def fake_run_training_job(**kwargs):
-        counter["idx"] += 1
-        model_path = tmp_path / f"strict_result_{counter['idx']}.pkl"
-        model_path.write_bytes(b"model")
-        meta = {
-            "created_at": "2026-03-16T11:00:00",
-            "estimator_name": kwargs["estimator_name"],
-            "label_horizon_bars": kwargs["horizon"],
-            "label_take_profit_bps": kwargs["tp_bps"],
-            "label_stop_loss_bps": kwargs["sl_bps"],
-        }
-        write_sidecar_model_meta(model_path, meta)
-        return {
-            "status": "ok",
-            "model_path": str(model_path),
-            "meta_path": str(model_path.with_name(model_path.stem + "_meta.json")),
-            "profit_net": 123.0,
-            "sharpe": 0.02,
-            "pf": 1.1,
-            "trades": 42,
-        }
+        def stop(self):
+            self.stop_calls += 1
 
-    monkeypatch.setattr("ibkr_trading_bot.gui.tab_model_ranking.run_training_job", fake_run_training_job)
+    tab = ModelRankingTab()
+    try:
+        worker = DummyWorker()
+        tab._ranking_request_id = 7
+        tab._ranking_worker = worker
+        tab._batch_total = 5
+        tab._batch_completed = 2
+        tab._batch_current_index = 3
+        tab._batch_current_model = "demo.pkl"
+        tab.btn_stop_recompute.setEnabled(True)
 
-    result = ModelRankingTab._task_run_strict_batch(
-        jobs=[
-            {
-                "source_model_path": str(tmp_path / "source_a.pkl"),
-                "source_rank_position": 1,
-                "estimator_name": "hgbt",
-                "criterion": "balanced",
-                "horizon": 8,
-                "tp_bps": 50.0,
-                "sl_bps": 50.0,
-                "strict_source_metrics": {"profit_h_opt": 640.0, "profit_h": 140.0, "sharpe_h": 0.02, "trades_h": 120.0},
-            },
-            {
-                "source_model_path": str(tmp_path / "source_b.pkl"),
-                "source_rank_position": 2,
-                "estimator_name": "lgb",
-                "criterion": "profit_first",
-                "horizon": 12,
-                "tp_bps": 40.0,
-                "sl_bps": 60.0,
-                "strict_source_metrics": {"profit_h_opt": 590.0, "profit_h": 90.0, "sharpe_h": 0.015, "trades_h": 110.0},
-            },
-        ],
-        training_csv_path=str(csv_path),
-        holdout_pct=0.10,
-        holdout_min_bars=1000,
-        holdout_max_bars=6000,
-        candidate_top_n=10,
-        candidate_fresh_ratio=0.30,
-        batch_id="strict_test_batch",
-    )
+        tab._on_stop_recompute_clicked()
 
-    assert result["created"] == 2
-    assert result["rejected"] == 0
-    assert result["failures"] == 0
+        assert worker.stop_calls == 1
+        assert tab._batch_cancel_requested is True
+        assert tab.btn_stop_recompute.isEnabled() is False
+        assert "zastavuji prepocet" in tab.lbl_status.text()
 
-    meta_a = read_sidecar_model_meta(tmp_path / "strict_result_1.pkl")
-    meta_b = read_sidecar_model_meta(tmp_path / "strict_result_2.pkl")
+        tab._on_batch_finished(7)
 
-    assert meta_a["training_mode"] == "strict"
-    assert meta_a["strict_source_model_path"].endswith("source_a.pkl")
-    assert meta_a["strict_source_rank_position"] == 1
-    assert meta_a["strict_batch_id"] == "strict_test_batch"
-    assert meta_a["strict_trigger"] == "ranking_top10"
-    assert meta_a["strict_source_metrics"]["profit_h_opt"] == 640.0
-
-    assert meta_b["training_mode"] == "strict"
-    assert meta_b["strict_source_model_path"].endswith("source_b.pkl")
-    assert meta_b["strict_source_rank_position"] == 2
+        assert tab._ranking_worker is None
+        assert tab.btn_recompute_profit_opt.isEnabled() is True
+        assert tab.btn_stop_recompute.isEnabled() is False
+        assert "prepocet zastaven" in tab.lbl_status.text()
+        assert "2/5" in tab.lbl_batch_progress.text()
+    finally:
+        tab.close()

@@ -224,3 +224,233 @@ def test_run_training_job_rejects_unknown_phase(tmp_path):
             candidate_fresh_ratio=0.3,
             training_profile={"n_splits": 3},
         )
+
+
+def test_run_training_job_forwards_should_continue_to_train_and_evaluate_model(monkeypatch, tmp_path):
+    csv_path = tmp_path / "features.csv"
+    csv_path.write_text("timestamp,close\n2026-01-01T00:00:00Z,100\n", encoding="utf-8")
+
+    prepared = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-01-01", periods=32, freq="5min", tz="UTC"),
+            "close": range(32),
+        }
+    )
+
+    monkeypatch.setattr(
+        model_training_service_module.DatasetService,
+        "prepare_from_csv",
+        lambda self, *args, **kwargs: prepared.copy(),
+    )
+    monkeypatch.setattr(model_training_service_module, "compute_holdout_bars", lambda **kwargs: 8)
+    monkeypatch.setattr(model_training_service_module, "name_and_meta_from_csv", lambda *args, **kwargs: ("demo", {}))
+    monkeypatch.setattr(model_training_service_module, "_model_dir", lambda: str(tmp_path))
+
+    captured: dict[str, object] = {}
+
+    def _fake_train_and_evaluate_model(*args, **kwargs):
+        captured["should_continue"] = kwargs.get("should_continue")
+        model_path = tmp_path / "demo_rf_20260420_120000.pkl"
+        model_path.write_bytes(b"model")
+        meta_path = model_path.with_name(model_path.stem + "_meta.json")
+        meta_path.write_text(json.dumps({"search_plan": {}, "quality_gate": {}}), encoding="utf-8")
+        return {"output_path": str(model_path)}
+
+    monkeypatch.setattr(model_training_service_module, "train_and_evaluate_model", _fake_train_and_evaluate_model)
+
+    state = {"keep_running": True}
+    result = model_training_service_module.run_training_job(
+        csv_path=str(csv_path),
+        holdout_pct=0.2,
+        holdout_min_bars=8,
+        holdout_max_bars=32,
+        phase="standard",
+        estimator_name="rf",
+        criterion="balanced",
+        horizon=8,
+        tp_bps=40.0,
+        sl_bps=40.0,
+        candidate_top_n=5,
+        candidate_fresh_ratio=0.3,
+        training_profile={"n_splits": 3},
+        should_continue=lambda: bool(state["keep_running"]),
+    )
+
+    should_continue = captured["should_continue"]
+    assert callable(should_continue)
+    assert should_continue() is True
+    state["keep_running"] = False
+    assert should_continue() is False
+    assert result["status"] == "ok"
+
+
+def test_run_training_job_prefers_explicit_output_path_over_glob_fallback(monkeypatch, tmp_path):
+    csv_path = tmp_path / "features.csv"
+    csv_path.write_text("timestamp,close\n2026-01-01T00:00:00Z,100\n", encoding="utf-8")
+
+    prepared = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-01-01", periods=32, freq="5min", tz="UTC"),
+            "close": range(32),
+        }
+    )
+
+    monkeypatch.setattr(
+        model_training_service_module.DatasetService,
+        "prepare_from_csv",
+        lambda self, *args, **kwargs: prepared.copy(),
+    )
+    monkeypatch.setattr(model_training_service_module, "compute_holdout_bars", lambda **kwargs: 8)
+    monkeypatch.setattr(model_training_service_module, "name_and_meta_from_csv", lambda *args, **kwargs: ("demo", {}))
+    monkeypatch.setattr(model_training_service_module, "_model_dir", lambda: str(tmp_path))
+
+    explicit_model_path = tmp_path / "demo_rf_20260420_120000_111111.pkl"
+    explicit_model_path.write_bytes(b"model-a")
+    explicit_meta_path = explicit_model_path.with_name(explicit_model_path.stem + "_meta.json")
+    explicit_meta_path.write_text(
+        json.dumps(
+            {
+                "estimator_name": "rf",
+                "workflow_mode": "refine",
+                "training_profile": {"candidate_selection_criterion": "balanced"},
+                "label_horizon_bars": 8,
+                "label_take_profit_bps": 40.0,
+                "label_stop_loss_bps": 40.0,
+                "metrics_holdout": {"profit_net": 11.0, "sharpe": 0.5, "pf": 1.2},
+                "search_plan": {},
+                "quality_gate": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    newer_other_model_path = tmp_path / "demo_rf_20260420_120000_999999.pkl"
+    newer_other_model_path.write_bytes(b"model-b")
+    newer_other_meta_path = newer_other_model_path.with_name(newer_other_model_path.stem + "_meta.json")
+    newer_other_meta_path.write_text(
+        json.dumps(
+            {
+                "estimator_name": "rf",
+                "workflow_mode": "refine",
+                "training_profile": {"candidate_selection_criterion": "profit_first"},
+                "label_horizon_bars": 16,
+                "label_take_profit_bps": 60.0,
+                "label_stop_loss_bps": 50.0,
+                "metrics_holdout": {"profit_net": 99.0, "sharpe": 9.9, "pf": 9.9},
+                "search_plan": {},
+                "quality_gate": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _fake_train_and_evaluate_model(*args, **kwargs):
+        return {"output_path": str(explicit_model_path)}
+
+    monkeypatch.setattr(model_training_service_module, "train_and_evaluate_model", _fake_train_and_evaluate_model)
+
+    result = model_training_service_module.run_training_job(
+        csv_path=str(csv_path),
+        holdout_pct=0.2,
+        holdout_min_bars=8,
+        holdout_max_bars=32,
+        phase="refine",
+        estimator_name="rf",
+        criterion="balanced",
+        horizon=8,
+        tp_bps=40.0,
+        sl_bps=40.0,
+        candidate_top_n=5,
+        candidate_fresh_ratio=0.3,
+        training_profile={"n_splits": 3},
+    )
+
+    assert result["model_path"] == explicit_model_path.as_posix()
+    assert result["meta_path"] == explicit_meta_path.as_posix()
+    assert result["profit_net"] == 11.0
+
+
+def test_run_training_job_fallback_ignores_candidate_mismatched_artifacts(monkeypatch, tmp_path):
+    csv_path = tmp_path / "features.csv"
+    csv_path.write_text("timestamp,close\n2026-01-01T00:00:00Z,100\n", encoding="utf-8")
+
+    prepared = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-01-01", periods=32, freq="5min", tz="UTC"),
+            "close": range(32),
+        }
+    )
+
+    monkeypatch.setattr(
+        model_training_service_module.DatasetService,
+        "prepare_from_csv",
+        lambda self, *args, **kwargs: prepared.copy(),
+    )
+    monkeypatch.setattr(model_training_service_module, "compute_holdout_bars", lambda **kwargs: 8)
+    monkeypatch.setattr(model_training_service_module, "name_and_meta_from_csv", lambda *args, **kwargs: ("demo", {}))
+    monkeypatch.setattr(model_training_service_module, "_model_dir", lambda: str(tmp_path))
+
+    stale_model_path = tmp_path / "demo_rf_20260420_120000_111111.pkl"
+    stale_model_path.write_bytes(b"stale")
+    stale_meta_path = stale_model_path.with_name(stale_model_path.stem + "_meta.json")
+    stale_meta_path.write_text(
+        json.dumps(
+            {
+                "estimator_name": "rf",
+                "workflow_mode": "refine",
+                "training_profile": {"candidate_selection_criterion": "profit_first"},
+                "label_horizon_bars": 16,
+                "label_take_profit_bps": 60.0,
+                "label_stop_loss_bps": 50.0,
+                "metrics_holdout": {"profit_net": 99.0, "sharpe": 9.9, "pf": 9.9},
+                "search_plan": {},
+                "quality_gate": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    matching_model_path = tmp_path / "demo_rf_20260420_120000_222222.pkl"
+    matching_model_path.write_bytes(b"matching")
+    matching_meta_path = matching_model_path.with_name(matching_model_path.stem + "_meta.json")
+    matching_meta_path.write_text(
+        json.dumps(
+            {
+                "estimator_name": "rf",
+                "workflow_mode": "refine",
+                "training_profile": {"candidate_selection_criterion": "balanced"},
+                "label_horizon_bars": 8,
+                "label_take_profit_bps": 40.0,
+                "label_stop_loss_bps": 40.0,
+                "metrics_holdout": {"profit_net": 11.0, "sharpe": 0.5, "pf": 1.2},
+                "search_plan": {},
+                "quality_gate": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _fake_train_and_evaluate_model(*args, **kwargs):
+        return {}
+
+    monkeypatch.setattr(model_training_service_module, "train_and_evaluate_model", _fake_train_and_evaluate_model)
+
+    result = model_training_service_module.run_training_job(
+        csv_path=str(csv_path),
+        holdout_pct=0.2,
+        holdout_min_bars=8,
+        holdout_max_bars=32,
+        phase="refine",
+        estimator_name="rf",
+        criterion="balanced",
+        horizon=8,
+        tp_bps=40.0,
+        sl_bps=40.0,
+        candidate_top_n=5,
+        candidate_fresh_ratio=0.3,
+        training_profile={"n_splits": 3},
+    )
+
+    assert result["model_path"] == matching_model_path.as_posix()
+    assert result["meta_path"] == matching_meta_path.as_posix()
+    assert result["profit_net"] == 11.0

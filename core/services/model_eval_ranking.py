@@ -149,7 +149,7 @@ def get_tab5_holdout_ranking(
         return ranking
     ranking_policy = ranking.get("exit_policy")
     if ranking_policy is None:
-        return ranking if requested_policy == DEFAULT_EXIT_POLICY else None
+        return None
     return ranking if resolve_exit_policy_setting(ranking_policy, default=DEFAULT_EXIT_POLICY) == requested_policy else None
 
 

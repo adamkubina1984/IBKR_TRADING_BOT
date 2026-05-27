@@ -43,11 +43,14 @@ from ibkr_trading_bot.core.services.signal_policy import (
     DEFAULT_EXIT_POLICY,
     apply_confidence_entry_threshold,
     apply_exit_confidence_threshold,
+    exit_policy_display_text,
     normalize_signal_array,
     resolve_exit_policy_setting,
+    stamp_exit_policy_metadata,
 )
 from ibkr_trading_bot.core.services.auto_threshold_search import run_auto_threshold_search
 from ibkr_trading_bot.core.services.evaluation_service import EvaluationService
+from ibkr_trading_bot.core.services.model_service import write_sidecar_model_meta
 from ibkr_trading_bot.core.services.trade_executor import replay_signals_over_market_data
 from ibkr_trading_bot.core.services.model_service import (
     build_sklearn_version_warning,
@@ -511,6 +514,10 @@ class ModelEvaluationTab(QWidget):
             "T(model) = prahy ulozene v metadatech modelu.\n"
             "T(active) = prahy realne pouzite pri evaluaci podle aktualniho nastaveni."
         )
+        self.lbl_exit_policy = QLabel("Policy: —")
+        self.lbl_exit_policy.setToolTip(
+            "Aktivni exit policy nactena z modelu nebo z jeho ulozenych user_settings."
+        )
 
         # Tlačítko pro uložení
         self.btn_auto_thresholds = QPushButton("Auto Entry/Exit (max profit)")
@@ -530,6 +537,8 @@ class ModelEvaluationTab(QWidget):
         model_settings_layout.addWidget(self.ext_spin)
         model_settings_layout.addSpacing(12)
         model_settings_layout.addWidget(self.lbl_threshold_preview, 1)
+        model_settings_layout.addSpacing(12)
+        model_settings_layout.addWidget(self.lbl_exit_policy)
         model_settings_layout.addSpacing(12)
         model_settings_layout.addWidget(self.btn_auto_thresholds)
         model_settings_layout.addSpacing(8)
@@ -672,15 +681,31 @@ class ModelEvaluationTab(QWidget):
         src = getattr(self, "_last_ternary_threshold_source", "model")
         entry = self._safe_float(self.et_spin.value()) if hasattr(self, "et_spin") else None
         exit_thr = self._safe_float(self.ext_spin.value()) if hasattr(self, "ext_spin") else None
+        policy_text = exit_policy_display_text(self._active_exit_policy())
         self.lbl_threshold_preview.setText(
             f"T(model): short={_fmt(tshort_model)} long={_fmt(tlong_model)} | "
             f"T(active): short={_fmt(thr_short)} long={_fmt(thr_long)} src={src} | "
             f"Entry={_fmt(entry)} Exit={_fmt(exit_thr)}"
         )
+        if hasattr(self, "lbl_exit_policy"):
+            self.lbl_exit_policy.setText(f"Policy: {policy_text}")
 
     def _active_exit_policy(self) -> str:
         metadata = self.model_metadata if isinstance(self.model_metadata, dict) else {}
         return resolve_exit_policy_setting(metadata, default=DEFAULT_EXIT_POLICY)
+
+    def _stamp_loaded_exit_policy_if_needed(self) -> None:
+        if not self.model_path or not isinstance(self.model_metadata, dict):
+            return
+        try:
+            updated_meta = dict(self.model_metadata)
+            changed = stamp_exit_policy_metadata(updated_meta)
+            if not changed:
+                return
+            write_sidecar_model_meta(self.model_path, updated_meta)
+            self.model_metadata = updated_meta
+        except Exception:
+            return
 
     def on_open_data_clicked(self):
         # Dynamický a záložní start dir (po změně kořene projektu)
@@ -901,7 +926,7 @@ class ModelEvaluationTab(QWidget):
     def _resolve_ternary_thresholds(self) -> tuple[float, float]:
         """
         Resolve active ternary short/long thresholds from model metadata.
-        Tab 3 is strict ternary-only flow: no Decision-threshold fallback.
+        Tab 3 is ternary-only flow: no Decision-threshold fallback.
         """
         _, tshort, tlong = self._meta_threshold_values()
         if not isinstance(tshort, (int, float)) or not isinstance(tlong, (int, float)):
@@ -1566,15 +1591,18 @@ class ModelEvaluationTab(QWidget):
                 "ternary_threshold_long_eval": float(tl_eval),
                 "entry_threshold": float(self.et_spin.value()),
                 "exit_threshold": float(self.ext_spin.value()),
+                "exit_policy": self._active_exit_policy(),
                 "use_and_ensemble": False,
                 "use_ma_only": False,
                 "use_macd_filter": False,
                 "updated_at": str(pd.Timestamp.now(tz="UTC")),
             }
+            stamp_exit_policy_metadata(metadata)
             
             # Ulož metadat zpět
-            with meta_path.open("w", encoding="utf-8") as fh:
-                jsonlib.dump(metadata, fh, indent=2, default=str)
+            write_sidecar_model_meta(model_path, metadata)
+            self.model_metadata = dict(metadata)
+            self._refresh_threshold_preview()
             
             self._set_status(f"✅ Nastavení uloženo: {meta_path.name}")
             QMessageBox.information(
@@ -1984,6 +2012,7 @@ class ModelEvaluationTab(QWidget):
                     )
             self.model_path = normalized_path
             self.model_label.setText(f"Model: {normalized_path}")
+            self._stamp_loaded_exit_policy_if_needed()
             self._refresh_threshold_preview()
             version_warning = loaded.version_warning or build_sklearn_version_warning(
                 self.model_metadata, model_path=normalized_path

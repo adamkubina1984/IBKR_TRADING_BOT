@@ -74,7 +74,7 @@ except ImportError:
 
 # ------------------- Pomocné -------------------
 def _now_str() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
 def _project_root() -> pathlib.Path:
     here = pathlib.Path(__file__).resolve()
@@ -2260,6 +2260,7 @@ def _mc_eval_holdout_adaptive(
     slippage_bps: float = 0.0,
     min_trades: int = 20,
     trial_thresholds: tuple[float, ...] = (0.5, 0.48, 0.46, 0.45, 0.42, 0.40, 0.38, 0.36, 0.34, 0.32, 0.30, 0.28, 0.26, 0.25),
+    should_continue=None,
 ) -> dict[str, Any]:
     if (not HAS_CALC_METRICS) or df_hold is None or len(df_hold) < 10:
         return {}
@@ -2298,6 +2299,8 @@ def _mc_eval_holdout_adaptive(
     valid_sharpes = []
 
     for _ in range(int(max(1, iters))):
+        if callable(should_continue) and not bool(should_continue()):
+            raise InterruptedError("training cancelled by caller")
         idx = _mc_block_bootstrap_indices(len(y_true), int(max(1, block_len)))
         yt = y_true[idx]
         dfb = df_hold.iloc[idx]
@@ -2438,6 +2441,7 @@ def train_and_evaluate_model(
     threshold_calibration_min_bars_kw = kwargs.pop("threshold_calibration_min_bars", 500)
     threshold_calibration_max_bars_kw = kwargs.pop("threshold_calibration_max_bars", 4000)
     threshold_calibration_train_min_guard_kw = kwargs.pop("threshold_calibration_train_min_guard", 2000)
+    should_continue = kwargs.pop("should_continue", None)
 
     mc_enabled: bool = bool(kwargs.pop("mc_enabled", True))
     mc_iters: int = int(kwargs.pop("mc_iters", 200))
@@ -2475,6 +2479,18 @@ def train_and_evaluate_model(
             feature_stability_threshold = None
 
     _ = kwargs
+
+    def _raise_if_cancelled() -> None:
+        if not callable(should_continue):
+            return
+        try:
+            keep_running = bool(should_continue())
+        except Exception:
+            keep_running = True
+        if not keep_running:
+            raise InterruptedError("training cancelled by caller")
+
+    _raise_if_cancelled()
 
     if "target" not in df.columns:
         raise ValueError("DataFrame musí obsahovat 'target'.")
@@ -2629,6 +2645,7 @@ def train_and_evaluate_model(
             cv_rank = PurgedWalkForwardSplit(n_splits=max(2, ranking_folds), embargo=effective_embargo)
             imp_acc = np.zeros(len(feats))
             for tr_idx, _ in cv_rank.split(df_train_core[feats]):
+                _raise_if_cancelled()
                 Xtr = df_train_core.iloc[tr_idx][feats].replace([np.inf, -np.inf], np.nan)
                 ytr = df_train_core.iloc[tr_idx]["target"].astype(int).to_numpy()
                 est_rank = ExtraTreesClassifier(n_estimators=300, random_state=42, n_jobs=-1)
@@ -2885,6 +2902,7 @@ def train_and_evaluate_model(
         *,
         trial=None,
     ) -> tuple[float, float, dict[str, Any], np.ndarray]:
+        _raise_if_cancelled()
         fold_scores, fold_sizes = [], []
         metric_wsum = 0.0
         metric_acc: dict[str, float] = {}
@@ -2898,6 +2916,7 @@ def train_and_evaluate_model(
             tmp_oof = np.full(shape=(len(X_all),), fill_value=np.nan, dtype=float)
 
         for tr_idx, te_idx in cv.split(X_all):
+            _raise_if_cancelled()
             fold_count += 1
             X_tr, y_tr = X_all.iloc[tr_idx], y_all[tr_idx]
             X_te, y_te = X_all.iloc[te_idx], y_all[te_idx]
@@ -3024,6 +3043,7 @@ def train_and_evaluate_model(
 
     def _run_candidate(params: dict[str, Any], *, trial=None) -> float:
         nonlocal step_idx, best_score, best_params, best_estimator, best_oof
+        _raise_if_cancelled()
         step_idx += 1
         mean_score, std_score, row_rec, tmp_oof = _evaluate_candidate(params, trial=trial)
         _emit(on_progress, step_idx, total, params, mean_score, std_score)
@@ -3076,6 +3096,7 @@ def train_and_evaluate_model(
         for params in all_param_sets:
             _run_candidate(dict(params))
 
+    _raise_if_cancelled()
     best_fold_feature_importances: list[dict[str, float]] = []
     if best_params is not None:
         try:
@@ -3114,6 +3135,7 @@ def train_and_evaluate_model(
 
     if best_estimator is None:
         best_estimator = base_estimator
+    _raise_if_cancelled()
     sw_all = (
         _balanced_sample_weight(
             y_all,
@@ -3140,6 +3162,7 @@ def train_and_evaluate_model(
     ternary_threshold_short = 0.5
     ternary_threshold_long = 0.5
     threshold_tuning: dict[str, Any] = {}
+    _raise_if_cancelled()
     if is_ternary and best_oof is not None and HAS_CALC_METRICS:
         try:
             valid = np.isfinite(best_oof).all(axis=1)
@@ -3385,6 +3408,7 @@ def train_and_evaluate_model(
         feature_stability_filter_applied
         or (is_ternary and df_threshold_calib is not None and len(df_threshold_calib) > 0)
     ):
+        _raise_if_cancelled()
         try:
             refit_df = (
                 df_train
@@ -3548,6 +3572,7 @@ def train_and_evaluate_model(
                 pass
 
     if df_hold is not None and len(df_hold) >= 10:
+        _raise_if_cancelled()
         used_feats = list(trained_features)
         Xh = df_hold[used_feats].replace([np.inf, -np.inf], np.nan)
         yh = df_hold["target"].astype(int).to_numpy()
@@ -3622,6 +3647,7 @@ def train_and_evaluate_model(
                         fee_per_trade=fee_per_trade,
                         slippage_bps=slippage_bps,
                         min_trades=20,
+                        should_continue=should_continue,
                     )
             else:
                 Xh_pred = _align_X_for_estimator(calibrated_estimator, Xh)
@@ -3691,6 +3717,7 @@ def train_and_evaluate_model(
             quality_gate["reasons"] = ["not_applicable_binary_target"]
 
     # Persist cross-mode candidate shortlist (uses CV/OOF only; no holdout leakage in ranking).
+    _raise_if_cancelled()
     try:
         ranked_for_chain = _rank_candidates_for_chain(candidate_records, candidate_selection_criterion)
         shortlist_keep_n = int(np.clip(max(int(candidate_top_n), 12), 3, 40))
@@ -3883,6 +3910,7 @@ def train_and_evaluate_model(
         "metrics_holdout": {**holdout_metrics, **({"n_signals_holdout": n_signals_holdout} if n_signals_holdout is not None else {})},
         **meta_extra_safe,
     }
+    _raise_if_cancelled()
     import joblib
     joblib.dump(payload, fpath)
 
@@ -3955,6 +3983,7 @@ def train_and_evaluate_model(
     )
 
     # Feature importance
+    _raise_if_cancelled()
     try:
         X_feature_importance = df_train[trained_features].replace([np.inf, -np.inf], np.nan)
         y_feature_importance = df_train["target"].astype(int).to_numpy()

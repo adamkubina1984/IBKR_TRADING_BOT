@@ -373,6 +373,50 @@ def _result_metrics_from_meta(meta_obj: dict[str, Any]) -> dict[str, Any]:
     return metrics if isinstance(metrics, dict) else {}
 
 
+def _meta_matches_requested_candidate(
+    meta_obj: dict[str, Any],
+    *,
+    workflow_mode: str,
+    estimator_name: str,
+    criterion: str,
+    horizon: int,
+    tp_bps: float,
+    sl_bps: float,
+) -> bool:
+    if not isinstance(meta_obj, dict):
+        return False
+
+    workflow_raw = str(
+        meta_obj.get("workflow_mode")
+        or meta_obj.get("training_mode_requested")
+        or meta_obj.get("training_mode")
+        or ""
+    ).strip().lower()
+    if workflow_raw:
+        try:
+            if canonical_workflow_mode(workflow_raw) != workflow_mode:
+                return False
+        except Exception:
+            return False
+
+    estimator_meta = str(meta_obj.get("estimator_name") or "").strip().lower()
+    if estimator_meta and estimator_meta != estimator_name:
+        return False
+
+    try:
+        horizon_meta = int(meta_obj.get("label_horizon_bars") or meta_obj.get("label_lookahead_bars") or 0)
+        tp_meta = float(meta_obj.get("label_take_profit_bps") or 0.0)
+        sl_meta = float(meta_obj.get("label_stop_loss_bps") or 0.0)
+    except Exception:
+        return False
+    if horizon_meta != int(horizon):
+        return False
+    if tp_meta != float(tp_bps) or sl_meta != float(sl_bps):
+        return False
+
+    return candidate_selection_criterion_from_meta(meta_obj, default=criterion) == criterion
+
+
 def run_training_job(
     *,
     csv_path: str,
@@ -389,6 +433,7 @@ def run_training_job(
     candidate_fresh_ratio: float,
     training_profile: dict[str, Any] | None = None,
     extra_meta: dict[str, Any] | None = None,
+    should_continue=None,
 ) -> dict[str, Any]:
     phase_norm = normalize_training_mode(phase)
     workflow_mode = canonical_workflow_mode(phase_norm)
@@ -410,6 +455,8 @@ def run_training_job(
     profile["candidate_fresh_ratio"] = float(np.clip(candidate_fresh_ratio, 0.05, 0.80))
 
     svc = DatasetService()
+    if callable(should_continue) and not bool(should_continue()):
+        raise InterruptedError("training cancelled by caller")
     df = svc.prepare_from_csv(
         csv_path,
         labeling="triple_barrier",
@@ -419,6 +466,8 @@ def run_training_job(
         stop_loss_bps=sl_value,
         same_bar_policy="neutral",
     ).sort_values("timestamp").reset_index(drop=True)
+    if callable(should_continue) and not bool(should_continue()):
+        raise InterruptedError("training cancelled by caller")
 
     n_total = int(len(df))
     n_hold = compute_holdout_bars(
@@ -457,13 +506,16 @@ def run_training_job(
     meta_obj: dict[str, Any] = {}
     status = "ok"
     err_msg = ""
+    train_result: dict[str, Any] = {}
 
     try:
-        train_and_evaluate_model(
+        train_result = dict(
+            train_and_evaluate_model(
             df,
             estimator_name=estimator_norm,
             param_grid=None,
             on_progress=None,
+            should_continue=should_continue,
             n_splits=int(profile.get("n_splits", 5)),
             holdout_bars=int(n_hold),
             holdout_pct=float(holdout_pct),
@@ -498,7 +550,11 @@ def run_training_job(
             candidate_selection_criterion=criterion_norm,
             candidate_top_n=int(profile.get("candidate_top_n", 5)),
             candidate_fresh_ratio=float(profile.get("candidate_fresh_ratio", 0.30)),
+            )
+            or {}
         )
+    except InterruptedError:
+        raise
     except Exception as exc:
         status = "rejected" if "QUALITY_GATE_REJECT" in str(exc) else "error"
         err_msg = str(exc)
@@ -512,20 +568,45 @@ def run_training_job(
                 except Exception:
                     meta_obj = {}
 
-    if not meta_obj:
+    explicit_output_path = str(train_result.get("output_path") or "").strip()
+    if explicit_output_path:
+        explicit_model_path = Path(explicit_output_path)
+        if explicit_model_path.exists():
+            model_path = explicit_model_path.as_posix()
+        explicit_meta_path = str(train_result.get("meta_path") or "").strip()
+        meta_candidate = Path(explicit_meta_path) if explicit_meta_path else explicit_model_path.with_name(explicit_model_path.stem + "_meta.json")
+        if meta_candidate.exists():
+            meta_path = meta_candidate.as_posix()
+            try:
+                meta_obj = jsonlib.loads(meta_candidate.read_text(encoding="utf-8"))
+            except Exception:
+                meta_obj = {}
+
+    if not meta_obj and not model_path:
         out_dir = Path(_model_dir())
         pattern = f"{name_prefix}_{estimator_norm}_*.pkl"
         files = [path for path in out_dir.glob(pattern) if path.stat().st_mtime >= (started_ts - 3.0)]
-        if files:
-            latest = sorted(files, key=lambda path: path.stat().st_mtime, reverse=True)[0]
-            model_path = latest.as_posix()
+        for latest in sorted(files, key=lambda path: path.stat().st_mtime, reverse=True):
             meta_candidate = latest.with_name(latest.stem + "_meta.json")
             if meta_candidate.exists():
-                meta_path = meta_candidate.as_posix()
                 try:
-                    meta_obj = jsonlib.loads(meta_candidate.read_text(encoding="utf-8"))
+                    meta_candidate_obj = jsonlib.loads(meta_candidate.read_text(encoding="utf-8"))
                 except Exception:
-                    meta_obj = {}
+                    meta_candidate_obj = {}
+                if not _meta_matches_requested_candidate(
+                    meta_candidate_obj,
+                    workflow_mode=workflow_mode,
+                    estimator_name=estimator_norm,
+                    criterion=criterion_norm,
+                    horizon=horizon_value,
+                    tp_bps=tp_value,
+                    sl_bps=sl_value,
+                ):
+                    continue
+                model_path = latest.as_posix()
+                meta_path = meta_candidate.as_posix()
+                meta_obj = meta_candidate_obj
+                break
 
     metrics = _result_metrics_from_meta(meta_obj)
     quality_gate = (meta_obj.get("quality_gate") or {}) if isinstance(meta_obj, dict) else {}

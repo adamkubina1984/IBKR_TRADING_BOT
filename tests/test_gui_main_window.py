@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import pytest
+from pathlib import Path
 from PySide6.QtWidgets import QWidget
 
 from ibkr_trading_bot.gui import tab_model_ranking as tab_model_ranking_module
@@ -9,6 +10,18 @@ from ibkr_trading_bot.gui.main_window import MainWindow
 from ibkr_trading_bot.gui.tab_model_training import ModelTrainingTab
 
 from ._gui_test_helpers import StubLiveTab
+
+
+class _HookedTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.events: list[str] = []
+
+    def on_tab_activated(self):
+        self.events.append("activated")
+
+    def on_tab_deactivated(self):
+        self.events.append("deactivated")
 
 
 def test_main_window_tab_order_hides_legacy_manager(monkeypatch, qapp, tmp_path):
@@ -42,17 +55,149 @@ def test_main_window_tab_order_hides_legacy_manager(monkeypatch, qapp, tmp_path)
         window.close()
 
 
+def test_main_window_notifies_loaded_tabs_about_visibility_changes(monkeypatch, qapp, tmp_path):
+    monkeypatch.setattr(tab_model_ranking_module, "DEFAULT_MODEL_DIR", tmp_path)
+    data_tab = _HookedTab()
+    train_tab = _HookedTab()
+    monkeypatch.setattr(MainWindow, "_create_data_tab", lambda self: data_tab)
+    monkeypatch.setattr(MainWindow, "_create_train_tab", lambda self: train_tab)
+    monkeypatch.setattr(MainWindow, "_create_model_ranking_tab", lambda self: QWidget())
+    monkeypatch.setattr(MainWindow, "_create_eval_tab", lambda self: QWidget())
+    monkeypatch.setattr(MainWindow, "_create_live_tab", lambda self: QWidget())
+
+    window = MainWindow()
+    try:
+        assert data_tab.events == ["activated"]
+        assert train_tab.events == []
+
+        window.tabs.setCurrentIndex(1)
+        qapp.processEvents()
+
+        assert data_tab.events == ["activated", "deactivated"]
+        assert train_tab.events == ["activated"]
+    finally:
+        window.close()
+
+
 def test_model_training_tab_hides_manual_training_controls(qapp):
     tab = ModelTrainingTab()
     try:
         assert tab.cmb_model.isHidden()
         assert tab.cmb_training_mode.isHidden()
+        assert [tab.cmb_training_mode.itemText(i) for i in range(tab.cmb_training_mode.count())] == ["quick", "standard"]
         assert tab.cmb_candidate_criterion.isHidden()
         assert tab.btn_train.isHidden()
         assert tab.prog.isHidden()
         assert tab.tbl.isHidden()
         assert not tab.btn_auto_search.isHidden()
         assert not tab.cmb_search_backend.isHidden()
+    finally:
+        tab.close()
+
+
+def test_model_training_tab_restores_last_selected_csv_on_activation(monkeypatch, qapp, tmp_path):
+    class _DummySettings:
+        _store: dict[str, object] = {}
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def value(self, key, default=None):
+            return self._store.get(str(key), default)
+
+        def setValue(self, key, value):
+            self._store[str(key)] = value
+
+        def sync(self):
+            return None
+
+    csv_path = tmp_path / "features.csv"
+    csv_path.write_text("timestamp,close\n2026-01-01T00:00:00Z,1\n", encoding="utf-8")
+
+    dataset = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-01-01", periods=8, freq="5min", tz="UTC"),
+            "feature_a": np.linspace(0.0, 1.0, 8),
+            "target": [0, 1, 0, 1, 0, 1, 0, 1],
+        }
+    )
+
+    _DummySettings._store = {}
+    monkeypatch.setattr(tab_model_training_module, "QSettings", _DummySettings)
+    monkeypatch.setattr(
+        tab_model_training_module.DatasetService,
+        "prepare_from_csv",
+        lambda self, path, **kwargs: dataset.copy(),
+    )
+    monkeypatch.setattr(tab_model_training_module, "read_dataset_sidecar_meta", lambda path: {})
+    monkeypatch.setattr(ModelTrainingTab, "_log_dataset_audit", lambda self, df: None)
+
+    first = ModelTrainingTab()
+    try:
+        assert first._load_csv_path(str(csv_path), persist=True) is True
+        assert first.csv_path == str(csv_path.resolve())
+    finally:
+        first.close()
+
+    second = ModelTrainingTab()
+    try:
+        assert second.dataset is None
+        assert second.lbl_csv.text().endswith("features.csv")
+
+        second.on_tab_activated()
+
+        assert second.csv_path == str(csv_path.resolve())
+        assert second.dataset is not None
+        assert second.btn_auto_search.isEnabled() is True
+    finally:
+        second.close()
+
+
+def test_model_training_tab_prefers_more_advanced_legacy_fast_checkpoint_for_refine(monkeypatch, qapp, tmp_path):
+    monkeypatch.setattr(tab_model_training_module, "_model_dir", lambda: tmp_path.as_posix())
+    state_dir = tmp_path / "auto_search"
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    refine_state = state_dir / "tv_GC_COMEX_5m_sample_refine_state.json"
+    refine_state.write_text(
+        """
+{
+  "version": 2,
+  "csv_path": "C:\\tmp\\tv_GC_COMEX_5m_sample.csv",
+  "workflow_mode": "refine",
+  "spec": {"version": 2, "workflow_mode": "refine"},
+  "phase": "refine",
+  "queue": [],
+  "queue_idx": 0,
+  "results": [],
+  "stopped": true,
+  "completed": false
+}
+        """.strip(),
+        encoding="utf-8",
+    )
+
+    legacy_fast_state = state_dir / "tv_GC_COMEX_5m_sample_fast_state.json"
+    legacy_fast_state.write_text(
+        """
+{
+  "version": 1,
+  "spec": {"search_profile": "fast"},
+  "phase": "quick",
+  "quick_queue": [],
+  "quick_idx": 157,
+  "results": [],
+  "stopped": true,
+  "completed": false
+}
+        """.strip(),
+        encoding="utf-8",
+    )
+
+    tab = tab_model_training_module.ModelTrainingTab()
+    try:
+        tab.csv_path = str((tmp_path / "tv_GC_COMEX_5m_sample.csv").resolve())
+        assert tab._auto_search_state_path("Refine") == legacy_fast_state
     finally:
         tab.close()
 

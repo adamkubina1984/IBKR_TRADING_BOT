@@ -29,6 +29,7 @@ class MainWindow(QMainWindow):
             ("tab_live", "5) Live trading bot", self._create_live_tab),
         ]
         self._tab_containers: list[QWidget] = []
+        self._active_tab_index: int | None = None
 
         for _, label, _ in self._tab_specs:
             container = QWidget(self.tabs)
@@ -38,9 +39,9 @@ class MainWindow(QMainWindow):
             self._tab_containers.append(container)
             self.tabs.addTab(container, label)
 
-        self.tabs.currentChanged.connect(self._ensure_tab_loaded)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         self.setCentralWidget(self.tabs)
-        self._ensure_tab_loaded(0)
+        self._on_tab_changed(0)
 
     def _create_data_tab(self):
         from ibkr_trading_bot.gui.tab_data_download import DataDownloadTab
@@ -85,6 +86,34 @@ class MainWindow(QMainWindow):
         layout = container.layout()
         if layout is not None:
             layout.addWidget(widget)
+
+    def _notify_tab_visibility(self, index: int, *, active: bool) -> None:
+        if index < 0 or index >= len(self._tab_specs):
+            return
+        attr_name, _, _ = self._tab_specs[index]
+        widget = getattr(self, attr_name, None)
+        if widget is None:
+            return
+        callback = getattr(widget, "on_tab_activated" if active else "on_tab_deactivated", None)
+        if callable(callback):
+            try:
+                callback()
+            except Exception:
+                pass
+
+    def _on_tab_changed(self, index: int) -> None:
+        if index < 0 or index >= len(self._tab_specs):
+            return
+        if self._active_tab_index == index and getattr(self, self._tab_specs[index][0], None) is not None:
+            return
+
+        previous_index = self._active_tab_index
+        if previous_index is not None and previous_index != index:
+            self._notify_tab_visibility(previous_index, active=False)
+
+        self._ensure_tab_loaded(index)
+        self._active_tab_index = index
+        self._notify_tab_visibility(index, active=True)
 
     def get_live_features_df(self):
         try:

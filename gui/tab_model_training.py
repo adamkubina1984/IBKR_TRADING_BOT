@@ -9,7 +9,7 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QSettings, QThread, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -31,6 +31,7 @@ from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_sc
 from ibkr_trading_bot.core.services.dataset_service import DatasetService
 from ibkr_trading_bot.core.services.futures_roll_chain_service import read_dataset_sidecar_meta
 from ibkr_trading_bot.core.services.model_training_service import (
+    candidate_selection_criterion_from_meta,
     canonical_workflow_mode,
     compatibility_training_mode,
     compute_holdout_bars as runtime_compute_holdout_bars,
@@ -47,6 +48,55 @@ from ibkr_trading_bot.model.train_models import (
     _ternary_predict_mapped,
     train_and_evaluate_model,
 )
+
+
+LAST_TRAINING_CSV_PATH_KEY = "last_training_csv_path"
+AUTO_SEARCH_PROFILE_ALIASES = {
+    "fast": "refine",
+    "full": "explore",
+    "weekly": "refresh",
+}
+AUTO_SEARCH_PROFILE_VALUES = {"explore", "refine", "refresh"}
+
+
+def _normalize_auto_search_profile(profile: str) -> str:
+    txt = str(profile or "").strip().lower()
+    if txt in AUTO_SEARCH_PROFILE_VALUES:
+        return txt
+    return AUTO_SEARCH_PROFILE_ALIASES.get(txt, "explore")
+
+
+def _normalized_resume_path(path: Any) -> str:
+    txt = str(path or "").strip()
+    if not txt:
+        return ""
+    expanded = os.path.expanduser(txt)
+    return os.path.normcase(os.path.normpath(expanded))
+
+
+def _auto_search_state_score(path: Path) -> tuple[int, int, int]:
+    if not path.exists():
+        return (-1, -1, -1)
+
+    queue_idx = 0
+    completed = False
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for raw_line in handle:
+                line = raw_line.strip().lower()
+                match = re.search(r'"(?:queue_idx|quick_idx)"\s*:\s*(\d+)', line)
+                if match:
+                    queue_idx = max(queue_idx, int(match.group(1)))
+                if '"completed"' in line:
+                    completed = "true" in line
+    except Exception:
+        pass
+
+    try:
+        size = int(path.stat().st_size)
+    except Exception:
+        size = 0
+    return (0 if completed else 1, int(queue_idx), int(size))
 
 
 def atr_series(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -248,6 +298,9 @@ class AutoSearchWorker(QThread):
         self.state_path = Path(state_path)
         self.workflow_mode = self._normalize_search_profile(search_profile)
         self._stop_requested = False
+        self._last_recovered_results_count = 0
+        self._last_reconciled_duplicate_results_count = 0
+        self._last_reconciled_pruned_queue_count = 0
 
     def request_stop(self):
         self._stop_requested = True
@@ -291,15 +344,11 @@ class AutoSearchWorker(QThread):
 
     @staticmethod
     def _normalize_search_profile(profile: str) -> str:
-        p = str(profile or "").strip().lower()
-        alias_map = {
-            "fast": "refine",
-            "full": "explore",
-            "weekly": "refresh",
-        }
-        if p in {"explore", "refine", "refresh"}:
-            return p
-        return alias_map.get(p, "explore")
+        return _normalize_auto_search_profile(profile)
+
+    @staticmethod
+    def _same_csv_path(left: Any, right: Any) -> bool:
+        return _normalized_resume_path(left) == _normalized_resume_path(right)
 
     def _artifact_stem(self) -> str:
         stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(self.csv_path).stem).strip("_")
@@ -357,19 +406,56 @@ class AutoSearchWorker(QThread):
         seen: set[tuple[str, str, str, int, float, float]] = set()
         out: list[dict[str, Any]] = []
         for row in rows:
-            key = (
-                str(row.get("phase") or ""),
-                str(row.get("model") or ""),
-                str(row.get("criterion") or ""),
-                int(row.get("horizon") or 0),
-                float(row.get("tp_bps") or 0.0),
-                float(row.get("sl_bps") or 0.0),
-            )
+            key = AutoSearchWorker._candidate_key(row)
             if key in seen:
                 continue
             seen.add(key)
             out.append(row)
         return out
+
+    @staticmethod
+    def _candidate_key(row: dict[str, Any]) -> tuple[str, str, str, int, float, float]:
+        return (
+            str(row.get("phase") or ""),
+            str(row.get("model") or "").strip().lower(),
+            str(row.get("criterion") or "balanced").strip().lower(),
+            int(row.get("horizon") or 0),
+            float(row.get("tp_bps") or 0.0),
+            float(row.get("sl_bps") or 0.0),
+        )
+
+    @staticmethod
+    def _collect_csv_paths(payload: Any) -> set[str]:
+        paths: set[str] = set()
+        stack = [payload]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, dict):
+                for key, value in item.items():
+                    if key == "csv_path":
+                        normalized = _normalized_resume_path(value)
+                        if normalized:
+                            paths.add(normalized)
+                    elif isinstance(value, (dict, list)):
+                        stack.append(value)
+            elif isinstance(item, list):
+                for value in item:
+                    if isinstance(value, (dict, list)):
+                        stack.append(value)
+        return paths
+
+    @staticmethod
+    def _workflow_progress_counts(state: dict[str, Any]) -> tuple[int, int]:
+        queue = list(state.get("queue") or []) if isinstance(state, dict) else []
+        try:
+            queue_idx = int(state.get("queue_idx", 0) or 0) if isinstance(state, dict) else 0
+        except Exception:
+            queue_idx = 0
+        queue_idx = max(0, min(queue_idx, len(queue)))
+        completed_count = len(list(state.get("results") or [])) if isinstance(state, dict) else 0
+        completed_count = max(completed_count, queue_idx)
+        total_count = completed_count + max(0, len(queue) - queue_idx)
+        return int(completed_count), int(total_count)
 
     def _queue_from_spec(self, spec: dict[str, Any]) -> list[dict[str, Any]]:
         mode = str(spec.get("workflow_mode") or self.workflow_mode)
@@ -520,6 +606,290 @@ class AutoSearchWorker(QThread):
             "completed": False,
         }
 
+    def _recover_result_from_meta_path(
+        self,
+        meta_path: Path,
+        *,
+        expected_csv_path: str,
+        expected_n_total: int,
+    ) -> dict[str, Any] | None:
+        try:
+            meta_obj = jsonlib.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(meta_obj, dict):
+            return None
+
+        workflow_raw = str(
+            meta_obj.get("workflow_mode")
+            or meta_obj.get("training_mode_requested")
+            or meta_obj.get("training_mode")
+            or ""
+        ).strip().lower()
+        workflow_mode = canonical_workflow_mode(workflow_raw) if workflow_raw else ""
+        if workflow_mode != self.workflow_mode:
+            return None
+
+        try:
+            n_total = int(meta_obj.get("n_total_bars") or 0)
+        except Exception:
+            return None
+        if n_total != int(expected_n_total):
+            return None
+
+        csv_paths = self._collect_csv_paths(meta_obj)
+        if expected_csv_path not in csv_paths:
+            return None
+
+        estimator_name = str(meta_obj.get("estimator_name") or "").strip().lower()
+        if not estimator_name:
+            return None
+        criterion = candidate_selection_criterion_from_meta(meta_obj, default="balanced")
+        try:
+            horizon = int(meta_obj.get("label_horizon_bars") or meta_obj.get("label_lookahead_bars") or 0)
+            tp_bps = float(meta_obj.get("label_take_profit_bps") or 0.0)
+            sl_bps = float(meta_obj.get("label_stop_loss_bps") or 0.0)
+        except Exception:
+            return None
+        if horizon <= 0:
+            return None
+
+        metrics = self._meta_metrics(meta_obj)
+        quality_gate = meta_obj.get("quality_gate") if isinstance(meta_obj.get("quality_gate"), dict) else {}
+        qg_reasons = list(quality_gate.get("reasons") or [])
+        trade_count = metrics.get("num_trades")
+        if trade_count is None:
+            raw_trades = metrics.get("trades")
+            if isinstance(raw_trades, list):
+                trade_count = len(raw_trades)
+            else:
+                trade_count = raw_trades
+
+        raw_status = str(meta_obj.get("status") or "").strip().lower()
+        status = "ok"
+        if meta_path.name.endswith("_rejected_meta.json") or raw_status.startswith("rejected"):
+            status = "rejected"
+        elif raw_status == "error":
+            status = "error"
+        elif quality_gate.get("evaluated") and not bool(quality_gate.get("passed", False)):
+            status = "rejected"
+
+        training_profile = meta_obj.get("training_profile") if isinstance(meta_obj.get("training_profile"), dict) else {}
+        search_plan = meta_obj.get("search_plan") if isinstance(meta_obj.get("search_plan"), dict) else {}
+        compatibility_mode = str(
+            meta_obj.get("training_mode_compatibility")
+            or compatibility_training_mode(workflow_mode)
+            or ""
+        )
+        runtime_training_mode = str(
+            training_profile.get("training_mode")
+            or compatibility_mode
+            or workflow_mode
+        )
+
+        model_path = ""
+        if meta_path.name.endswith("_meta.json") and not meta_path.name.endswith("_rejected_meta.json"):
+            model_candidate = meta_path.with_name(meta_path.name[: -len("_meta.json")] + ".pkl")
+            if model_candidate.exists():
+                model_path = model_candidate.as_posix()
+
+        return {
+            "phase": workflow_mode,
+            "workflow_mode": workflow_mode,
+            "compatibility_mode": compatibility_mode,
+            "runtime_training_mode": runtime_training_mode,
+            "model": estimator_name,
+            "criterion": criterion,
+            "horizon": horizon,
+            "tp_bps": tp_bps,
+            "sl_bps": sl_bps,
+            "status": status,
+            "error": "" if status == "ok" else str(meta_obj.get("status") or raw_status),
+            "model_path": model_path,
+            "meta_path": meta_path.as_posix(),
+            "meta_obj": meta_obj,
+            "search_plan": dict(search_plan),
+            "search_backend_requested": search_plan.get("search_backend_requested"),
+            "search_backend_used": search_plan.get("search_backend_used"),
+            "search_backend_fallback_reason": search_plan.get("search_backend_fallback_reason"),
+            "profit_net": metrics.get("profit_net"),
+            "sharpe": metrics.get("sharpe"),
+            "pf": metrics.get("pf"),
+            "trades": trade_count,
+            "num_trades_short": metrics.get("num_trades_short"),
+            "num_trades_long": metrics.get("num_trades_long"),
+            "qg_reasons": qg_reasons,
+            "created_at": str(meta_obj.get("created_at_iso") or self._now_str()),
+        }
+
+    def _recover_empty_state_from_artifacts(self, state: dict[str, Any]) -> dict[str, Any]:
+        self._last_recovered_results_count = 0
+        if not isinstance(state, dict):
+            return state
+
+        queue = list(state.get("queue") or [])
+        if not queue:
+            return state
+        try:
+            if int(state.get("queue_idx", 0) or 0) > 0:
+                return state
+        except Exception:
+            return state
+        if list(state.get("results") or []):
+            return state
+
+        seed_cfg = dict(queue[0])
+        try:
+            df = DatasetService().prepare_from_csv(
+                self.csv_path,
+                labeling="triple_barrier",
+                target_mode="ternary",
+                horizon=int(seed_cfg.get("horizon") or 12),
+                take_profit_bps=float(seed_cfg.get("tp_bps") or 50.0),
+                stop_loss_bps=float(seed_cfg.get("sl_bps") or 50.0),
+                same_bar_policy="neutral",
+            ).sort_values("timestamp").reset_index(drop=True)
+        except Exception:
+            return state
+
+        n_total = int(len(df))
+        if n_total <= 0:
+            return state
+        n_hold = self._compute_holdout_bars(
+            n_total,
+            self.holdout_pct,
+            self.holdout_min_bars,
+            self.holdout_max_bars,
+        )
+        name_prefix, _ = self._name_and_meta_from_csv(self.csv_path, n_total, max(0, n_total - n_hold), n_hold)
+
+        queue_keys = {self._candidate_key(row) for row in queue}
+        recovered_by_key: dict[tuple[str, str, str, int, float, float], dict[str, Any]] = {}
+        recovered_mtime: dict[tuple[str, str, str, int, float, float], float] = {}
+        expected_csv_path = _normalized_resume_path(self.csv_path)
+        for meta_path in Path(_model_dir()).glob(f"{name_prefix}_*_meta.json"):
+            row = self._recover_result_from_meta_path(
+                meta_path,
+                expected_csv_path=expected_csv_path,
+                expected_n_total=n_total,
+            )
+            if row is None:
+                continue
+            key = self._candidate_key(row)
+            if key not in queue_keys:
+                continue
+            try:
+                mtime = float(meta_path.stat().st_mtime)
+            except Exception:
+                mtime = 0.0
+            if key not in recovered_by_key or mtime >= recovered_mtime.get(key, float("-inf")):
+                recovered_by_key[key] = row
+                recovered_mtime[key] = mtime
+
+        if not recovered_by_key:
+            return state
+
+        recovered_results = [recovered_by_key[self._candidate_key(row)] for row in queue if self._candidate_key(row) in recovered_by_key]
+        if not recovered_results:
+            return state
+
+        state["queue"] = [row for row in queue if self._candidate_key(row) not in recovered_by_key]
+        state["results"] = recovered_results
+        state["queue_idx"] = 0
+        self._save_state(state)
+        self._last_recovered_results_count = len(recovered_results)
+        return state
+
+    @staticmethod
+    def _result_status_rank(row: dict[str, Any]) -> int:
+        status = str(row.get("status") or "").strip().lower()
+        if status == "ok":
+            return 3
+        if status == "rejected":
+            return 2
+        if status == "error":
+            return 1
+        return 0
+
+    @staticmethod
+    def _result_artifact_rank(row: dict[str, Any]) -> tuple[int, int]:
+        meta_path = str(row.get("meta_path") or "").strip()
+        model_path = str(row.get("model_path") or "").strip()
+        meta_exists = int(bool(meta_path) and Path(meta_path).exists())
+        model_exists = int(bool(model_path) and Path(model_path).exists())
+        return meta_exists, model_exists
+
+    @staticmethod
+    def _result_created_sort_value(row: dict[str, Any]) -> str:
+        return str(row.get("created_at") or "").strip()
+
+    def _dedupe_result_rows(self, rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+        best_row_by_key: dict[tuple[str, str, str, int, float, float], dict[str, Any]] = {}
+        best_rank_by_key: dict[tuple[str, str, str, int, float, float], tuple[int, tuple[int, int], str, int]] = {}
+        best_index_by_key: dict[tuple[str, str, str, int, float, float], int] = {}
+
+        for idx, row in enumerate(rows):
+            key = self._candidate_key(row)
+            rank = (
+                self._result_status_rank(row),
+                self._result_artifact_rank(row),
+                self._result_created_sort_value(row),
+                idx,
+            )
+            if key not in best_rank_by_key or rank > best_rank_by_key[key]:
+                best_rank_by_key[key] = rank
+                best_row_by_key[key] = row
+                best_index_by_key[key] = idx
+
+        deduped = [best_row_by_key[key] for _, key in sorted((idx, key) for key, idx in best_index_by_key.items())]
+        duplicate_count = max(0, len(rows) - len(deduped))
+        return deduped, duplicate_count
+
+    def _reconcile_state_progress(self, state: dict[str, Any]) -> dict[str, Any]:
+        self._last_reconciled_duplicate_results_count = 0
+        self._last_reconciled_pruned_queue_count = 0
+        if not isinstance(state, dict):
+            return state
+
+        queue = list(state.get("queue") or [])
+        results = list(state.get("results") or [])
+        deduped_results, duplicate_count = self._dedupe_result_rows(results)
+        result_keys = {self._candidate_key(row) for row in deduped_results}
+
+        try:
+            queue_idx = int(state.get("queue_idx", 0) or 0)
+        except Exception:
+            queue_idx = 0
+        queue_idx = max(0, min(queue_idx, len(queue)))
+
+        should_prune_completed = bool(result_keys) and (queue_idx == 0 or len(deduped_results) >= queue_idx)
+        pruned_queue_count = 0
+        new_queue = queue
+        new_queue_idx = queue_idx
+
+        if should_prune_completed:
+            new_queue = []
+            for pos, row in enumerate(queue):
+                if pos < queue_idx:
+                    pruned_queue_count += 1
+                    continue
+                if self._candidate_key(row) in result_keys:
+                    pruned_queue_count += 1
+                    continue
+                new_queue.append(row)
+            new_queue_idx = 0
+
+        state_changed = duplicate_count > 0 or pruned_queue_count > 0 or new_queue_idx != queue_idx
+        if state_changed:
+            state["results"] = deduped_results
+            state["queue"] = new_queue
+            state["queue_idx"] = new_queue_idx
+            self._save_state(state)
+
+        self._last_reconciled_duplicate_results_count = duplicate_count
+        self._last_reconciled_pruned_queue_count = pruned_queue_count
+        return state
+
     def _save_state(self, state: dict[str, Any]):
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         state["updated_at"] = self._now_str()
@@ -532,14 +902,15 @@ class AutoSearchWorker(QThread):
             return None
         spec = legacy_state.get("spec") or {}
         legacy_profile = str(spec.get("search_profile") or "").strip().lower()
-        if legacy_profile != "full" or self.workflow_mode != "explore":
+        migrated_mode = _normalize_auto_search_profile(legacy_profile)
+        if legacy_profile not in AUTO_SEARCH_PROFILE_ALIASES or migrated_mode != self.workflow_mode:
             return None
 
         queue: list[dict[str, Any]] = []
         for row in list(legacy_state.get("quick_queue") or []):
             queue.append(
                 {
-                    "phase": "explore",
+                    "phase": migrated_mode,
                     "model": str(row.get("model") or "lgb"),
                     "criterion": str(row.get("criterion") or "balanced"),
                     "horizon": int(row.get("horizon") or 12),
@@ -548,25 +919,43 @@ class AutoSearchWorker(QThread):
                 }
             )
 
+        if migrated_mode == "explore":
+            migrated_spec = self._build_spec()
+        else:
+            migrated_spec = {
+                "version": 1,
+                "workflow_mode": migrated_mode,
+                "legacy_search_profile": legacy_profile,
+                "migrated_queue_source": "quick_queue",
+                "criteria": list(spec.get("criteria") or []),
+                "label_horizon_bars": list(spec.get("label_horizon_bars") or []),
+                "label_tp_bps": list(spec.get("label_tp_bps") or []),
+                "label_sl_bps": list(spec.get("label_sl_bps") or []),
+                "shortlist_top_k": int(max(1, self.candidate_top_n)),
+            }
+
         migrated = {
             "version": 2,
             "created_at": legacy_state.get("created_at") or self._now_str(),
             "updated_at": self._now_str(),
             "csv_path": self.csv_path,
-            "workflow_mode": "explore",
-            "spec": self._build_spec(),
-            "phase": "explore",
+            "workflow_mode": migrated_mode,
+            "spec": migrated_spec,
+            "phase": migrated_mode,
             "queue": queue,
             "queue_idx": int(legacy_state.get("quick_idx", 0) or 0),
             "results": list(legacy_state.get("results") or []),
             "stopped": bool(legacy_state.get("stopped", False)),
             "completed": False,
-            "migrated_from": "full",
+            "migrated_from": legacy_profile,
         }
         self._save_state(migrated)
         return migrated
 
     def _load_or_init_state(self) -> tuple[dict[str, Any], bool]:
+        self._last_recovered_results_count = 0
+        self._last_reconciled_duplicate_results_count = 0
+        self._last_reconciled_pruned_queue_count = 0
         if not self.state_path.exists():
             st = self._new_state()
             self._save_state(st)
@@ -581,16 +970,33 @@ class AutoSearchWorker(QThread):
         if migrated is not None:
             return migrated, True
         spec_expected = self._build_spec()
+        state_has_progress = False
+        if isinstance(st, dict):
+            try:
+                state_has_progress = int(st.get("queue_idx", 0) or 0) > 0
+            except Exception:
+                state_has_progress = False
+            if not state_has_progress:
+                state_has_progress = bool(st.get("results"))
+        allow_spec_mismatch = bool(isinstance(st, dict) and st.get("migrated_from")) or state_has_progress
         if (
             not isinstance(st, dict)
-            or str(st.get("csv_path")) != self.csv_path
+            or not self._same_csv_path(st.get("csv_path"), self.csv_path)
             or str(st.get("workflow_mode") or "") != self.workflow_mode
-            or st.get("spec") != spec_expected
             or st.get("phase") == "done"
         ):
             st = self._new_state()
             self._save_state(st)
             return st, False
+        if st.get("spec") != spec_expected and not allow_spec_mismatch:
+            st = self._new_state()
+            self._save_state(st)
+            return st, False
+        if str(st.get("csv_path") or "") != self.csv_path:
+            st["csv_path"] = self.csv_path
+            self._save_state(st)
+        st = self._recover_empty_state_from_artifacts(st)
+        st = self._reconcile_state_progress(st)
         return st, True
 
     @staticmethod
@@ -849,19 +1255,31 @@ class AutoSearchWorker(QThread):
             candidate_top_n=int(self.candidate_top_n),
             candidate_fresh_ratio=float(self.candidate_fresh_ratio),
             training_profile=dict(self.training_profiles.get(phase) or {}),
+            should_continue=lambda: not self._stop_requested,
         )
 
     def run(self):
+        state: dict[str, Any] | None = None
         try:
             state, resumed = self._load_or_init_state()
             spec = (state.get("spec") or {}) if isinstance(state, dict) else {}
             workflow_mode = str(spec.get("workflow_mode") or self.workflow_mode)
-            queue = list(state.get("queue") or [])
+            completed_count, total_count = self._workflow_progress_counts(state)
             self.message.emit(
                 f"INFO Workflow {'resume' if resumed else 'start'}: {self.state_path.as_posix()} "
                 f"| mode={workflow_mode} "
-                f"| phase={state.get('phase')} queue={state.get('queue_idx', 0)}/{len(queue)}"
+                f"| phase={state.get('phase')} queue={completed_count}/{total_count}"
             )
+            if self._last_recovered_results_count > 0:
+                self.message.emit(
+                    f"INFO Workflow recovery: restored {self._last_recovered_results_count} completed candidates from saved artifacts."
+                )
+            if self._last_reconciled_duplicate_results_count > 0 or self._last_reconciled_pruned_queue_count > 0:
+                self.message.emit(
+                    "INFO Workflow reconcile: "
+                    f"removed {self._last_reconciled_duplicate_results_count} duplicate result rows "
+                    f"and pruned {self._last_reconciled_pruned_queue_count} completed candidates from queue."
+                )
 
             while not self._stop_requested:
                 q = list(state.get("queue") or [])
@@ -876,8 +1294,20 @@ class AutoSearchWorker(QThread):
                     break
 
                 cfg = dict(q[i])
+                candidate_key = self._candidate_key(cfg)
+                completed_keys = {self._candidate_key(row) for row in list(state.get("results") or [])}
+                if candidate_key in completed_keys:
+                    state["queue_idx"] = i + 1
+                    self._save_state(state)
+                    self.message.emit(
+                        f"INFO Workflow skip duplicate candidate: mode={workflow_mode} "
+                        f"model={cfg.get('model')} criterion={cfg.get('criterion')} "
+                        f"horizon={cfg.get('horizon')} tp={cfg.get('tp_bps')} sl={cfg.get('sl_bps')}"
+                    )
+                    continue
+                completed_count, total_count = self._workflow_progress_counts(state)
                 self.message.emit(
-                    f"INFO Workflow run [{i+1}/{len(q)}] mode={workflow_mode} "
+                    f"INFO Workflow run [{completed_count+1}/{total_count}] mode={workflow_mode} "
                     f"model={cfg.get('model')} criterion={cfg.get('criterion')} "
                     f"horizon={cfg.get('horizon')} tp={cfg.get('tp_bps')} sl={cfg.get('sl_bps')}"
                 )
@@ -894,6 +1324,13 @@ class AutoSearchWorker(QThread):
 
             completed = bool(state.get("phase") == "done" and state.get("completed"))
             self.finished_state.emit(self.state_path.as_posix(), completed)
+        except InterruptedError:
+            if isinstance(state, dict):
+                state["stopped"] = True
+                state["completed"] = False
+                self._save_state(state)
+            self.message.emit("INFO Workflow: stop acknowledged, aktualni kandidat prerusen.")
+            self.finished_state.emit(self.state_path.as_posix(), False)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -903,6 +1340,8 @@ class ModelTrainingTab(QWidget):
         super().__init__()
         self.dataset: pd.DataFrame | None = None
         self.csv_path: str | None = None
+        self._ui_settings = QSettings("ibkr_trading_bot", "model_training_tab")
+        self._pending_restore_csv_path: str | None = None
         self.worker: TrainWorker | None = None
         self.auto_worker: AutoSearchWorker | None = None
         self.X_test: pd.DataFrame | None = None
@@ -939,7 +1378,7 @@ class ModelTrainingTab(QWidget):
         self.cmb_model.addItems(["hgbt", "rf", "et", "xgb", "lgb", "svm"])
         self.cmb_model.hide()
         self.cmb_training_mode = QComboBox()
-        self.cmb_training_mode.addItems(["quick", "standard", "strict"])
+        self.cmb_training_mode.addItems(["quick", "standard"])
         self.cmb_training_mode.setCurrentText("standard")
         self.cmb_training_mode.currentTextChanged.connect(lambda _: self._refresh_train_button_text())
         self.cmb_training_mode.hide()
@@ -1016,10 +1455,11 @@ class ModelTrainingTab(QWidget):
         lay3.addWidget(self.log)
         root.addWidget(box3, 1)
         self._on_search_backend_changed()
+        self._restore_last_csv_path()
 
     def _current_training_mode(self) -> str:
         txt = (self.cmb_training_mode.currentText() or "").strip().lower()
-        return txt if txt in {"quick", "standard", "strict"} else "standard"
+        return txt if txt in {"quick", "standard"} else "standard"
 
     def _training_profile_for_mode(self, mode: str) -> dict[str, Any]:
         return training_profile_for_mode(mode)
@@ -1143,15 +1583,7 @@ class ModelTrainingTab(QWidget):
             return 0.30
 
     def _current_auto_search_profile(self) -> str:
-        txt = (self.cmb_auto_search_profile.currentText() or "").strip().lower()
-        alias_map = {
-            "fast": "refine",
-            "full": "explore",
-            "weekly": "refresh",
-        }
-        if txt in {"explore", "refine", "refresh"}:
-            return txt
-        return alias_map.get(txt, "explore")
+        return _normalize_auto_search_profile(self.cmb_auto_search_profile.currentText() or "")
 
     def _compute_holdout_bars(self, n_total: int) -> int:
         return runtime_compute_holdout_bars(
@@ -1161,18 +1593,47 @@ class ModelTrainingTab(QWidget):
             int(self.holdout_max_bars_default),
         )
 
-    def pick_csv(self):
-        base_dir = Path(__file__).resolve().parents[1] / "data" / "processed"
-        path, _ = QFileDialog.getOpenFileName(self, "Vyber CSV s daty", base_dir.as_posix(), "CSV Files (*.csv)")
-        if not path:
+    def on_tab_activated(self):
+        if self.dataset is not None or not self._pending_restore_csv_path:
             return
-        self.csv_path = path
-        self.lbl_csv.setText(f"Vybrany soubor: {os.path.basename(path)}")
+        restore_path = self._pending_restore_csv_path
+        self._pending_restore_csv_path = None
+        self._load_csv_path(restore_path, persist=False, restored=True)
+
+    def _restore_last_csv_path(self) -> None:
+        saved_path = str(self._ui_settings.value(LAST_TRAINING_CSV_PATH_KEY, "") or "").strip()
+        if not saved_path:
+            return
+        candidate = Path(saved_path).expanduser()
+        try:
+            if not candidate.exists():
+                return
+            normalized_path = str(candidate.resolve())
+        except Exception:
+            return
+        self._pending_restore_csv_path = normalized_path
+        self.lbl_csv.setText(f"Vybrany soubor: {os.path.basename(normalized_path)}")
+
+    def _default_csv_dialog_dir(self) -> str:
+        candidate_path = self.csv_path or self._pending_restore_csv_path
+        if candidate_path:
+            candidate_dir = Path(candidate_path).expanduser().resolve().parent
+            if candidate_dir.exists():
+                return candidate_dir.as_posix()
+        base_dir = Path(__file__).resolve().parents[1] / "data" / "processed"
+        return base_dir.as_posix()
+
+    def _load_csv_path(self, path: str, *, persist: bool, restored: bool = False) -> bool:
+        normalized_path = str(Path(path).expanduser().resolve())
+        self.csv_path = normalized_path
+        self.lbl_csv.setText(f"Vybrany soubor: {os.path.basename(normalized_path)}")
+        if restored:
+            self.log.appendPlainText(f"INFO Obnovuji posledni CSV: {normalized_path}")
 
         try:
             svc = DatasetService()
             df = svc.prepare_from_csv(
-                path,
+                normalized_path,
                 labeling="triple_barrier",
                 target_mode="ternary",
                 horizon=int(self._label_horizon_bars),
@@ -1191,7 +1652,7 @@ class ModelTrainingTab(QWidget):
                 f"tp_bps={float(self._label_take_profit_bps):.1f} "
                 f"sl_bps={float(self._label_stop_loss_bps):.1f} same_bar=neutral"
             )
-            dataset_meta = read_dataset_sidecar_meta(path)
+            dataset_meta = read_dataset_sidecar_meta(normalized_path)
             if dataset_meta:
                 self.log.appendPlainText(
                     "INFO Dataset meta: "
@@ -1205,16 +1666,33 @@ class ModelTrainingTab(QWidget):
                         f"prepared_ratio={float(dataset_meta.get('prepared_retention_ratio', 0.0)):.3f} "
                         f"flat_zero_ratio={float((dataset_meta.get('quality_report') or {}).get('flat_zero_ratio', 0.0)):.3f}"
                     )
-            self.log.appendPlainText(f"OK Nacteno: {path} | radku={n_rows}")
+            self.log.appendPlainText(f"OK Nacteno: {normalized_path} | radku={n_rows}")
             self._log_dataset_audit(df)
             self._set_controls_running(False)
             self._refresh_train_button_text()
             self.tbl.setRowCount(0)
             self.prog.setRange(0, 1)
             self.prog.setValue(0)
+            self._pending_restore_csv_path = None
+            if persist:
+                self._ui_settings.setValue(LAST_TRAINING_CSV_PATH_KEY, normalized_path)
+                self._ui_settings.sync()
+            return True
         except Exception as e:
             self.log.appendPlainText(f"ERROR Chyba nacteni/pripravy dat: {e}")
             self._set_controls_running(False)
+            return False
+
+    def pick_csv(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Vyber CSV s daty",
+            self._default_csv_dialog_dir(),
+            "CSV Files (*.csv)",
+        )
+        if not path:
+            return
+        self._load_csv_path(path, persist=True)
 
     def run_training(self):
         if self.dataset is None:
@@ -1351,20 +1829,22 @@ class ModelTrainingTab(QWidget):
         safe = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("_")
         if not safe:
             safe = "dataset"
-        profile_norm = str(profile or "").strip().lower()
-        profile_norm = {
-            "fast": "refine",
-            "full": "explore",
-            "weekly": "refresh",
-        }.get(profile_norm, profile_norm)
-        if profile_norm not in {"explore", "refine", "refresh"}:
-            profile_norm = "explore"
+        profile_norm = _normalize_auto_search_profile(profile)
         state_dir = Path(_model_dir()) / "auto_search"
         prof_path = state_dir / f"{safe}_{profile_norm}_state.json"
-        legacy_path = state_dir / f"{safe}_state.json"
-        if profile_norm == "explore" and legacy_path.exists() and not prof_path.exists():
-            return legacy_path
-        return prof_path
+        legacy_candidates = {
+            "explore": [
+                state_dir / f"{safe}_state.json",
+                state_dir / f"{safe}_full_state.json",
+            ],
+            "refine": [state_dir / f"{safe}_fast_state.json"],
+            "refresh": [state_dir / f"{safe}_weekly_state.json"],
+        }
+        candidates = [prof_path, *legacy_candidates.get(profile_norm, [])]
+        existing = [path for path in candidates if path.exists()]
+        if not existing:
+            return prof_path
+        return max(existing, key=_auto_search_state_score)
 
     def run_auto_search(self):
         if self.dataset is None or not self.csv_path:
@@ -1415,6 +1895,7 @@ class ModelTrainingTab(QWidget):
     def stop_auto_search(self):
         if self._is_auto_search_running() and self.auto_worker is not None:
             self.auto_worker.request_stop()
+            self.btn_auto_stop.setEnabled(False)
             self.log.appendPlainText("INFO Workflow: stop requested (ulozim checkpoint a ukoncim beh).")
 
     def _on_auto_result(self, row: dict[str, Any]):

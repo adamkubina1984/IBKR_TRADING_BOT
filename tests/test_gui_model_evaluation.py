@@ -1,3 +1,5 @@
+import json
+
 import pandas as pd
 import pytest
 
@@ -150,6 +152,32 @@ def test_model_evaluation_workers_use_active_exit_policy(monkeypatch, qapp):
         tab._start_auto_threshold_worker()
 
         assert len(created) == 3
-        assert all(kwargs["exit_policy"] == "legacy_flat_exit" for kwargs in created)
+        assert all(kwargs["exit_policy"] == "flat_on_weak_signal" for kwargs in created)
+        assert "flat_on_weak_signal" in tab.lbl_exit_policy.text()
+    finally:
+        tab.close()
+
+
+def test_model_evaluation_save_model_settings_persists_active_exit_policy(monkeypatch, qapp, tmp_path):
+    monkeypatch.setattr(tab_model_evaluation_module.QMessageBox, "information", lambda *args, **kwargs: None)
+
+    tab = ModelEvaluationTab()
+    try:
+        model_path = tmp_path / "demo.pkl"
+        tab.model_path = str(model_path)
+        tab.model_metadata = {"user_settings": {"exit_policy": "legacy_flat"}}
+        tab.et_spin.setValue(0.61)
+        tab.ext_spin.setValue(0.72)
+        monkeypatch.setattr(tab, "_resolve_ternary_thresholds", lambda: (0.31, 0.69))
+
+        tab._on_save_model_settings()
+
+        meta_path = model_path.with_name("demo_meta.json")
+        saved = json.loads(meta_path.read_text(encoding="utf-8"))
+
+        assert saved["user_settings"]["entry_threshold"] == pytest.approx(0.61)
+        assert saved["user_settings"]["exit_threshold"] == pytest.approx(0.72)
+        assert saved["user_settings"]["exit_policy"] == "flat_on_weak_signal"
+        assert saved["exit_policy"] == "flat_on_weak_signal"
     finally:
         tab.close()
