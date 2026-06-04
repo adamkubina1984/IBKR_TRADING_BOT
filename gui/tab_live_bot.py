@@ -1010,9 +1010,10 @@ class _WarmAdapter:
 
         # L1: AND nebo VOTE podle nastavení (model-only = VOTE)
         if use_and:
-            label, conf_min, dirs, confs = self.w._predict_one_label_AND(features, thr=0.0)
+            prediction_result = self.w._predict_one_label_AND(features, thr=0.0)
         else:
-            label, conf_min, dirs, confs = self.w._predict_one_label_VOTE(features)
+            prediction_result = self.w._predict_one_label_VOTE(features)
+        label, conf_min, dirs, confs, _, _ = self.w._unpack_prediction_result(prediction_result)
         l1 = "LONG" if label == +1 else "SHORT" if label == -1 else "FLAT"
 
         # L2: (volitelně) MA ∧ L1 + aplikace prahu z UI (thr_ui) – stejná politika jako v _rescore_all
@@ -1116,7 +1117,7 @@ class LiveBotWidget(QWidget):
 
         self._live_pos = 0       # -1 short, 0 flat, +1 long
         self._live_entry_px = None
-        self._trade_executor = TradeExecutor()
+        self._reset_fallback_trade_executor()
         self._trades: list[dict[str, Any]] = []
         self._open_trade: dict[str, Any] | None = None
         self._trading_enabled = False
@@ -1643,9 +1644,10 @@ class LiveBotWidget(QWidget):
         box = QGroupBox("Grafy")
         v = QVBoxLayout()
         self.fig = Figure(figsize=(8, 5), constrained_layout=True)
-        gs = self.fig.add_gridspec(nrows=2, ncols=1, height_ratios=[3, 2])
+        gs = self.fig.add_gridspec(nrows=3, ncols=1, height_ratios=[3, 1, 1])
         self.ax_price = self.fig.add_subplot(gs[0, 0])
-        self.ax_macd  = self.fig.add_subplot(gs[1, 0], sharex=self.ax_price)
+        self.ax_proba = self.fig.add_subplot(gs[1, 0], sharex=self.ax_price)
+        self.ax_macd  = self.fig.add_subplot(gs[2, 0], sharex=self.ax_price)
         self.canvas = FigureCanvas(self.fig)
         v.addWidget(self.canvas)
         box.setLayout(v)
@@ -1718,12 +1720,10 @@ class LiveBotWidget(QWidget):
             self._live_entry_px = None
             self._open_trade = None
 
-        self._trade_executor = TradeExecutor(
-            TradeState(
-                position=int(self._live_pos),
-                entry_price=self._live_entry_px,
-                entry_time=(position.opened_at if self._live_pos != 0 else None),
-            )
+        self._seed_fallback_trade_executor(
+            position=int(self._live_pos),
+            entry_price=self._live_entry_px,
+            entry_time=(position.opened_at if self._live_pos != 0 else None),
         )
 
         broker_status = controller.broker_status
@@ -1732,12 +1732,13 @@ class LiveBotWidget(QWidget):
         else:
             self.lbl_mode.setText(f"Mode: {status.mode}")
 
+        self._render_trade_table()
+
     def _refresh_trades_from_controller(self) -> None:
         controller = getattr(self, "live_controller", None)
         if controller is None or not hasattr(self, "tbl_trades"):
             return
         rows = controller.list_closed_trades()
-        self.tbl_trades.setRowCount(0)
         self._trades = []
         for row in rows:
             entry_time = str(row.get("entry_time") or "")[:19]
@@ -1746,7 +1747,6 @@ class LiveBotWidget(QWidget):
             exit_time = str(row.get("exit_time") or "")[:19]
             exit_price = float(row.get("exit_price", 0.0) or 0.0)
             pnl = float(row.get("pnl", 0.0) or 0.0)
-            self._add_trade_to_table(entry_time, direction, entry_price, exit_time, exit_price, pnl)
             self._trades.append(
                 {
                     "entry_time": entry_time,
@@ -1757,6 +1757,7 @@ class LiveBotWidget(QWidget):
                     "pnl": pnl,
                 }
             )
+        self._render_trade_table()
 
     def _reset_runtime_state(
         self,
@@ -1776,7 +1777,7 @@ class LiveBotWidget(QWidget):
         self._degradation_request_id += 1
         self._bootstrap_done = True
         self._warmup_done = True
-        self._trade_executor = TradeExecutor()
+        self._reset_fallback_trade_executor()
         self._live_pos = 0
         self._live_entry_px = None
         self._open_trade = None
@@ -1867,8 +1868,8 @@ class LiveBotWidget(QWidget):
             self._refresh_trades_from_controller()
         else:
             if not self._trading_enabled:
-                self._trade_executor = TradeExecutor()
-                self._sync_live_state_from_executor()
+                self._reset_fallback_trade_executor()
+                self._sync_live_state_from_fallback_executor()
             self.lbl_mode.setText("Mode: LIVE" if self._trading_enabled else "Mode: OBSERVE")
 
     @Slot(int)
@@ -2578,15 +2579,29 @@ class LiveBotWidget(QWidget):
             )
 
     # AND hlasování přes všechny modely
-    def _predict_one_label_AND(self, Xrow: pd.DataFrame, thr: float) -> tuple[int, float, list[str], list[float]]:
+    @staticmethod
+    def _unpack_prediction_result(result: Any) -> tuple[int, float, list[str], list[float], float | None, float | None]:
+        if not isinstance(result, tuple):
+            raise TypeError(f"Prediction helper returned unsupported value: {type(result)!r}")
+        if len(result) == 6:
+            label, conf, dirs, confs, p_long, p_short = result
+            return label, conf, dirs, confs, p_long, p_short
+        if len(result) == 4:
+            label, conf, dirs, confs = result
+            return label, conf, dirs, confs, None, None
+        raise ValueError(f"Prediction helper returned unexpected tuple size: {len(result)}")
+
+    def _predict_one_label_AND(self, Xrow: pd.DataFrame, thr: float) -> tuple[int, float, list[str], list[float], float | None, float | None]:
         """
-        Vrací (label {-1,0,+1}, conf_min, directions, confs)
+        Vraci (label {-1,0,+1}, conf_min, directions, confs, p_long_mean, p_short_mean)
         """
         if not self.models:
-            return 0, 0.0, [], []
+            return 0, 0.0, [], [], None, None
 
         dirs = []
         confs = []
+        prob_longs = []
+        prob_shorts = []
         for m in self.models:
             mdl = m["predictor"]
             exp = m.get("exp_feats")
@@ -2625,26 +2640,34 @@ class LiveBotWidget(QWidget):
 
             dirs.append(direction)
             confs.append(conf)
+            if np.isfinite(pL):
+                prob_longs.append(float(pL))
+            if np.isfinite(pS):
+                prob_shorts.append(float(pS))
 
 
         conf_min = min(confs) if confs else 0.0
+        p_long_mean = float(np.mean(prob_longs)) if prob_longs else None
+        p_short_mean = float(np.mean(prob_shorts)) if prob_shorts else None
         if all(d == "LONG"  for d in dirs) and conf_min >= thr:
-            return +1, conf_min, dirs, confs
+            return +1, conf_min, dirs, confs, p_long_mean, p_short_mean
         if all(d == "SHORT" for d in dirs) and conf_min >= thr:
-            return -1, conf_min, dirs, confs
-        return 0, conf_min, dirs, confs
+            return -1, conf_min, dirs, confs, p_long_mean, p_short_mean
+        return 0, conf_min, dirs, confs, p_long_mean, p_short_mean
 
     # Majority-vote přes všechny modely (model-only, bez MA filtru)
-    def _predict_one_label_VOTE(self, Xrow: pd.DataFrame) -> tuple[int, float, list[str], list[float]]:
+    def _predict_one_label_VOTE(self, Xrow: pd.DataFrame) -> tuple[int, float, list[str], list[float], float | None, float | None]:
         """
-        Vrací (label {-1,0,+1}, conf_vote, directions, confs)
+        Vraci (label {-1,0,+1}, conf_vote, directions, confs, p_long_mean, p_short_mean)
         label=0 při remíze nebo když není jasná většina.
         """
         if not self.models:
-            return 0, 0.0, [], []
+            return 0, 0.0, [], [], None, None
 
         dirs = []
         confs = []
+        prob_longs = []
+        prob_shorts = []
         for m in self.models:
             mdl = m["predictor"]
             exp = m.get("exp_feats")
@@ -2675,17 +2698,23 @@ class LiveBotWidget(QWidget):
 
             dirs.append(direction)
             confs.append(conf)
+            if np.isfinite(pL):
+                prob_longs.append(float(pL))
+            if np.isfinite(pS):
+                prob_shorts.append(float(pS))
 
+        p_long_mean = float(np.mean(prob_longs)) if prob_longs else None
+        p_short_mean = float(np.mean(prob_shorts)) if prob_shorts else None
         n_long = sum(1 for d in dirs if d == "LONG")
         n_short = sum(1 for d in dirs if d == "SHORT")
         if n_long == n_short:
-            return 0, float(np.mean(confs)) if confs else 0.0, dirs, confs
+            return 0, float(np.mean(confs)) if confs else 0.0, dirs, confs, p_long_mean, p_short_mean
 
         if n_long > n_short:
             conf_vote = float(np.mean([c for d, c in zip(dirs, confs) if d == "LONG"]))
-            return +1, conf_vote, dirs, confs
+            return +1, conf_vote, dirs, confs, p_long_mean, p_short_mean
         conf_vote = float(np.mean([c for d, c in zip(dirs, confs) if d == "SHORT"]))
-        return -1, conf_vote, dirs, confs
+        return -1, conf_vote, dirs, confs, p_long_mean, p_short_mean
 
     def _prepare_X_for_model(self, Xrow: pd.DataFrame, exp: list[str], *, model_label: str = "model") -> pd.DataFrame:
         """Připrav řádek pro model. Chybné features vyplní mediánem z dostupných dat."""
@@ -2975,11 +3004,22 @@ class LiveBotWidget(QWidget):
     def _nearest_bar_index(self, ts) -> int | None:
         if not self._bars:
             return None
-        t_target = int(pd.to_datetime(ts).value)
         arr = np.array([int(pd.to_datetime(b["time"]).value) for b in self._bars], dtype=np.int64)
+        return self._nearest_index_for_times(arr, ts)
+
+    def _chart_time_tolerance_ns(self) -> int:
         tf = (self.config.bar_size or "1 hour")
-        sec = {"5 min":300, "15 min":900, "30 min":1800, "1 hour":3600}.get(tf, 3600)
-        tol_ns = int(0.5 * sec * 1e9)
+        sec = {"5 min": 300, "15 min": 900, "30 min": 1800, "1 hour": 3600}.get(tf, 3600)
+        return int(0.5 * sec * 1e9)
+
+    def _nearest_index_for_times(self, arr: np.ndarray, ts) -> int | None:
+        if arr.size == 0:
+            return None
+        ts_value = pd.to_datetime(ts, utc=True, errors="coerce")
+        if pd.isna(ts_value):
+            return None
+        t_target = int(ts_value.value)
+        tol_ns = self._chart_time_tolerance_ns()
         i = int(np.argmin(np.abs(arr - t_target)))
         if abs(int(arr[i]) - t_target) <= tol_ns:
             return i
@@ -3019,6 +3059,8 @@ class LiveBotWidget(QWidget):
                 self._bars[idx]["signal"] = sig
                 self._bars[idx]["chart_signal"] = chart_sig
                 self._bars[idx]["proba"]  = 1.0 if sig else None
+                self._bars[idx]["p_long"] = None
+                self._bars[idx]["p_short"] = None
                 self._bars[idx]["layers"] = {"L0_MA": d0, "L1_AND": None, "L2_AND": sig or "FLAT"}
                 if sig == "LONG":
                     n_long += 1
@@ -3062,9 +3104,10 @@ class LiveBotWidget(QWidget):
 
             if use_ma_and:
                 thr_model = 0.0  # nefiltruj směr uvnitř AND, prahy řeší hysterese
-                label, conf_min, dirs, confs = self._predict_one_label_AND(Xrow, thr_model)
+                prediction_result = self._predict_one_label_AND(Xrow, thr_model)
             else:
-                label, conf_min, dirs, confs = self._predict_one_label_VOTE(Xrow)
+                prediction_result = self._predict_one_label_VOTE(Xrow)
+            label, conf_min, dirs, confs, p_long, p_short = self._unpack_prediction_result(prediction_result)
             l1 = "LONG" if label == +1 else "SHORT" if label == -1 else "FLAT"
             if l1 == "FLAT":
                 n_l1_flat += 1
@@ -3097,6 +3140,8 @@ class LiveBotWidget(QWidget):
             self._bars[idx]["signal"] = final
             self._bars[idx]["chart_signal"] = chart_sig
             self._bars[idx]["proba"]  = proba
+            self._bars[idx]["p_long"] = p_long
+            self._bars[idx]["p_short"] = p_short
             self._bars[idx]["layers"] = layers
 
             if final == "LONG":
@@ -3155,19 +3200,84 @@ class LiveBotWidget(QWidget):
             return
         
         final = last_bar.get("signal")
-        if final is None:
-            return
+
+        controller = getattr(self, "live_controller", None)
+        if controller is not None:
+            try:
+                last_processed = pd.to_datetime(
+                    getattr(controller.status.runtime_state, "last_processed_closed_bar_at", None),
+                    utc=True,
+                    errors="coerce",
+                )
+                if pd.notna(last_processed) and last_processed >= ts:
+                    self._sync_live_state_from_controller()
+                    self._refresh_trades_from_controller()
+                    return
+
+                controller.process_closed_bar(ts, float(raw.loc[ts, "close"]), signal=final)
+                self._sync_live_state_from_controller()
+                self._refresh_trades_from_controller()
+                return
+            except Exception as exc:
+                self._seed_fallback_trade_executor_from_controller()
+                self._append_log(f"[WARN] Controller paper runtime selhal, prepinam na lokalni executor: {exc}")
+
         result = self._trade_executor.step(final, float(raw.loc[ts, "close"]), ts)
         if result.closed_trade is not None:
             self._store_closed_trade(result.closed_trade)
-        self._sync_live_state_from_executor()
+        self._sync_live_state_from_fallback_executor()
 
-    def _sync_live_state_from_executor(self) -> None:
+    def _reset_fallback_trade_executor(self) -> None:
+        self._trade_executor = TradeExecutor()
+
+    def _seed_fallback_trade_executor(
+        self,
+        *,
+        position: int,
+        entry_price: float | None,
+        entry_time: Any,
+    ) -> None:
+        self._trade_executor = TradeExecutor(
+            TradeState(
+                position=int(position),
+                entry_price=entry_price,
+                entry_time=entry_time,
+            )
+        )
+
+    def _seed_fallback_trade_executor_from_controller(self) -> None:
+        controller = getattr(self, "live_controller", None)
+        if controller is None:
+            return
+
+        position = controller.status.runtime_state.position
+        side = str(position.side or "FLAT").upper()
+        if side == "LONG":
+            fallback_position = 1
+            fallback_entry_price = float(position.avg_price) if position.avg_price is not None else None
+            fallback_entry_time = position.opened_at
+        elif side == "SHORT":
+            fallback_position = -1
+            fallback_entry_price = float(position.avg_price) if position.avg_price is not None else None
+            fallback_entry_time = position.opened_at
+        else:
+            fallback_position = 0
+            fallback_entry_price = None
+            fallback_entry_time = None
+
+        self._seed_fallback_trade_executor(
+            position=fallback_position,
+            entry_price=fallback_entry_price,
+            entry_time=fallback_entry_time,
+        )
+
+    def _sync_live_state_from_fallback_executor(self) -> None:
         state = self._trade_executor.state
         self._live_pos = int(state.position)
         self._live_entry_px = float(state.entry_price) if state.entry_price is not None else None
         if self._live_pos == 0 or state.entry_price is None:
             self._open_trade = None
+            self._render_trade_table()
             return
 
         direction = "LONG" if self._live_pos > 0 else "SHORT"
@@ -3178,6 +3288,7 @@ class LiveBotWidget(QWidget):
             "entry_time": entry_time_text,
             "entry_price": float(state.entry_price),
         }
+        self._render_trade_table()
 
     def _store_closed_trade(self, trade: ClosedTrade) -> None:
         entry_time = pd.to_datetime(trade.entry_time, utc=True, errors="coerce")
@@ -3186,14 +3297,6 @@ class LiveBotWidget(QWidget):
         exit_time_text = str(exit_time)[:19] if pd.notna(exit_time) else str(trade.exit_time or "")[:19]
         direction = "LONG" if int(trade.side) > 0 else "SHORT"
         pnl = float(trade.pnl)
-        self._add_trade_to_table(
-            entry_time_text,
-            direction,
-            float(trade.entry_price),
-            exit_time_text,
-            float(trade.exit_price),
-            pnl,
-        )
         self._trades.append({
             "entry_time": entry_time_text,
             "direction": direction,
@@ -3202,6 +3305,65 @@ class LiveBotWidget(QWidget):
             "exit_price": float(trade.exit_price),
             "pnl": pnl,
         })
+
+    def _build_visible_trade_rows(self) -> list[dict[str, Any]]:
+        rows = [dict(row) for row in self._trades]
+        if self._open_trade is not None:
+            rows.append(
+                {
+                    "entry_time": str(self._open_trade.get("entry_time") or "")[:19],
+                    "direction": str(self._open_trade.get("direction") or ""),
+                    "entry_price": float(self._open_trade.get("entry_price", 0.0) or 0.0),
+                    "exit_time": "otevreny",
+                    "exit_price": None,
+                    "pnl": None,
+                }
+            )
+        return rows
+
+    def _build_trade_chart_events(self) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+
+        for row in self._trades:
+            direction = str(row.get("direction") or "").strip().upper()
+            if direction not in {"LONG", "SHORT"}:
+                continue
+
+            entry_time = row.get("entry_time")
+            exit_time = row.get("exit_time")
+            if entry_time:
+                events.append({"kind": "entry", "direction": direction, "time": entry_time})
+            if exit_time and str(exit_time).strip().lower() != "otevreny":
+                events.append({"kind": "exit", "direction": direction, "time": exit_time})
+
+        if self._open_trade is not None:
+            direction = str(self._open_trade.get("direction") or "").strip().upper()
+            entry_time = self._open_trade.get("entry_time")
+            if direction in {"LONG", "SHORT"} and entry_time:
+                events.append({"kind": "entry", "direction": direction, "time": entry_time, "is_open": True})
+
+        return events
+
+    def _render_trade_table(self) -> None:
+        if not hasattr(self, "tbl_trades"):
+            return
+
+        self.tbl_trades.setRowCount(0)
+        for row in self._build_visible_trade_rows():
+            self._add_trade_to_table(
+                str(row.get("entry_time") or "")[:19],
+                str(row.get("direction") or ""),
+                float(row.get("entry_price", 0.0) or 0.0),
+                row.get("exit_time"),
+                row.get("exit_price"),
+                row.get("pnl"),
+            )
+
+    def _format_trade_time_text(self, value: Any) -> str:
+        text = str(value or "")[:19]
+        if len(text) >= 11 and text[10] == "T":
+            return f"{text[:10]} {text[11:]}"
+        return text
 
     # ========== Degradation Diagnostics METHODS ==========
     
@@ -3450,15 +3612,27 @@ class LiveBotWidget(QWidget):
         cursor.movePosition(QTextCursor.End)
         self.console.setTextCursor(cursor)
 
-    def _add_trade_to_table(self, entry_time: str, direction: str, entry_price: float, exit_time: str, exit_price: float, pnl: float) -> None:
+    def _add_trade_to_table(
+        self,
+        entry_time: str,
+        direction: str,
+        entry_price: float,
+        exit_time: str | None,
+        exit_price: float | None,
+        pnl: float | None,
+    ) -> None:
         """Přidá obchod do tabulky."""
         row = self.tbl_trades.rowCount()
         self.tbl_trades.insertRow(row)
-        self.tbl_trades.setItem(row, 0, QTableWidgetItem(f"{entry_time} → {exit_time}"))
+        entry_time_text = self._format_trade_time_text(entry_time)
+        exit_time_text = self._format_trade_time_text(exit_time)
+        exit_price_text = "" if exit_price is None else f"{float(exit_price):.2f}"
+        pnl_text = "" if pnl is None else f"{float(pnl):+.2f}"
+        self.tbl_trades.setItem(row, 0, QTableWidgetItem(f"{entry_time_text} → {exit_time_text}"))
         self.tbl_trades.setItem(row, 1, QTableWidgetItem(direction))
         self.tbl_trades.setItem(row, 2, QTableWidgetItem(f"{entry_price:.2f}"))
-        self.tbl_trades.setItem(row, 3, QTableWidgetItem(f"{exit_price:.2f}"))
-        self.tbl_trades.setItem(row, 4, QTableWidgetItem(f"{pnl:+.2f}"))
+        self.tbl_trades.setItem(row, 3, QTableWidgetItem(exit_price_text))
+        self.tbl_trades.setItem(row, 4, QTableWidgetItem(pnl_text))
         # Scroll to bottom
         self.tbl_trades.scrollToBottom()
 
@@ -3606,7 +3780,7 @@ class LiveBotWidget(QWidget):
 
     def _render_charts(self) -> None:
         if not self._bars:
-            self.ax_price.cla(); self.ax_macd.cla(); self.canvas.draw_idle(); return
+            self.ax_price.cla(); self.ax_proba.cla(); self.ax_macd.cla(); self.canvas.draw_idle(); return
         display_n = max(30, int(getattr(self.config, "display_bars", 144)))
         df = pd.DataFrame(self._bars)
         if "time" in df.columns:
@@ -3624,8 +3798,8 @@ class LiveBotWidget(QWidget):
         sig  = macd.ewm(span=9, adjust=False).mean()
         hist = macd - sig
 
-        ax1, ax2 = self.ax_price, self.ax_macd
-        ax1.cla(); ax2.cla()
+        ax1, ax2, ax3 = self.ax_price, self.ax_proba, self.ax_macd
+        ax1.cla(); ax2.cla(); ax3.cla()
         x = np.arange(len(df))
         bullish_color = '#1f9d55'
         bearish_color = '#d64545'
@@ -3661,10 +3835,10 @@ class LiveBotWidget(QWidget):
             )
 
         # Šipky v grafu reprezentují aktivní stav obchodu po dobu držení pozice.
+        rng = (df['high'] - df['low']).replace(0, np.nan)
+        pad = float(np.nanmedian(rng)) * 0.12 if not np.isnan(np.nanmedian(rng)) else 0.0
+        pad = max(pad, 0.0001)
         if 'signal' in df.columns or 'chart_signal' in df.columns:
-            rng = (df['high'] - df['low']).replace(0, np.nan)
-            pad = float(np.nanmedian(rng)) * 0.12 if not np.isnan(np.nanmedian(rng)) else 0.0
-            pad = max(pad, 0.0001)
             long_x, long_y, short_x, short_y = [], [], [], []
             for i2, row2 in df.iterrows():
                 state_sig = row2.get('signal') if 'signal' in df.columns else None
@@ -3686,6 +3860,47 @@ class LiveBotWidget(QWidget):
             if short_x:
                 ax1.scatter(short_x, short_y, marker='v', s=90, color=bearish_color, zorder=5)
 
+        display_times = np.array(
+            [int(pd.to_datetime(value, utc=True, errors='coerce').value) for value in df['time']],
+            dtype=np.int64,
+        )
+        long_entry_x, long_entry_y = [], []
+        short_entry_x, short_entry_y = [], []
+        long_exit_x, long_exit_y = [], []
+        short_exit_x, short_exit_y = [], []
+        for event in self._build_trade_chart_events():
+            event_idx = self._nearest_index_for_times(display_times, event.get('time'))
+            if event_idx is None:
+                continue
+
+            bar = df.iloc[event_idx]
+            direction = str(event.get('direction') or '').upper()
+            kind = str(event.get('kind') or '').lower()
+
+            if kind == 'entry':
+                if direction == 'LONG':
+                    long_entry_x.append(event_idx)
+                    long_entry_y.append(float(bar['low']) - (pad * 2.0))
+                elif direction == 'SHORT':
+                    short_entry_x.append(event_idx)
+                    short_entry_y.append(float(bar['high']) + (pad * 2.0))
+            elif kind == 'exit':
+                if direction == 'LONG':
+                    long_exit_x.append(event_idx)
+                    long_exit_y.append(float(bar['high']) + (pad * 2.35))
+                elif direction == 'SHORT':
+                    short_exit_x.append(event_idx)
+                    short_exit_y.append(float(bar['low']) - (pad * 2.35))
+
+        if long_entry_x:
+            ax1.scatter(long_entry_x, long_entry_y, marker='o', s=42, color=bullish_color, edgecolors='black', linewidths=0.7, zorder=4)
+        if short_entry_x:
+            ax1.scatter(short_entry_x, short_entry_y, marker='o', s=42, color=bearish_color, edgecolors='black', linewidths=0.7, zorder=4)
+        if long_exit_x:
+            ax1.scatter(long_exit_x, long_exit_y, marker='x', s=68, color=bullish_color, linewidths=1.5, zorder=4)
+        if short_exit_x:
+            ax1.scatter(short_exit_x, short_exit_y, marker='x', s=68, color=bearish_color, linewidths=1.5, zorder=4)
+
         axis_pad = max(min_body_height, median_range * 0.18)
         y_min = float(df['low'].min()) - axis_pad
         y_max = float(df['high'].max()) + axis_pad
@@ -3693,13 +3908,62 @@ class LiveBotWidget(QWidget):
             ax1.set_ylim(y_min, y_max)
         ax1.set_xlim(-0.75, len(df) - 0.25)
 
+        has_probability_panel = bool(
+            not bool(getattr(self.config, "use_ma_only", False))
+            and bool(self.models)
+            and (
+                ("p_long" in df.columns and df["p_long"].notna().any())
+                or ("p_short" in df.columns and df["p_short"].notna().any())
+            )
+        )
+        prob_long = pd.to_numeric(df.get("p_long"), errors="coerce") if "p_long" in df.columns else pd.Series(np.nan, index=df.index, dtype=float)
+        prob_short = pd.to_numeric(df.get("p_short"), errors="coerce") if "p_short" in df.columns else pd.Series(np.nan, index=df.index, dtype=float)
+        ax2.set_ylabel('Prob.')
+        ax2.set_ylim(0.0, 1.0)
+        if has_probability_panel:
+            if prob_long.notna().any():
+                ax2.plot(x, prob_long.to_numpy(dtype=float), label='BUY / LONG', color=bullish_color, linewidth=1.35)
+            if prob_short.notna().any():
+                ax2.plot(x, prob_short.to_numpy(dtype=float), label='SELL / SHORT', color=bearish_color, linewidth=1.35)
+
+            if isinstance(self._curr_t_long, (int, float)):
+                ax2.axhline(
+                    float(self._curr_t_long),
+                    color=bullish_color,
+                    linestyle='--',
+                    linewidth=1.0,
+                    alpha=0.55,
+                    label=f"T-long={float(self._curr_t_long):.2f}",
+                )
+            if isinstance(self._curr_t_short, (int, float)):
+                ax2.axhline(
+                    float(self._curr_t_short),
+                    color=bearish_color,
+                    linestyle='--',
+                    linewidth=1.0,
+                    alpha=0.55,
+                    label=f"T-short={float(self._curr_t_short):.2f}",
+                )
+            ax2.legend(loc='upper right', fontsize=8, ncol=2)
+        else:
+            ax2.text(
+                0.5,
+                0.5,
+                'BUY/SELL probabilities unavailable\n(MA-only / no model)',
+                transform=ax2.transAxes,
+                ha='center',
+                va='center',
+                fontsize=8,
+                color='#666666',
+            )
+
         ax1.set_ylabel('Price')
-        ax2.plot(x, macd.values, label='MACD')
-        ax2.plot(x, sig.values,  label='Signal')
-        ax2.bar(x, hist.values, width=0.8, alpha=0.3)
-        ax2.set_ylabel('MACD')
-        ax2.legend(loc='upper left', fontsize=8)
-        ax1.grid(True, alpha=0.2); ax2.grid(True, alpha=0.2)
+        ax3.plot(x, macd.values, label='MACD')
+        ax3.plot(x, sig.values,  label='Signal')
+        ax3.bar(x, hist.values, width=0.8, alpha=0.3)
+        ax3.set_ylabel('MACD')
+        ax3.legend(loc='upper left', fontsize=8)
+        ax1.grid(True, alpha=0.2); ax2.grid(True, alpha=0.2); ax3.grid(True, alpha=0.2)
         self.canvas.draw_idle()
 
 
@@ -4102,10 +4366,9 @@ class LiveBotWidget(QWidget):
         if idx is not None:
             existing_bar = self._bars[idx]
             if isinstance(existing_bar, dict):
-                if "signal" in existing_bar:
-                    payload["signal"] = existing_bar.get("signal")
-                if "chart_signal" in existing_bar:
-                    payload["chart_signal"] = existing_bar.get("chart_signal")
+                for preserved_key in ("signal", "chart_signal", "proba", "p_long", "p_short", "layers"):
+                    if preserved_key in existing_bar:
+                        payload[preserved_key] = existing_bar.get(preserved_key)
         if idx is None:
             self._bar_index[key] = len(self._bars)
             self._bars.append(payload)

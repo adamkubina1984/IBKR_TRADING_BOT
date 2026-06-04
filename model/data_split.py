@@ -23,6 +23,13 @@ def walk_forward_split(df, window_size, test_size, step_size, expanding=False):
     :param expanding: True = expanding window, False = rolling window
     :return: seznam dvojic (train_df, test_df)
     """
+    if window_size <= 0:
+        raise ValueError("window_size must be > 0")
+    if test_size <= 0:
+        raise ValueError("test_size must be > 0")
+    if step_size <= 0:
+        raise ValueError("step_size must be > 0")
+
     splits = []
     start = 0
     while start + window_size + test_size <= len(df):
@@ -35,6 +42,8 @@ def walk_forward_split(df, window_size, test_size, step_size, expanding=False):
         splits.append((train_df.copy(), test_df.copy()))
         start += step_size
     return splits
+
+
 
 def export_datasets(pairs, output_dir, prefix="fold", format="csv"):
     """

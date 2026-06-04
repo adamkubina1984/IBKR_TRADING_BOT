@@ -12,6 +12,7 @@ import pandas as pd
 from PySide6.QtCore import QSettings, QThread, Signal
 from PySide6.QtWidgets import (
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -35,6 +36,7 @@ from ibkr_trading_bot.core.services.model_training_service import (
     canonical_workflow_mode,
     compatibility_training_mode,
     compute_holdout_bars as runtime_compute_holdout_bars,
+    dataset_snapshot_signature_from_csv,
     name_and_meta_from_csv as runtime_name_and_meta_from_csv,
     run_training_job,
     training_profile_for_mode,
@@ -51,6 +53,11 @@ from ibkr_trading_bot.model.train_models import (
 
 
 LAST_TRAINING_CSV_PATH_KEY = "last_training_csv_path"
+TRAINING_FEE_PER_TRADE_KEY = "training_fee_per_trade"
+TRAINING_SLIPPAGE_BPS_KEY = "training_slippage_bps"
+REFINE_SOURCE_ARTIFACT_PATH_KEY = "refine_source_artifact_path"
+REFRESH_SOURCE_ARTIFACT_PATH_KEY = "refresh_source_artifact_path"
+REFRESH_TARGET_CSV_PATH_KEY = "refresh_target_csv_path"
 AUTO_SEARCH_PROFILE_ALIASES = {
     "fast": "refine",
     "full": "explore",
@@ -186,6 +193,8 @@ class TrainWorker(QThread):
             quality_min_mc_sharpe_p50 = float(profile.get("quality_min_mc_sharpe_p50", -0.02))
             quality_min_profit_net = float(profile.get("quality_min_profit_net", 0.0))
             quality_min_holdout_sharpe = float(profile.get("quality_min_holdout_sharpe", 0.0))
+            fee_per_trade = float(profile.get("fee_per_trade", 0.0))
+            slippage_bps = float(profile.get("slippage_bps", 0.0))
             training_mode = str(
                 profile.get("training_mode")
                 or profile.get("compatibility_mode")
@@ -240,6 +249,8 @@ class TrainWorker(QThread):
                 quality_min_mc_sharpe_p50=quality_min_mc_sharpe_p50,
                 quality_min_profit_net=quality_min_profit_net,
                 quality_min_holdout_sharpe=quality_min_holdout_sharpe,
+                fee_per_trade=fee_per_trade,
+                slippage_bps=slippage_bps,
                 max_param_candidates=max_param_candidates,
                 param_sample_seed=param_sample_seed,
                 search_backend=search_backend,
@@ -283,6 +294,8 @@ class AutoSearchWorker(QThread):
         candidate_top_n: int,
         candidate_fresh_ratio: float,
         state_path: str,
+        source_artifact_path: str | None = None,
+        refresh_csv_path: str | None = None,
         search_profile: str = "explore",
     ):
         super().__init__()
@@ -296,6 +309,8 @@ class AutoSearchWorker(QThread):
         self.candidate_top_n = int(max(1, candidate_top_n))
         self.candidate_fresh_ratio = float(np.clip(candidate_fresh_ratio, 0.05, 0.80))
         self.state_path = Path(state_path)
+        self.source_artifact_path = str(source_artifact_path or "").strip()
+        self.refresh_csv_path = str(refresh_csv_path or "").strip()
         self.workflow_mode = self._normalize_search_profile(search_profile)
         self._stop_requested = False
         self._last_recovered_results_count = 0
@@ -358,6 +373,36 @@ class AutoSearchWorker(QThread):
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         return self.state_path.parent
 
+    def _explicit_source_artifact(self) -> Path | None:
+        path_txt = str(self.source_artifact_path or "").strip()
+        if not path_txt:
+            return None
+        return Path(path_txt)
+
+    def _target_csv_path_for_phase(self, phase: str) -> str:
+        if str(phase or "").strip().lower() == "refresh":
+            refresh_csv = str(self.refresh_csv_path or "").strip()
+            if refresh_csv:
+                return refresh_csv
+        return self.csv_path
+
+    @staticmethod
+    def _refresh_candidates_from_shortlist_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        refresh_candidates: list[dict[str, Any]] = []
+        for candidate in list(payload.get("candidates") or []):
+            refresh_candidates.append(
+                {
+                    "enabled": True,
+                    "candidate_id": candidate.get("candidate_id"),
+                    "model": candidate.get("model"),
+                    "criterion": candidate.get("criterion"),
+                    "horizon": candidate.get("horizon"),
+                    "tp_bps": candidate.get("tp_bps"),
+                    "sl_bps": candidate.get("sl_bps"),
+                }
+            )
+        return refresh_candidates
+
     def _region_summary_path(self) -> Path:
         return self._artifact_dir() / f"{self._artifact_stem()}_region_summary.json"
 
@@ -366,6 +411,30 @@ class AutoSearchWorker(QThread):
 
     def _refresh_set_path(self) -> Path:
         return self._artifact_dir() / f"{self._artifact_stem()}_refresh_set.json"
+
+    def _refine_source_path(self) -> Path:
+        explicit = self._explicit_source_artifact()
+        if explicit is not None:
+            return explicit
+        return self._region_summary_path()
+
+    def _refresh_source_payload(self) -> tuple[list[dict[str, Any]], Path | None, str]:
+        explicit = self._explicit_source_artifact()
+        if explicit is not None:
+            payload = self._load_json_file(explicit)
+            if "refresh_candidates" in payload:
+                return list(payload.get("refresh_candidates") or []), explicit, "refresh_set"
+            return self._refresh_candidates_from_shortlist_payload(payload), explicit, "shortlist"
+
+        refresh_set_path = self._refresh_set_path()
+        shortlist_path = self._shortlist_path()
+        if refresh_set_path.exists():
+            payload = self._load_json_file(refresh_set_path)
+            return list(payload.get("refresh_candidates") or []), refresh_set_path, "refresh_set"
+        if shortlist_path.exists():
+            payload = self._load_json_file(shortlist_path)
+            return self._refresh_candidates_from_shortlist_payload(payload), shortlist_path, "shortlist"
+        return [], None, ""
 
     @staticmethod
     def _load_json_file(path: Path) -> dict[str, Any]:
@@ -543,59 +612,51 @@ class AutoSearchWorker(QThread):
                 "refine_criteria": ["balanced", "profit_first", "robustness_first", "recall_balance"],
             }
         if self.workflow_mode == "refine":
-            region_summary = self._load_json_file(self._region_summary_path())
+            source_region_summary_path = self._refine_source_path()
+            region_summary = self._load_json_file(source_region_summary_path)
             approved_regions = list(region_summary.get("approved_regions") or [])
             if not approved_regions:
                 raise ValueError(
-                    f"Refine vyzaduje region_summary s approved_regions: {self._region_summary_path().as_posix()}"
+                    f"Refine vyzaduje region_summary s approved_regions: {source_region_summary_path.as_posix()}"
                 )
             return {
                 "version": 2,
                 "workflow_mode": "refine",
-                "source_region_summary": self._region_summary_path().as_posix(),
+                "source_region_summary": source_region_summary_path.as_posix(),
                 "approved_regions": approved_regions,
                 "criteria": ["balanced", "profit_first", "robustness_first", "recall_balance"],
                 "fine_step_bps": 5.0,
                 "shortlist_top_k": int(max(1, self.candidate_top_n)),
             }
-        refresh_set_path = self._refresh_set_path()
-        shortlist_path = self._shortlist_path()
-        refresh_candidates: list[dict[str, Any]] = []
-        if refresh_set_path.exists():
-            refresh_candidates = list(self._load_json_file(refresh_set_path).get("refresh_candidates") or [])
-        elif shortlist_path.exists():
-            shortlist = self._load_json_file(shortlist_path)
-            for candidate in list(shortlist.get("candidates") or []):
-                refresh_candidates.append(
-                    {
-                        "enabled": True,
-                        "candidate_id": candidate.get("candidate_id"),
-                        "model": candidate.get("model"),
-                        "criterion": candidate.get("criterion"),
-                        "horizon": candidate.get("horizon"),
-                        "tp_bps": candidate.get("tp_bps"),
-                        "sl_bps": candidate.get("sl_bps"),
-                    }
-                )
+        refresh_candidates, source_artifact_path, source_artifact_kind = self._refresh_source_payload()
         if not refresh_candidates:
+            refresh_set_path = self._refresh_set_path()
+            shortlist_path = self._shortlist_path()
             raise ValueError(
                 f"Refresh vyzaduje refresh_set nebo shortlist: {refresh_set_path.as_posix()} / {shortlist_path.as_posix()}"
             )
+        target_csv_path = self._target_csv_path_for_phase("refresh")
         return {
             "version": 2,
             "workflow_mode": "refresh",
-            "source_shortlist": shortlist_path.as_posix(),
+            "source_artifact": source_artifact_path.as_posix() if source_artifact_path is not None else "",
+            "source_artifact_kind": source_artifact_kind,
+            "source_shortlist": source_artifact_path.as_posix() if source_artifact_path is not None else "",
+            "target_csv_path": target_csv_path,
             "refresh_candidates": refresh_candidates[: int(max(1, self.candidate_top_n))],
         }
 
     def _new_state(self) -> dict[str, Any]:
         spec = self._build_spec()
         queue = self._queue_from_spec(spec)
+        explicit_source_artifact = self._explicit_source_artifact()
         return {
             "version": 2,
             "created_at": self._now_str(),
             "updated_at": self._now_str(),
             "csv_path": self.csv_path,
+            "source_artifact_path": explicit_source_artifact.as_posix() if explicit_source_artifact is not None else "",
+            "refresh_csv_path": str(self.refresh_csv_path or ""),
             "workflow_mode": self.workflow_mode,
             "spec": spec,
             "phase": self.workflow_mode,
@@ -1111,6 +1172,7 @@ class AutoSearchWorker(QThread):
             "mode": "explore",
             "created_at": self._now_str(),
             "dataset_signature": self._dataset_signature_from_row(ok_rows[0]) if ok_rows else {},
+            "source_csv_path": str(state.get("csv_path") or self.csv_path),
             "source_checkpoint": self.state_path.as_posix(),
             "model_families": {
                 "approved": approved_models,
@@ -1172,12 +1234,14 @@ class AutoSearchWorker(QThread):
             "mode": "refine",
             "created_at": self._now_str(),
             "dataset_signature": self._dataset_signature_from_row(ok_rows[0]) if ok_rows else {},
+            "source_csv_path": str(state.get("csv_path") or self.csv_path),
             "source_region_summary": str(spec.get("source_region_summary") or self._region_summary_path().as_posix()),
             "candidates": candidates,
         }
         return self._write_json_artifact(self._shortlist_path(), payload)
 
     def _write_refresh_set(self, state: dict[str, Any]) -> str:
+        spec = dict(state.get("spec") or {})
         ok_rows = [r for r in list(state.get("results") or []) if str(r.get("status")) == "ok"]
         ok_rows.sort(key=self._score_result, reverse=True)
         refresh_candidates: list[dict[str, Any]] = []
@@ -1212,7 +1276,12 @@ class AutoSearchWorker(QThread):
             "version": 1,
             "mode": "refresh",
             "created_at": self._now_str(),
-            "source_shortlist": self._shortlist_path().as_posix(),
+            "dataset_signature": self._dataset_signature_from_row(ok_rows[0]) if ok_rows else {},
+            "source_csv_path": str(state.get("csv_path") or self.csv_path),
+            "target_csv_path": str(spec.get("target_csv_path") or self._target_csv_path_for_phase("refresh")),
+            "source_artifact": str(spec.get("source_artifact") or spec.get("source_shortlist") or self._shortlist_path().as_posix()),
+            "source_artifact_kind": str(spec.get("source_artifact_kind") or "shortlist"),
+            "source_shortlist": str(spec.get("source_shortlist") or self._shortlist_path().as_posix()),
             "refresh_candidates": refresh_candidates,
         }
         return self._write_json_artifact(self._refresh_set_path(), payload)
@@ -1242,7 +1311,7 @@ class AutoSearchWorker(QThread):
         tp_bps = float(cfg.get("tp_bps", 50.0))
         sl_bps = float(cfg.get("sl_bps", 50.0))
         return run_training_job(
-            csv_path=self.csv_path,
+            csv_path=self._target_csv_path_for_phase(phase),
             holdout_pct=float(self.holdout_pct),
             holdout_min_bars=int(self.holdout_min_bars),
             holdout_max_bars=int(self.holdout_max_bars),
@@ -1344,6 +1413,9 @@ class ModelTrainingTab(QWidget):
         self._pending_restore_csv_path: str | None = None
         self.worker: TrainWorker | None = None
         self.auto_worker: AutoSearchWorker | None = None
+        self.refine_source_artifact_path: str | None = None
+        self.refresh_source_artifact_path: str | None = None
+        self.refresh_target_csv_path: str | None = None
         self.X_test: pd.DataFrame | None = None
         self.y_test: pd.Series | None = None
         self._is_ternary_target: bool = False
@@ -1419,7 +1491,24 @@ class ModelTrainingTab(QWidget):
         self.cmb_auto_search_profile = QComboBox()
         self.cmb_auto_search_profile.addItems(["Explore", "Refine", "Refresh"])
         self.cmb_auto_search_profile.setCurrentText("Explore")
+        self.cmb_auto_search_profile.currentTextChanged.connect(self._on_auto_search_profile_changed)
         row.addWidget(self.cmb_auto_search_profile)
+        row.addWidget(QLabel("Fee/trade:"))
+        self.spn_training_fee = QDoubleSpinBox()
+        self.spn_training_fee.setRange(0.0, 100000.0)
+        self.spn_training_fee.setDecimals(2)
+        self.spn_training_fee.setSingleStep(0.25)
+        self.spn_training_fee.setValue(0.0)
+        self.spn_training_fee.valueChanged.connect(lambda *_: self._persist_training_cost_settings())
+        row.addWidget(self.spn_training_fee)
+        row.addWidget(QLabel("Slippage [bps]:"))
+        self.spn_training_slippage = QDoubleSpinBox()
+        self.spn_training_slippage.setRange(0.0, 10000.0)
+        self.spn_training_slippage.setDecimals(2)
+        self.spn_training_slippage.setSingleStep(0.25)
+        self.spn_training_slippage.setValue(0.0)
+        self.spn_training_slippage.valueChanged.connect(lambda *_: self._persist_training_cost_settings())
+        row.addWidget(self.spn_training_slippage)
         row.addStretch(1)
 
         self.btn_train = QPushButton("Trenovat (standard)")
@@ -1435,6 +1524,39 @@ class ModelTrainingTab(QWidget):
         self.btn_auto_stop.clicked.connect(self.stop_auto_search)
         row.addWidget(self.btn_auto_stop)
         lay2.addLayout(row)
+
+        self.refresh_overrides_widget = QWidget(self)
+        refresh_overrides_layout = QVBoxLayout(self.refresh_overrides_widget)
+        refresh_overrides_layout.setContentsMargins(0, 0, 0, 0)
+        refresh_overrides_layout.setSpacing(6)
+
+        refresh_artifact_row = QHBoxLayout()
+        self.lbl_workflow_source_caption = QLabel("Workflow source:")
+        refresh_artifact_row.addWidget(self.lbl_workflow_source_caption)
+        self.lbl_refresh_source_artifact = QLabel("automaticky podle aktivniho datasetu")
+        refresh_artifact_row.addWidget(self.lbl_refresh_source_artifact, 1)
+        self.btn_refresh_source_artifact = QPushButton("Vybrat artifact...")
+        self.btn_refresh_source_artifact.clicked.connect(self.pick_refresh_source_artifact)
+        refresh_artifact_row.addWidget(self.btn_refresh_source_artifact)
+        self.btn_refresh_source_artifact_clear = QPushButton("Auto")
+        self.btn_refresh_source_artifact_clear.clicked.connect(self.clear_refresh_source_artifact)
+        refresh_artifact_row.addWidget(self.btn_refresh_source_artifact_clear)
+        refresh_overrides_layout.addLayout(refresh_artifact_row)
+
+        refresh_target_row = QHBoxLayout()
+        self.lbl_refresh_target_caption = QLabel("Refresh target CSV:")
+        refresh_target_row.addWidget(self.lbl_refresh_target_caption)
+        self.lbl_refresh_target_csv = QLabel("stejny jako aktivni dataset")
+        refresh_target_row.addWidget(self.lbl_refresh_target_csv, 1)
+        self.btn_refresh_target_csv = QPushButton("Vybrat CSV...")
+        self.btn_refresh_target_csv.clicked.connect(self.pick_refresh_target_csv)
+        refresh_target_row.addWidget(self.btn_refresh_target_csv)
+        self.btn_refresh_target_csv_clear = QPushButton("Stejny dataset")
+        self.btn_refresh_target_csv_clear.clicked.connect(self.clear_refresh_target_csv)
+        refresh_target_row.addWidget(self.btn_refresh_target_csv_clear)
+        refresh_overrides_layout.addLayout(refresh_target_row)
+
+        lay2.addWidget(self.refresh_overrides_widget)
 
         self.prog = QProgressBar()
         self.prog.setRange(0, 1)
@@ -1454,8 +1576,16 @@ class ModelTrainingTab(QWidget):
         self.log.setPlaceholderText("Hlasky treninku a evaluace...")
         lay3.addWidget(self.log)
         root.addWidget(box3, 1)
+        self._restore_training_cost_settings()
+        self._restore_refresh_workflow_paths()
         self._on_search_backend_changed()
+        self._update_refresh_override_labels()
+        self._update_refresh_overrides_visibility()
         self._restore_last_csv_path()
+
+    def _on_auto_search_profile_changed(self, *_args) -> None:
+        self._update_refresh_override_labels()
+        self._update_refresh_overrides_visibility()
 
     def _current_training_mode(self) -> str:
         txt = (self.cmb_training_mode.currentText() or "").strip().lower()
@@ -1480,6 +1610,185 @@ class ModelTrainingTab(QWidget):
         except Exception:
             return 300
 
+    def _current_fee_per_trade(self) -> float:
+        try:
+            return float(self.spn_training_fee.value())
+        except Exception:
+            return 0.0
+
+    def _current_slippage_bps(self) -> float:
+        try:
+            return float(self.spn_training_slippage.value())
+        except Exception:
+            return 0.0
+
+    def _persist_training_cost_settings(self) -> None:
+        self._ui_settings.setValue(TRAINING_FEE_PER_TRADE_KEY, float(self._current_fee_per_trade()))
+        self._ui_settings.setValue(TRAINING_SLIPPAGE_BPS_KEY, float(self._current_slippage_bps()))
+        self._ui_settings.sync()
+
+    def _restore_training_cost_settings(self) -> None:
+        try:
+            fee_value = float(self._ui_settings.value(TRAINING_FEE_PER_TRADE_KEY, self.spn_training_fee.value()) or 0.0)
+        except Exception:
+            fee_value = float(self.spn_training_fee.value())
+        try:
+            slippage_value = float(self._ui_settings.value(TRAINING_SLIPPAGE_BPS_KEY, self.spn_training_slippage.value()) or 0.0)
+        except Exception:
+            slippage_value = float(self.spn_training_slippage.value())
+        self.spn_training_fee.blockSignals(True)
+        self.spn_training_slippage.blockSignals(True)
+        self.spn_training_fee.setValue(float(max(0.0, fee_value)))
+        self.spn_training_slippage.setValue(float(max(0.0, slippage_value)))
+        self.spn_training_fee.blockSignals(False)
+        self.spn_training_slippage.blockSignals(False)
+
+    def _current_source_artifact_path_for_profile(self, profile: str) -> str | None:
+        profile_norm = _normalize_auto_search_profile(profile)
+        if profile_norm == "refine":
+            return self.refine_source_artifact_path
+        if profile_norm == "refresh":
+            return self.refresh_source_artifact_path
+        return None
+
+    def _current_source_artifact_path(self) -> str | None:
+        return self._current_source_artifact_path_for_profile(self._current_auto_search_profile())
+
+    def _default_source_artifact_label(self, profile: str) -> str:
+        profile_norm = _normalize_auto_search_profile(profile)
+        if profile_norm == "refine":
+            return "region_summary podle aktivniho datasetu"
+        if profile_norm == "refresh":
+            return "shortlist/refresh_set podle aktivniho datasetu"
+        return "automaticky podle aktivniho datasetu"
+
+    def _update_refresh_override_labels(self) -> None:
+        profile = self._current_auto_search_profile()
+        source_txt = str(self._current_source_artifact_path_for_profile(profile) or "").strip()
+        target_txt = str(self.refresh_target_csv_path or "").strip()
+        self.lbl_workflow_source_caption.setText(
+            "Refine source:" if profile == "refine" else "Refresh source:" if profile == "refresh" else "Workflow source:"
+        )
+        self.lbl_refresh_source_artifact.setText(
+            os.path.basename(source_txt) if source_txt else self._default_source_artifact_label(profile)
+        )
+        self.lbl_refresh_target_csv.setText(
+            os.path.basename(target_txt) if target_txt else "stejny jako aktivni dataset"
+        )
+
+    def _update_refresh_overrides_visibility(self) -> None:
+        profile = self._current_auto_search_profile()
+        source_visible = profile in {"refine", "refresh"}
+        refresh_visible = profile == "refresh"
+        self.refresh_overrides_widget.setVisible(source_visible)
+        self.lbl_refresh_target_caption.setVisible(refresh_visible)
+        self.lbl_refresh_target_csv.setVisible(refresh_visible)
+        self.btn_refresh_target_csv.setVisible(refresh_visible)
+        self.btn_refresh_target_csv_clear.setVisible(refresh_visible)
+
+    def _persist_refresh_workflow_paths(self) -> None:
+        self._ui_settings.setValue(REFINE_SOURCE_ARTIFACT_PATH_KEY, str(self.refine_source_artifact_path or ""))
+        self._ui_settings.setValue(REFRESH_SOURCE_ARTIFACT_PATH_KEY, str(self.refresh_source_artifact_path or ""))
+        self._ui_settings.setValue(REFRESH_TARGET_CSV_PATH_KEY, str(self.refresh_target_csv_path or ""))
+        self._ui_settings.sync()
+
+    def _restore_refresh_workflow_paths(self) -> None:
+        refine_source_artifact = str(self._ui_settings.value(REFINE_SOURCE_ARTIFACT_PATH_KEY, "") or "").strip()
+        source_artifact = str(self._ui_settings.value(REFRESH_SOURCE_ARTIFACT_PATH_KEY, "") or "").strip()
+        target_csv = str(self._ui_settings.value(REFRESH_TARGET_CSV_PATH_KEY, "") or "").strip()
+        if refine_source_artifact:
+            try:
+                candidate = Path(refine_source_artifact).expanduser().resolve()
+                if candidate.exists():
+                    self.refine_source_artifact_path = str(candidate)
+            except Exception:
+                self.refine_source_artifact_path = None
+        if source_artifact:
+            try:
+                candidate = Path(source_artifact).expanduser().resolve()
+                if candidate.exists():
+                    self.refresh_source_artifact_path = str(candidate)
+            except Exception:
+                self.refresh_source_artifact_path = None
+        if target_csv:
+            try:
+                candidate = Path(target_csv).expanduser().resolve()
+                if candidate.exists():
+                    self.refresh_target_csv_path = str(candidate)
+            except Exception:
+                self.refresh_target_csv_path = None
+
+    def _set_source_artifact_path_for_profile(self, profile: str, path: str | None, *, persist: bool) -> None:
+        normalized_path = ""
+        if path:
+            candidate = Path(path).expanduser().resolve()
+            normalized_path = str(candidate) if candidate.exists() else ""
+        if _normalize_auto_search_profile(profile) == "refine":
+            self.refine_source_artifact_path = normalized_path or None
+        else:
+            self.refresh_source_artifact_path = normalized_path or None
+        self._update_refresh_override_labels()
+        if persist:
+            self._persist_refresh_workflow_paths()
+
+    def _set_refine_source_artifact_path(self, path: str | None, *, persist: bool) -> None:
+        self._set_source_artifact_path_for_profile("refine", path, persist=persist)
+
+    def _set_refresh_source_artifact_path(self, path: str | None, *, persist: bool) -> None:
+        self._set_source_artifact_path_for_profile("refresh", path, persist=persist)
+
+    def _set_refresh_target_csv_path(self, path: str | None, *, persist: bool) -> None:
+        normalized_path = ""
+        if path:
+            candidate = Path(path).expanduser().resolve()
+            normalized_path = str(candidate) if candidate.exists() else ""
+        self.refresh_target_csv_path = normalized_path or None
+        self._update_refresh_override_labels()
+        if persist:
+            self._persist_refresh_workflow_paths()
+
+    def clear_refresh_source_artifact(self) -> None:
+        profile = self._current_auto_search_profile()
+        if profile not in {"refine", "refresh"}:
+            return
+        self._set_source_artifact_path_for_profile(profile, None, persist=True)
+
+    def clear_refresh_target_csv(self) -> None:
+        self._set_refresh_target_csv_path(None, persist=True)
+
+    def _default_refresh_source_artifact_dialog_dir(self) -> str:
+        current_source_artifact = self._current_source_artifact_path()
+        if current_source_artifact:
+            candidate_dir = Path(current_source_artifact).expanduser().resolve().parent
+            if candidate_dir.exists():
+                return candidate_dir.as_posix()
+        return (Path(_model_dir()) / "auto_search").as_posix()
+
+    def pick_refresh_source_artifact(self) -> None:
+        profile = self._current_auto_search_profile()
+        if profile not in {"refine", "refresh"}:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Vyber refine source artifact" if profile == "refine" else "Vyber refresh source artifact",
+            self._default_refresh_source_artifact_dialog_dir(),
+            "Workflow JSON (*.json)",
+        )
+        if not path:
+            return
+        self._set_source_artifact_path_for_profile(profile, path, persist=True)
+
+    def pick_refresh_target_csv(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Vyber refresh target CSV",
+            self._default_csv_dialog_dir(),
+            "CSV Files (*.csv)",
+        )
+        if not path:
+            return
+        self._set_refresh_target_csv_path(path, persist=True)
+
     def _on_search_backend_changed(self, *_args):
         optuna_enabled = self._selected_search_backend() == "optuna"
         self.spn_optuna_trials.setEnabled(optuna_enabled)
@@ -1491,6 +1800,8 @@ class ModelTrainingTab(QWidget):
         out["search_backend"] = self._selected_search_backend()
         out["optuna_trials"] = int(self._selected_optuna_trials())
         out["optuna_timeout_seconds"] = int(self._selected_optuna_timeout_seconds())
+        out["fee_per_trade"] = float(self._current_fee_per_trade())
+        out["slippage_bps"] = float(self._current_slippage_bps())
         return out
 
     def _log_search_backend_hint(self, *, estimators: list[str] | None = None):
@@ -1560,10 +1871,167 @@ class ModelTrainingTab(QWidget):
         self.cmb_search_backend.setEnabled(not running)
         self.spn_optuna_trials.setEnabled((not running) and (self._selected_search_backend() == "optuna"))
         self.spn_optuna_timeout.setEnabled((not running) and (self._selected_search_backend() == "optuna"))
+        self.spn_training_fee.setEnabled(not running)
+        self.spn_training_slippage.setEnabled(not running)
         self.cmb_auto_search_profile.setEnabled(not running)
+        self.btn_refresh_source_artifact.setEnabled(not running)
+        self.btn_refresh_source_artifact_clear.setEnabled(not running)
+        self.btn_refresh_target_csv.setEnabled(not running)
+        self.btn_refresh_target_csv_clear.setEnabled(not running)
         self.btn_train.setEnabled((not running) and (self.dataset is not None))
         self.btn_auto_search.setEnabled((not running) and (self.dataset is not None))
         self.btn_auto_stop.setEnabled(self._is_auto_search_running())
+
+    @staticmethod
+    def _artifact_stem_for_path(path: str | None) -> str:
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(path or "dataset").stem).strip("_")
+        return stem or "dataset"
+
+    @staticmethod
+    def _auto_search_artifact_dir() -> Path:
+        return Path(_model_dir()) / "auto_search"
+
+    def _region_summary_artifact_path_for_csv(self, csv_path: str) -> Path:
+        return self._auto_search_artifact_dir() / f"{self._artifact_stem_for_path(csv_path)}_region_summary.json"
+
+    def _shortlist_artifact_path_for_csv(self, csv_path: str) -> Path:
+        return self._auto_search_artifact_dir() / f"{self._artifact_stem_for_path(csv_path)}_shortlist.json"
+
+    def _refresh_set_artifact_path_for_csv(self, csv_path: str) -> Path:
+        return self._auto_search_artifact_dir() / f"{self._artifact_stem_for_path(csv_path)}_refresh_set.json"
+
+    def _resolve_source_artifact_path(self, profile: str) -> Path | None:
+        profile_norm = _normalize_auto_search_profile(profile)
+        explicit_source = str(self._current_source_artifact_path_for_profile(profile_norm) or "").strip()
+        if explicit_source:
+            return Path(explicit_source)
+        if not self.csv_path:
+            return None
+        if profile_norm == "refine":
+            candidate = self._region_summary_artifact_path_for_csv(self.csv_path)
+            return candidate if candidate.exists() else None
+        if profile_norm == "refresh":
+            refresh_set_path = self._refresh_set_artifact_path_for_csv(self.csv_path)
+            if refresh_set_path.exists():
+                return refresh_set_path
+            shortlist_path = self._shortlist_artifact_path_for_csv(self.csv_path)
+            return shortlist_path if shortlist_path.exists() else None
+        return None
+
+    @staticmethod
+    def _load_workflow_artifact_payload(path: Path) -> dict[str, Any]:
+        payload = jsonlib.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(f"Invalid workflow artifact: {path.as_posix()}")
+        return payload
+
+    @staticmethod
+    def _artifact_dataset_triplet(payload: dict[str, Any]) -> tuple[str, str, str] | None:
+        signature = payload.get("dataset_signature") or {}
+        if not isinstance(signature, dict):
+            return None
+        instrument = str(signature.get("instrument") or "").strip().upper()
+        exchange = str(signature.get("exchange") or "").strip().upper()
+        timeframe = str(signature.get("timeframe") or "").strip().lower()
+        if not instrument or not exchange or not timeframe:
+            return None
+        return (instrument, exchange, timeframe)
+
+    @staticmethod
+    def _format_dataset_triplet(triplet: tuple[str, str, str] | None) -> str:
+        if not triplet:
+            return "unknown"
+        return f"{triplet[0]}_{triplet[1]}_{triplet[2]}"
+
+    @staticmethod
+    def _dataset_triplet_from_csv_path(csv_path: str | None) -> tuple[str, str, str] | None:
+        if not csv_path:
+            return None
+        _, meta = runtime_name_and_meta_from_csv(str(csv_path), 1, 0, 0)
+        instrument = str(meta.get("instrument") or "").strip().upper()
+        exchange = str(meta.get("exchange") or "").strip().upper()
+        timeframe = str(meta.get("timeframe") or "").strip().lower()
+        if not instrument or not exchange or not timeframe:
+            return None
+        return (instrument, exchange, timeframe)
+
+    def _validate_auto_search_inputs(
+        self,
+        profile: str,
+        source_artifact_path: Path | None,
+        refresh_target_csv: str | None,
+    ) -> None:
+        profile_norm = _normalize_auto_search_profile(profile)
+        if profile_norm == "explore":
+            return
+        if source_artifact_path is None:
+            if profile_norm == "refine":
+                expected = self._region_summary_artifact_path_for_csv(self.csv_path or "dataset")
+                raise ValueError(
+                    "Refine vyzaduje region_summary artifact pro aktivni dataset. "
+                    f"expected={expected.as_posix()} | Pro novejsi data nejdriv spust Explore; "
+                    "pro pretrenovani finalistu pouzij Refresh."
+                )
+            refresh_set_path = self._refresh_set_artifact_path_for_csv(self.csv_path or "dataset")
+            shortlist_path = self._shortlist_artifact_path_for_csv(self.csv_path or "dataset")
+            raise ValueError(
+                f"Refresh vyzaduje refresh_set nebo shortlist: {refresh_set_path.as_posix()} / {shortlist_path.as_posix()}"
+            )
+
+        payload = self._load_workflow_artifact_payload(source_artifact_path)
+        if profile_norm == "refine":
+            approved_regions = list(payload.get("approved_regions") or [])
+            if not approved_regions:
+                raise ValueError(
+                    f"Refine source artifact musi obsahovat approved_regions: {source_artifact_path.as_posix()}"
+                )
+            source_csv_path = _normalized_resume_path(payload.get("source_csv_path"))
+            current_csv_path = _normalized_resume_path(self.csv_path)
+            if source_csv_path and current_csv_path and source_csv_path != current_csv_path:
+                raise ValueError(
+                    "Refine source artifact patri k jinemu CSV. "
+                    f"artifact={source_artifact_path.as_posix()} current_csv={self.csv_path} | "
+                    "Refine je vazany na zdrojovy dataset; pro novejsi data pouzij Explore nebo Refresh."
+                )
+            if self.dataset is not None and self.csv_path:
+                current_signature = dataset_snapshot_signature_from_csv(self.csv_path, len(self.dataset))
+                artifact_signature = payload.get("dataset_signature") or {}
+                if current_signature and isinstance(artifact_signature, dict):
+                    artifact_exact = dataset_snapshot_signature_from_csv(self.csv_path, int(artifact_signature.get("n_total_bars") or 0))
+                    artifact_triplet = self._artifact_dataset_triplet(payload)
+                    current_triplet = (current_signature[0], current_signature[1], current_signature[2])
+                    if artifact_triplet and artifact_triplet != current_triplet:
+                        raise ValueError(
+                            "Refine source artifact neodpovida aktivnimu datasetu. "
+                            f"artifact={self._format_dataset_triplet(artifact_triplet)} current={self._format_dataset_triplet(current_triplet)} | "
+                            "Refine je vazany na zdrojovy dataset; pro novejsi data pouzij Explore nebo Refresh."
+                        )
+                    try:
+                        artifact_bars = int(artifact_signature.get("n_total_bars") or 0)
+                    except Exception:
+                        artifact_bars = 0
+                    if artifact_bars > 0 and artifact_bars != int(len(self.dataset)):
+                        raise ValueError(
+                            "Refine source artifact musi mit stejny rozsah pripravenych dat jako aktivni dataset. "
+                            f"artifact_bars={artifact_bars} current_bars={len(self.dataset)} | "
+                            "Refine je vazany na zdrojovy dataset; pro novejsi data pouzij Explore nebo Refresh."
+                        )
+            return
+
+        refresh_candidates = list(payload.get("refresh_candidates") or [])
+        shortlist_candidates = list(payload.get("candidates") or [])
+        if not refresh_candidates and not shortlist_candidates:
+            raise ValueError(
+                f"Refresh source artifact musi obsahovat refresh_candidates nebo candidates: {source_artifact_path.as_posix()}"
+            )
+        target_csv = str(refresh_target_csv or self.csv_path or "").strip()
+        artifact_triplet = self._artifact_dataset_triplet(payload)
+        target_triplet = self._dataset_triplet_from_csv_path(target_csv)
+        if artifact_triplet and target_triplet and artifact_triplet != target_triplet:
+            raise ValueError(
+                "Refresh source artifact neodpovida target datasetu. "
+                f"artifact={self._format_dataset_triplet(artifact_triplet)} target={self._format_dataset_triplet(target_triplet)}"
+            )
 
     def _current_candidate_criterion(self) -> str:
         txt = (self.cmb_candidate_criterion.currentText() or "").strip().lower()
@@ -1779,6 +2247,8 @@ class ModelTrainingTab(QWidget):
             f"qprofit>={float(profile.get('quality_min_profit_net', 0.0)):.2f} "
             f"qsharpe>={float(profile.get('quality_min_holdout_sharpe', 0.0)):.4f} "
             f"qmc>={float(profile.get('quality_min_mc_sharpe_p50', -0.02)):.4f} "
+            f"fee={float(profile.get('fee_per_trade', 0.0)):.2f} "
+            f"slippage_bps={float(profile.get('slippage_bps', 0.0)):.2f} "
             f"chain={bool(profile.get('candidate_chain_enabled', True))} "
             f"crit={profile.get('candidate_selection_criterion')} "
             f"topN={int(profile.get('candidate_top_n', 5))} "
@@ -1823,7 +2293,13 @@ class ModelTrainingTab(QWidget):
         self._set_controls_running(True)
         self.worker.start()
 
-    def _auto_search_state_path(self, profile: str) -> Path:
+    def _auto_search_state_path(
+        self,
+        profile: str,
+        *,
+        source_artifact_path: str | None = None,
+        refresh_target_csv_path: str | None = None,
+    ) -> Path:
         csv_src = self.csv_path or "dataset"
         stem = Path(csv_src).stem
         safe = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("_")
@@ -1831,6 +2307,22 @@ class ModelTrainingTab(QWidget):
             safe = "dataset"
         profile_norm = _normalize_auto_search_profile(profile)
         state_dir = Path(_model_dir()) / "auto_search"
+        if profile_norm == "refine":
+            refine_source = str(source_artifact_path or "").strip()
+            if refine_source:
+                source_safe = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(refine_source).stem).strip("_") or safe
+                return state_dir / f"{source_safe}_refine_state.json"
+        if profile_norm == "refresh":
+            refresh_target = str(refresh_target_csv_path or "").strip()
+            source_artifact = str(source_artifact_path or "").strip()
+            if refresh_target or source_artifact:
+                source_stem = Path(source_artifact).stem if source_artifact else safe
+                source_safe = re.sub(r"[^A-Za-z0-9._-]+", "_", source_stem).strip("_") or safe
+                if refresh_target:
+                    target_stem = Path(refresh_target).stem
+                    target_safe = re.sub(r"[^A-Za-z0-9._-]+", "_", target_stem).strip("_") or "dataset"
+                    return state_dir / f"{source_safe}__to__{target_safe}_refresh_state.json"
+                return state_dir / f"{source_safe}_refresh_state.json"
         prof_path = state_dir / f"{safe}_{profile_norm}_state.json"
         legacy_candidates = {
             "explore": [
@@ -1855,7 +2347,18 @@ class ModelTrainingTab(QWidget):
             return
 
         auto_profile = self._current_auto_search_profile()
-        state_path = self._auto_search_state_path(auto_profile)
+        source_artifact_path = self._resolve_source_artifact_path(auto_profile)
+        refresh_target_csv = self.refresh_target_csv_path if auto_profile == "refresh" else None
+        try:
+            self._validate_auto_search_inputs(auto_profile, source_artifact_path, refresh_target_csv)
+        except Exception as exc:
+            self.log.appendPlainText(f"ERROR Workflow: {exc}")
+            return
+        state_path = self._auto_search_state_path(
+            auto_profile,
+            source_artifact_path=source_artifact_path.as_posix() if source_artifact_path is not None else None,
+            refresh_target_csv_path=refresh_target_csv,
+        )
         profiles = {
             "explore": self._apply_search_backend_profile_overrides(self._training_profile_for_mode("explore")),
             "refine": self._apply_search_backend_profile_overrides(self._training_profile_for_mode("refine")),
@@ -1874,6 +2377,8 @@ class ModelTrainingTab(QWidget):
             candidate_top_n=top_n,
             candidate_fresh_ratio=fresh_ratio,
             state_path=state_path.as_posix(),
+            source_artifact_path=source_artifact_path.as_posix() if source_artifact_path is not None else None,
+            refresh_csv_path=refresh_target_csv,
             search_profile=auto_profile,
         )
         self.auto_worker.message.connect(self.log.appendPlainText)
@@ -1888,6 +2393,12 @@ class ModelTrainingTab(QWidget):
             f"optuna_timeout={self._selected_optuna_timeout_seconds()}s "
             f"| topN={top_n} fresh={fresh_ratio:.2f}"
         )
+        if auto_profile in {"refine", "refresh"}:
+            self.log.appendPlainText(
+                "INFO Workflow source: "
+                f"artifact={(source_artifact_path.as_posix() if source_artifact_path is not None else 'auto')} "
+                f"target_csv={refresh_target_csv or self.csv_path}"
+            )
         self.auto_worker.start()
         self._set_controls_running(True)
         self.btn_auto_stop.setEnabled(True)

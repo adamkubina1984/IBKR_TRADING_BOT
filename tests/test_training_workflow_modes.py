@@ -84,6 +84,52 @@ def test_auto_search_worker_builds_refine_queue_from_region_summary(tmp_path):
         assert all(row["phase"] == "refine" for row in state["queue"])
 
 
+def test_auto_search_worker_builds_refine_queue_from_explicit_source_artifact(tmp_path):
+        artifact_dir = tmp_path
+        region_summary_path = artifact_dir / "approved_refine_source_region_summary.json"
+        region_summary_path.write_text(
+                """
+{
+    "version": 1,
+    "mode": "explore",
+    "approved_regions": [
+        {
+            "region_id": "lgb_h12_tp50_sl50",
+            "models": ["lgb"],
+            "horizon_values": [12],
+            "tp_bps_min": 50.0,
+            "tp_bps_max": 55.0,
+            "sl_bps_min": 50.0,
+            "sl_bps_max": 55.0,
+            "criteria": ["balanced", "profit_first"]
+        }
+    ]
+}
+                """.strip(),
+                encoding="utf-8",
+        )
+
+        worker = AutoSearchWorker(
+                csv_path="tv_GC_COMEX_5m_source.csv",
+                holdout_pct=0.1,
+                holdout_min_bars=1000,
+                holdout_max_bars=6000,
+                training_profiles={},
+                candidate_top_n=5,
+                candidate_fresh_ratio=0.3,
+                state_path=(artifact_dir / "approved_refine_source_refine_state.json").as_posix(),
+                source_artifact_path=region_summary_path.as_posix(),
+                search_profile="refine",
+        )
+
+        state = worker._new_state()
+
+        assert state["workflow_mode"] == "refine"
+        assert state["spec"]["source_region_summary"] == region_summary_path.as_posix()
+        assert len(state["queue"]) == 16
+        assert all(row["phase"] == "refine" for row in state["queue"])
+
+
 def test_auto_search_worker_builds_refresh_queue_from_shortlist(tmp_path):
         artifact_dir = tmp_path
         (artifact_dir / "tv_GC_COMEX_5m_sample_shortlist.json").write_text(
@@ -129,6 +175,61 @@ def test_auto_search_worker_builds_refresh_queue_from_shortlist(tmp_path):
         state = worker._new_state()
 
         assert state["workflow_mode"] == "refresh"
+        assert len(state["queue"]) == 2
+        assert all(row["phase"] == "refresh" for row in state["queue"])
+
+
+def test_auto_search_worker_builds_refresh_queue_from_explicit_source_artifact(tmp_path):
+        artifact_dir = tmp_path
+        shortlist_path = artifact_dir / "approved_refresh_source_shortlist.json"
+        shortlist_path.write_text(
+                """
+{
+    "version": 1,
+    "mode": "refine",
+    "candidates": [
+        {
+            "candidate_id": "lgb_h12_tp50_sl50_balanced",
+            "model": "lgb",
+            "criterion": "balanced",
+            "horizon": 12,
+            "tp_bps": 50.0,
+            "sl_bps": 50.0
+        },
+        {
+            "candidate_id": "hgbt_h16_tp60_sl50_profit_first",
+            "model": "hgbt",
+            "criterion": "profit_first",
+            "horizon": 16,
+            "tp_bps": 60.0,
+            "sl_bps": 50.0
+        }
+    ]
+}
+                """.strip(),
+                encoding="utf-8",
+        )
+
+        worker = AutoSearchWorker(
+                csv_path="tv_GC_COMEX_5m_source.csv",
+                holdout_pct=0.1,
+                holdout_min_bars=1000,
+                holdout_max_bars=6000,
+                training_profiles={},
+                candidate_top_n=5,
+                candidate_fresh_ratio=0.3,
+                state_path=(artifact_dir / "tv_GC_COMEX_5m_target_refresh_state.json").as_posix(),
+                source_artifact_path=shortlist_path.as_posix(),
+                refresh_csv_path="tv_GC_COMEX_5m_target.csv",
+                search_profile="refresh",
+        )
+
+        state = worker._new_state()
+
+        assert state["workflow_mode"] == "refresh"
+        assert state["spec"]["source_artifact"] == shortlist_path.as_posix()
+        assert state["spec"]["source_artifact_kind"] == "shortlist"
+        assert state["spec"]["target_csv_path"] == "tv_GC_COMEX_5m_target.csv"
         assert len(state["queue"]) == 2
         assert all(row["phase"] == "refresh" for row in state["queue"])
 
@@ -663,6 +764,7 @@ def test_auto_search_worker_widens_explore_winner_into_refine_region(tmp_path):
         payload = worker._load_json_file(worker._region_summary_path())
         region = payload["approved_regions"][0]
 
+        assert payload["source_csv_path"] == worker.csv_path
         assert region["models"] == ["lgb"]
         assert region["horizon_values"] == [8, 12, 16]
         assert region["tp_bps_min"] == 40.0
@@ -730,6 +832,7 @@ def test_auto_search_worker_shortlist_dedupes_criteria_variants(tmp_path):
         worker._write_shortlist(state)
         payload = worker._load_json_file(worker._shortlist_path())
 
+        assert payload["source_csv_path"] == worker.csv_path
         assert len(payload["candidates"]) == 2
         assert payload["candidates"][0]["candidate_id"] == "hgbt_h8_tp55_sl30"
         assert payload["candidates"][1]["candidate_id"] == "lgb_h12_tp80_sl55"
@@ -749,6 +852,12 @@ def test_auto_search_worker_refresh_set_dedupes_criteria_variants(tmp_path):
         )
 
         state = {
+            "spec": {
+                "source_artifact": "C:/artifact_dir/approved_shortlist.json",
+                "source_artifact_kind": "shortlist",
+                "source_shortlist": "C:/artifact_dir/approved_shortlist.json",
+                "target_csv_path": "tv_GC_COMEX_5m_target.csv",
+            },
             "results": [
                 {
                     "status": "ok",
@@ -792,6 +901,10 @@ def test_auto_search_worker_refresh_set_dedupes_criteria_variants(tmp_path):
         worker._write_refresh_set(state)
         payload = worker._load_json_file(worker._refresh_set_path())
 
+        assert payload["source_csv_path"] == worker.csv_path
+        assert payload["target_csv_path"] == "tv_GC_COMEX_5m_target.csv"
+        assert payload["source_artifact"] == "C:/artifact_dir/approved_shortlist.json"
+        assert payload["source_artifact_kind"] == "shortlist"
         assert len(payload["refresh_candidates"]) == 2
         assert payload["refresh_candidates"][0]["candidate_id"] == "hgbt_h8_tp55_sl30"
         assert payload["refresh_candidates"][1]["candidate_id"] == "lgb_h12_tp80_sl55"
@@ -817,6 +930,8 @@ def test_train_worker_forwards_side_prediction_guard_thresholds(monkeypatch, tmp
         training_profile={
             "quality_min_side_prediction_share": 0.07,
             "quality_min_side_prediction_count": 11,
+            "fee_per_trade": 2.5,
+            "slippage_bps": 4.0,
         },
     )
 
@@ -824,6 +939,8 @@ def test_train_worker_forwards_side_prediction_guard_thresholds(monkeypatch, tmp
 
     assert captured["quality_min_side_prediction_share"] == 0.07
     assert captured["quality_min_side_prediction_count"] == 11
+    assert captured["fee_per_trade"] == 2.5
+    assert captured["slippage_bps"] == 4.0
 
 
 def test_auto_search_worker_interrupts_current_candidate_when_stop_is_requested(monkeypatch, tmp_path):
@@ -884,6 +1001,46 @@ def test_auto_search_worker_interrupts_current_candidate_when_stop_is_requested(
     assert saved_states[-1]["completed"] is False
     assert finished_states == [((tmp_path / "state.json").as_posix(), False)]
     assert any("stop acknowledged" in msg for msg in messages)
+
+
+def test_auto_search_worker_refresh_dispatches_run_training_job_to_target_csv(monkeypatch, tmp_path):
+    from ibkr_trading_bot.gui import tab_model_training as tab_model_training_module
+
+    captured: dict[str, object] = {}
+
+    def _fake_run_training_job(**kwargs):
+        captured.update(kwargs)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(tab_model_training_module, "run_training_job", _fake_run_training_job)
+
+    worker = AutoSearchWorker(
+        csv_path="tv_GC_COMEX_5m_source.csv",
+        holdout_pct=0.1,
+        holdout_min_bars=1000,
+        holdout_max_bars=6000,
+        training_profiles={"refresh": {}},
+        candidate_top_n=5,
+        candidate_fresh_ratio=0.3,
+        state_path=(tmp_path / "state.json").as_posix(),
+        refresh_csv_path="tv_GC_COMEX_5m_target.csv",
+        search_profile="refresh",
+    )
+
+    result = worker._train_one(
+        {
+            "phase": "refresh",
+            "model": "lgb",
+            "criterion": "balanced",
+            "horizon": 12,
+            "tp_bps": 50.0,
+            "sl_bps": 50.0,
+        }
+    )
+
+    assert result["status"] == "ok"
+    assert captured["csv_path"] == "tv_GC_COMEX_5m_target.csv"
+    assert captured["phase"] == "refresh"
 
 
 def test_auto_search_worker_resume_logs_continue_from_completed_position(monkeypatch, tmp_path):

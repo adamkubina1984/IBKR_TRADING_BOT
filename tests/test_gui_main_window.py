@@ -268,6 +268,315 @@ def test_model_training_tab_propagates_search_backend_profile(monkeypatch, qapp)
         tab.close()
 
 
+def test_model_training_tab_passes_refresh_overrides_to_auto_worker(monkeypatch, qapp, tmp_path):
+    captured: dict[str, object] = {}
+
+    class _Signal:
+        def connect(self, _cb):
+            return None
+
+    class StubAutoWorker:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.message = _Signal()
+            self.result = _Signal()
+            self.finished_state = _Signal()
+            self.error = _Signal()
+            self.finished = _Signal()
+
+        def start(self):
+            return None
+
+        def isRunning(self):
+            return False
+
+    monkeypatch.setattr(tab_model_training_module, "AutoSearchWorker", StubAutoWorker)
+    monkeypatch.setattr(tab_model_training_module, "_model_dir", lambda: tmp_path.as_posix())
+
+    source_artifact = tmp_path / "approved_refresh_source_shortlist.json"
+    source_artifact.write_text(
+        __import__("json").dumps(
+            {
+                "version": 1,
+                "mode": "refine",
+                "dataset_signature": {
+                    "instrument": "GC",
+                    "exchange": "COMEX",
+                    "timeframe": "5m",
+                    "n_total_bars": 64,
+                },
+                "candidates": [
+                    {
+                        "candidate_id": "lgb_h12_tp50_sl50_balanced",
+                        "model": "lgb",
+                        "criterion": "balanced",
+                        "horizon": 12,
+                        "tp_bps": 50.0,
+                        "sl_bps": 50.0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    target_csv = tmp_path / "tv_GC_COMEX_5m_refresh_target.csv"
+    target_csv.write_text("timestamp,close\n2026-01-01T00:00:00Z,1\n", encoding="utf-8")
+
+    tab = ModelTrainingTab()
+    try:
+        tab.csv_path = str((tmp_path / "tv_GC_COMEX_5m_source_dataset.csv").resolve())
+        tab.dataset = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-01-01", periods=32, freq="5min", tz="UTC"),
+                "feature_a": np.linspace(0.0, 1.0, 32),
+                "target": [0, 1] * 16,
+            }
+        )
+        tab.cmb_auto_search_profile.setCurrentText("Refresh")
+        tab._set_refresh_source_artifact_path(source_artifact.as_posix(), persist=False)
+        tab._set_refresh_target_csv_path(target_csv.as_posix(), persist=False)
+
+        tab.run_auto_search()
+
+        assert captured["search_profile"] == "refresh"
+        assert captured["source_artifact_path"] == source_artifact.resolve().as_posix()
+        assert captured["refresh_csv_path"] == str(target_csv.resolve())
+        assert str(captured["state_path"]).endswith(
+            "approved_refresh_source_shortlist__to__tv_GC_COMEX_5m_refresh_target_refresh_state.json"
+        )
+    finally:
+        tab.close()
+
+
+def test_model_training_tab_passes_refine_source_artifact_to_auto_worker(monkeypatch, qapp, tmp_path):
+    captured: dict[str, object] = {}
+
+    class _Signal:
+        def connect(self, _cb):
+            return None
+
+    class StubAutoWorker:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.message = _Signal()
+            self.result = _Signal()
+            self.finished_state = _Signal()
+            self.error = _Signal()
+            self.finished = _Signal()
+
+        def start(self):
+            return None
+
+        def isRunning(self):
+            return False
+
+    monkeypatch.setattr(tab_model_training_module, "AutoSearchWorker", StubAutoWorker)
+    monkeypatch.setattr(tab_model_training_module, "_model_dir", lambda: tmp_path.as_posix())
+
+    source_artifact = tmp_path / "approved_refine_source_region_summary.json"
+    source_artifact.write_text(
+        __import__("json").dumps(
+            {
+                "version": 1,
+                "mode": "explore",
+                "source_csv_path": str((tmp_path / "tv_GC_COMEX_5m_source_dataset.csv").resolve()),
+                "dataset_signature": {
+                    "instrument": "GC",
+                    "exchange": "COMEX",
+                    "timeframe": "5m",
+                    "n_total_bars": 32,
+                },
+                "approved_regions": [
+                    {
+                        "region_id": "lgb_h12_tp50_sl50",
+                        "models": ["lgb"],
+                        "horizon_values": [12],
+                        "tp_bps_min": 50.0,
+                        "tp_bps_max": 55.0,
+                        "sl_bps_min": 50.0,
+                        "sl_bps_max": 55.0,
+                        "criteria": ["balanced"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    tab = ModelTrainingTab()
+    try:
+        tab.csv_path = str((tmp_path / "tv_GC_COMEX_5m_source_dataset.csv").resolve())
+        tab.dataset = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-01-01", periods=32, freq="5min", tz="UTC"),
+                "feature_a": np.linspace(0.0, 1.0, 32),
+                "target": [0, 1] * 16,
+            }
+        )
+        tab.cmb_auto_search_profile.setCurrentText("Refine")
+        tab._set_refine_source_artifact_path(source_artifact.as_posix(), persist=False)
+
+        tab.run_auto_search()
+
+        assert captured["search_profile"] == "refine"
+        assert captured["source_artifact_path"] == source_artifact.resolve().as_posix()
+        assert str(captured["state_path"]).endswith("approved_refine_source_region_summary_refine_state.json")
+    finally:
+        tab.close()
+
+
+def test_model_training_tab_blocks_incompatible_refine_source_artifact(monkeypatch, qapp, tmp_path):
+    captured: dict[str, object] = {}
+
+    class _Signal:
+        def connect(self, _cb):
+            return None
+
+    class StubAutoWorker:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.message = _Signal()
+            self.result = _Signal()
+            self.finished_state = _Signal()
+            self.error = _Signal()
+            self.finished = _Signal()
+
+        def start(self):
+            return None
+
+        def isRunning(self):
+            return False
+
+    monkeypatch.setattr(tab_model_training_module, "AutoSearchWorker", StubAutoWorker)
+    monkeypatch.setattr(tab_model_training_module, "_model_dir", lambda: tmp_path.as_posix())
+
+    source_artifact = tmp_path / "incompatible_refine_region_summary.json"
+    source_artifact.write_text(
+        __import__("json").dumps(
+            {
+                "version": 1,
+                "mode": "explore",
+                "source_csv_path": str((tmp_path / "tv_GC_COMEX_5m_other_dataset.csv").resolve()),
+                "dataset_signature": {
+                    "instrument": "GC",
+                    "exchange": "COMEX",
+                    "timeframe": "5m",
+                    "n_total_bars": 128,
+                },
+                "approved_regions": [
+                    {
+                        "region_id": "lgb_h12_tp50_sl50",
+                        "models": ["lgb"],
+                        "horizon_values": [12],
+                        "tp_bps_min": 50.0,
+                        "tp_bps_max": 55.0,
+                        "sl_bps_min": 50.0,
+                        "sl_bps_max": 55.0,
+                        "criteria": ["balanced"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    tab = ModelTrainingTab()
+    try:
+        tab.csv_path = str((tmp_path / "tv_GC_COMEX_5m_source_dataset.csv").resolve())
+        tab.dataset = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-01-01", periods=32, freq="5min", tz="UTC"),
+                "feature_a": np.linspace(0.0, 1.0, 32),
+                "target": [0, 1] * 16,
+            }
+        )
+        tab.cmb_auto_search_profile.setCurrentText("Refine")
+        tab._set_refine_source_artifact_path(source_artifact.as_posix(), persist=False)
+
+        tab.run_auto_search()
+
+        assert captured == {}
+        assert "ERROR Workflow: Refine source artifact" in tab.log.toPlainText()
+    finally:
+        tab.close()
+
+
+def test_model_training_tab_blocks_incompatible_refresh_target_dataset(monkeypatch, qapp, tmp_path):
+    captured: dict[str, object] = {}
+
+    class _Signal:
+        def connect(self, _cb):
+            return None
+
+    class StubAutoWorker:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.message = _Signal()
+            self.result = _Signal()
+            self.finished_state = _Signal()
+            self.error = _Signal()
+            self.finished = _Signal()
+
+        def start(self):
+            return None
+
+        def isRunning(self):
+            return False
+
+    monkeypatch.setattr(tab_model_training_module, "AutoSearchWorker", StubAutoWorker)
+    monkeypatch.setattr(tab_model_training_module, "_model_dir", lambda: tmp_path.as_posix())
+
+    source_artifact = tmp_path / "approved_refresh_source_shortlist.json"
+    source_artifact.write_text(
+        __import__("json").dumps(
+            {
+                "version": 1,
+                "mode": "refine",
+                "dataset_signature": {
+                    "instrument": "GC",
+                    "exchange": "COMEX",
+                    "timeframe": "5m",
+                    "n_total_bars": 64,
+                },
+                "candidates": [
+                    {
+                        "candidate_id": "lgb_h12_tp50_sl50_balanced",
+                        "model": "lgb",
+                        "criterion": "balanced",
+                        "horizon": 12,
+                        "tp_bps": 50.0,
+                        "sl_bps": 50.0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    target_csv = tmp_path / "tv_GC_COMEX_15m_refresh_target.csv"
+    target_csv.write_text("timestamp,close\n2026-01-01T00:00:00Z,1\n", encoding="utf-8")
+
+    tab = ModelTrainingTab()
+    try:
+        tab.csv_path = str((tmp_path / "tv_GC_COMEX_5m_source_dataset.csv").resolve())
+        tab.dataset = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-01-01", periods=32, freq="5min", tz="UTC"),
+                "feature_a": np.linspace(0.0, 1.0, 32),
+                "target": [0, 1] * 16,
+            }
+        )
+        tab.cmb_auto_search_profile.setCurrentText("Refresh")
+        tab._set_refresh_source_artifact_path(source_artifact.as_posix(), persist=False)
+        tab._set_refresh_target_csv_path(target_csv.as_posix(), persist=False)
+
+        tab.run_auto_search()
+
+        assert captured == {}
+        assert "ERROR Workflow: Refresh source artifact neodpovida target datasetu" in tab.log.toPlainText()
+    finally:
+        tab.close()
+
+
 def test_model_training_tab_logs_holdout_chunk_summary(qapp):
     tab = ModelTrainingTab()
     try:

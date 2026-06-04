@@ -445,6 +445,8 @@ def run_training_job(
     tp_value = float(tp_bps)
     sl_value = float(sl_bps)
     profile = dict(training_profile or training_profile_for_mode(phase_norm))
+    fee_per_trade = float(profile.get("fee_per_trade", 0.0) or 0.0)
+    slippage_bps = float(profile.get("slippage_bps", 0.0) or 0.0)
     profile["training_mode"] = runtime_training_mode
     profile["workflow_mode"] = str(profile.get("workflow_mode") or workflow_mode)
     profile["compatibility_mode"] = profile.get("compatibility_mode", compatibility_mode)
@@ -496,6 +498,8 @@ def run_training_job(
     meta_extra["workflow_mode"] = workflow_mode
     meta_extra["training_mode_requested"] = phase_norm
     meta_extra["training_mode_compatibility"] = compatibility_mode
+    meta_extra["fee_per_trade"] = float(fee_per_trade)
+    meta_extra["slippage_bps"] = float(slippage_bps)
     meta_extra["training_profile"] = dict(profile)
     if isinstance(extra_meta, dict) and extra_meta:
         meta_extra.update(extra_meta)
@@ -540,6 +544,8 @@ def run_training_job(
             quality_min_mc_sharpe_p50=float(profile.get("quality_min_mc_sharpe_p50", -0.02)),
             quality_min_profit_net=float(profile.get("quality_min_profit_net", 0.0)),
             quality_min_holdout_sharpe=float(profile.get("quality_min_holdout_sharpe", 0.0)),
+            fee_per_trade=float(fee_per_trade),
+            slippage_bps=float(slippage_bps),
             max_param_candidates=profile.get("max_param_candidates"),
             param_sample_seed=int(profile.get("param_sample_seed", 42)),
             search_backend=profile.get("search_backend", "grid"),
